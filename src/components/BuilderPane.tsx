@@ -446,7 +446,7 @@ export function BuilderPane() {
               ))}
             </div>
             
-            <div className="ag-theme-alpine w-full rounded-lg overflow-hidden border border-slate-200" style={{ height: isFullscreen ? 'calc(100vh - 150px)' : '500px' }}>
+            <div className="ag-theme-alpine w-full rounded-lg overflow-hidden border border-slate-200 flex-1 min-h-[400px]" style={{ height: isFullscreen ? 'calc(100vh - 150px)' : '100%' }}>
               <AgGridReact
                 rowData={queryResult}
                 columnDefs={columnDefs}
@@ -688,7 +688,7 @@ export function BuilderPane() {
                 </button>
               </div>
             </div>
-            <div className="p-6 flex-1 overflow-auto">
+            <div className="p-6 flex-1 flex flex-col overflow-hidden">
               {renderVisual()}
             </div>
           </div>
