@@ -1,4 +1,5 @@
 import React, { useState, useMemo, useEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { useAppStore } from '../store';
 import { 
   DndContext, 
@@ -872,46 +873,55 @@ export function BuilderPane() {
             </div>
           )}
 
-          <div className={clsx(
-            "bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden flex flex-col transition-all duration-300",
-            isFullscreen ? "fixed inset-4 z-50 shadow-2xl" : "flex-1"
-          )}>
-            <div className="p-4 border-b border-slate-100 flex items-center justify-between bg-white shrink-0">
-              <h3 className="text-sm font-semibold text-slate-800">Results</h3>
-              <div className="flex items-center gap-2">
-                <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg">
-                  {[
-                    { id: 'table', icon: Table },
-                    { id: 'bar', icon: BarChart2 },
-                    { id: 'line', icon: LineChart },
-                    { id: 'pie', icon: PieChart },
-                  ].map((v) => (
+          {(() => {
+            // Results panel — rendered via portal when fullscreen so it escapes
+            // parent overflow/stacking contexts and fully overlays the chat pane.
+            const panel = (
+              <div className={clsx(
+                "bg-white border border-slate-200 shadow-sm overflow-hidden flex flex-col",
+                isFullscreen
+                  ? "fixed inset-0 z-[200] shadow-2xl rounded-none"
+                  : "flex-1 rounded-2xl"
+              )}>
+                <div className="p-4 border-b border-slate-100 flex items-center justify-between bg-white shrink-0">
+                  <h3 className="text-sm font-semibold text-slate-800">Results</h3>
+                  <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg">
+                      {[
+                        { id: 'table', icon: Table },
+                        { id: 'bar', icon: BarChart2 },
+                        { id: 'line', icon: LineChart },
+                        { id: 'pie', icon: PieChart },
+                      ].map((v) => (
+                        <button
+                          key={v.id}
+                          onClick={() => setVisualType(v.id as any)}
+                          className={clsx(
+                            "p-1.5 rounded-md transition-all",
+                            visualType === v.id ? "bg-white shadow-sm text-emerald-600" : "text-slate-500 hover:text-slate-700"
+                          )}
+                        >
+                          <v.icon size={16} />
+                        </button>
+                      ))}
+                    </div>
+                    <div className="w-px h-6 bg-slate-200 mx-1"></div>
                     <button
-                      key={v.id}
-                      onClick={() => setVisualType(v.id as any)}
-                      className={clsx(
-                        "p-1.5 rounded-md transition-all",
-                        visualType === v.id ? "bg-white shadow-sm text-emerald-600" : "text-slate-500 hover:text-slate-700"
-                      )}
+                      onClick={() => setIsFullscreen(!isFullscreen)}
+                      className="p-1.5 text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-md transition-colors"
+                      title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
                     >
-                      <v.icon size={16} />
+                      {isFullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
                     </button>
-                  ))}
+                  </div>
                 </div>
-                <div className="w-px h-6 bg-slate-200 mx-1"></div>
-                <button
-                  onClick={() => setIsFullscreen(!isFullscreen)}
-                  className="p-1.5 text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-md transition-colors"
-                  title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
-                >
-                  {isFullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
-                </button>
+                <div className="p-6 flex-1 flex flex-col overflow-hidden">
+                  {renderVisual()}
+                </div>
               </div>
-            </div>
-            <div className="p-6 flex-1 flex flex-col overflow-hidden">
-              {renderVisual()}
-            </div>
-          </div>
+            );
+            return isFullscreen ? createPortal(panel, document.body) : panel;
+          })()}
         </div>
       </div>
     </div>
