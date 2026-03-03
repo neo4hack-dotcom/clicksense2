@@ -21,12 +21,27 @@ import {
   useSortable
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { GripVertical, X, Table, BarChart2, PieChart, LineChart, Play, Save, Sparkles, Star, RefreshCw, Maximize2, Minimize2, Palette, ArrowUp, ArrowDown, Filter, RotateCcw } from 'lucide-react';
+import { GripVertical, X, Table, BarChart2, PieChart, LineChart, Play, Save, Sparkles, Star, RefreshCw, Maximize2, Minimize2, Palette, ArrowUp, ArrowDown, Filter, RotateCcw, Search } from 'lucide-react';
 import { 
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Legend, ResponsiveContainer,
   LineChart as RechartsLineChart, Line, PieChart as RechartsPieChart, Pie, Cell
 } from 'recharts';
 import clsx from 'clsx';
+
+/** Format a cell value: integers and floats get a thousands separator. */
+function formatCellValue(value: unknown): string {
+  if (value === null || value === undefined) return '';
+  const n = Number(value);
+  if (typeof value !== 'string' && isFinite(n)) {
+    return n.toLocaleString(undefined, { maximumFractionDigits: 10 });
+  }
+  // String that looks purely numeric (no leading zeros, no scientific notation edge-cases)
+  if (typeof value === 'string' && value.trim() !== '' && !isNaN(Number(value)) && !/^0\d/.test(value.trim())) {
+    const parsed = Number(value);
+    if (isFinite(parsed)) return parsed.toLocaleString(undefined, { maximumFractionDigits: 10 });
+  }
+  return String(value);
+}
 
 const SortableHeader: React.FC<{
   id: string,
@@ -128,6 +143,8 @@ export function BuilderPane() {
   const [columnColors, setColumnColors] = useState<Record<string, { bg?: string, text?: string }>>({});
   const [showColorPicker, setShowColorPicker] = useState<string | null>(null);
   
+  const [fieldSearch, setFieldSearch] = useState('');
+
   // Custom Table State
   const [sortConfig, setSortConfig] = useState<{ key: string, direction: 'asc' | 'desc' } | null>(null);
   const [filters, setFilters] = useState<Record<string, string>>({});
@@ -651,7 +668,7 @@ export function BuilderPane() {
 
                             return (
                               <td key={key} className="px-4 py-2.5 whitespace-nowrap text-slate-600" style={style}>
-                                {row[key] !== null && row[key] !== undefined ? String(row[key]) : <span className="text-slate-300 italic">null</span>}
+                                {row[key] !== null && row[key] !== undefined ? formatCellValue(row[key]) : <span className="text-slate-300 italic">null</span>}
                               </td>
                             );
                           })}
@@ -852,26 +869,52 @@ export function BuilderPane() {
                 {/* Columns */}
                 <div>
                   <div className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">Columns</div>
-                  <div className="space-y-1">
-                    {schema[selectedTable].map((col: any) => {
-                      const isNumeric = col.type.includes('Int') || col.type.includes('Float') || col.type.includes('Decimal');
-                      return (
-                        <div key={col.name} className="group flex items-center justify-between p-2 hover:bg-slate-50 rounded-lg cursor-pointer border border-transparent hover:border-slate-200 transition-all">
-                          <div className="flex items-center gap-2 overflow-hidden">
-                            <div className={clsx("w-2 h-2 rounded-full shrink-0", isNumeric ? "bg-blue-400" : "bg-emerald-400")} />
-                            <span className="text-sm text-slate-700 truncate" title={col.name}>{col.name}</span>
-                          </div>
-                          <div className="opacity-0 group-hover:opacity-100 flex items-center gap-1 transition-opacity">
-                            <button onClick={() => addDimension(col.name)} className="text-[10px] font-medium bg-slate-200 hover:bg-slate-300 text-slate-700 px-1.5 py-0.5 rounded">Dim</button>
-                            {isNumeric && (
-                              <button onClick={() => addMeasure(col.name, 'sum')} className="text-[10px] font-medium bg-blue-100 hover:bg-blue-200 text-blue-700 px-1.5 py-0.5 rounded">Sum</button>
-                            )}
-                            <button onClick={() => addMeasure(col.name, 'count')} className="text-[10px] font-medium bg-emerald-100 hover:bg-emerald-200 text-emerald-700 px-1.5 py-0.5 rounded">Cnt</button>
-                          </div>
-                        </div>
-                      );
-                    })}
+                  {/* Field search */}
+                  <div className="relative mb-2">
+                    <Search size={12} className="absolute left-2 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
+                    <input
+                      type="text"
+                      placeholder="Search fields…"
+                      value={fieldSearch}
+                      onChange={(e) => setFieldSearch(e.target.value)}
+                      className="w-full text-xs pl-6 pr-6 py-1.5 border border-slate-200 rounded-md focus:ring-1 focus:ring-emerald-500 outline-none bg-slate-50"
+                    />
+                    {fieldSearch && (
+                      <button onClick={() => setFieldSearch('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600">
+                        <X size={11} />
+                      </button>
+                    )}
                   </div>
+                  {(() => {
+                    const filtered = schema[selectedTable].filter((col: any) =>
+                      !fieldSearch || col.name.toLowerCase().includes(fieldSearch.toLowerCase())
+                    );
+                    if (filtered.length === 0) return (
+                      <p className="text-xs text-slate-400 italic py-2 px-1">No fields match "{fieldSearch}"</p>
+                    );
+                    return (
+                      <div className="space-y-1">
+                        {filtered.map((col: any) => {
+                          const isNumeric = col.type.includes('Int') || col.type.includes('Float') || col.type.includes('Decimal');
+                          return (
+                            <div key={col.name} className="group flex items-center justify-between p-2 hover:bg-slate-50 rounded-lg cursor-pointer border border-transparent hover:border-slate-200 transition-all">
+                              <div className="flex items-center gap-2 overflow-hidden">
+                                <div className={clsx("w-2 h-2 rounded-full shrink-0", isNumeric ? "bg-blue-400" : "bg-emerald-400")} />
+                                <span className="text-sm text-slate-700 truncate" title={col.name}>{col.name}</span>
+                              </div>
+                              <div className="opacity-0 group-hover:opacity-100 flex items-center gap-1 transition-opacity">
+                                <button onClick={() => addDimension(col.name)} className="text-[10px] font-medium bg-slate-200 hover:bg-slate-300 text-slate-700 px-1.5 py-0.5 rounded">Dim</button>
+                                {isNumeric && (
+                                  <button onClick={() => addMeasure(col.name, 'sum')} className="text-[10px] font-medium bg-blue-100 hover:bg-blue-200 text-blue-700 px-1.5 py-0.5 rounded">Sum</button>
+                                )}
+                                <button onClick={() => addMeasure(col.name, 'count')} className="text-[10px] font-medium bg-emerald-100 hover:bg-emerald-200 text-emerald-700 px-1.5 py-0.5 rounded">Cnt</button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    );
+                  })()}
                 </div>
               </>
             )}
