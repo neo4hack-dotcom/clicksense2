@@ -19,6 +19,13 @@ export default defineConfig(({mode}) => {
       hmr: process.env.DISABLE_HMR !== 'true',
       watch: {
         ignored: ['**/.data/**']
+      },
+      // Proxy API requests to the Python Flask backend during development
+      proxy: {
+        '/api': {
+          target: 'http://localhost:3000',
+          changeOrigin: true,
+        }
       }
     },
   };

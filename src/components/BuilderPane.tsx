@@ -27,14 +27,15 @@ import {
 } from 'recharts';
 import clsx from 'clsx';
 
-const SortableHeader: React.FC<{ 
-  id: string, 
-  column: string, 
+const SortableHeader: React.FC<{
+  id: string,
+  column: string,
   sortConfig: { key: string, direction: 'asc' | 'desc' } | null,
   onSort: (key: string) => void,
   onFilterClick: (key: string) => void,
-  colors?: { bg?: string, text?: string }
-}> = ({ id, column, sortConfig, onSort, onFilterClick, colors }) => {
+  colors?: { bg?: string, text?: string },
+  isFiltered?: boolean,
+}> = ({ id, column, sortConfig, onSort, onFilterClick, colors, isFiltered }) => {
   const {
     attributes,
     listeners,
@@ -71,10 +72,10 @@ const SortableHeader: React.FC<{
             </span>
           )}
         </div>
-        <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
-          <button 
+        <div className={clsx("flex items-center gap-1 transition-opacity shrink-0", isFiltered ? "opacity-100" : "opacity-0 group-hover:opacity-100")}>
+          <button
             onClick={(e) => { e.stopPropagation(); onFilterClick(column); }}
-            className="p-1 hover:bg-black/5 rounded text-slate-400 hover:text-slate-600"
+            className={clsx("p-1 hover:bg-black/5 rounded", isFiltered ? "text-emerald-600" : "text-slate-400 hover:text-slate-600")}
             title="Filter"
           >
             <Filter size={14} />
@@ -508,9 +509,12 @@ export function BuilderPane() {
           </ResponsiveContainer>
         );
       case 'table':
-      default:
+      default: {
+        const hasActiveFilters = Object.values(filters).some(v => v);
+        const showFilterRow = activeFilterColumn !== null || hasActiveFilters;
+
         return (
-          <div className="flex flex-col h-full relative">
+          <div className="flex flex-col h-full">
             {/* Color Picker Toolbar */}
             <div className="flex flex-wrap items-center gap-2 mb-3 p-2 bg-slate-50 border border-slate-200 rounded-lg shrink-0">
               <span className="text-xs font-semibold text-slate-500 uppercase tracking-wider flex items-center gap-1">
@@ -518,7 +522,7 @@ export function BuilderPane() {
               </span>
               {keys.map(key => (
                 <div key={key} className="relative">
-                  <button 
+                  <button
                     onClick={() => setShowColorPicker(showColorPicker === key ? null : key)}
                     className={clsx(
                       "text-xs px-2 py-1 rounded border transition-colors",
@@ -532,9 +536,9 @@ export function BuilderPane() {
                       <div>
                         <label className="text-[10px] font-bold text-slate-500 uppercase mb-1 block">Background Color</label>
                         <div className="flex items-center gap-2">
-                          <input 
-                            type="color" 
-                            value={columnColors[key]?.bg || '#ffffff'} 
+                          <input
+                            type="color"
+                            value={columnColors[key]?.bg || '#ffffff'}
                             onChange={(e) => setColumnColors(prev => ({ ...prev, [key]: { ...prev[key], bg: e.target.value } }))}
                             className="w-8 h-8 cursor-pointer rounded border border-slate-200 p-0"
                           />
@@ -544,16 +548,16 @@ export function BuilderPane() {
                       <div>
                         <label className="text-[10px] font-bold text-slate-500 uppercase mb-1 block">Text Color</label>
                         <div className="flex items-center gap-2">
-                          <input 
-                            type="color" 
-                            value={columnColors[key]?.text || '#000000'} 
+                          <input
+                            type="color"
+                            value={columnColors[key]?.text || '#000000'}
                             onChange={(e) => setColumnColors(prev => ({ ...prev, [key]: { ...prev[key], text: e.target.value } }))}
                             className="w-8 h-8 cursor-pointer rounded border border-slate-200 p-0"
                           />
                           <span className="text-xs text-slate-500 font-mono">{columnColors[key]?.text || '#000000'}</span>
                         </div>
                       </div>
-                      <button 
+                      <button
                         onClick={() => {
                           const newColors = { ...columnColors };
                           delete newColors[key];
@@ -570,108 +574,109 @@ export function BuilderPane() {
               ))}
             </div>
 
-            {/* Filter Popup */}
-            {activeFilterColumn && (
-              <div className="absolute z-50 bg-white border border-slate-200 rounded-lg shadow-xl p-3 min-w-[200px]" style={{ top: '60px', left: '20px' }}>
-                <div className="flex items-center justify-between mb-2">
-                  <span className="text-xs font-bold text-slate-700 uppercase">Filter: {activeFilterColumn}</span>
-                  <button onClick={() => setActiveFilterColumn(null)} className="text-slate-400 hover:text-slate-600"><X size={14} /></button>
-                </div>
-                <input 
-                  type="text"
-                  placeholder="Contains..."
-                  value={filters[activeFilterColumn] || ''}
-                  onChange={(e) => setFilters({ ...filters, [activeFilterColumn]: e.target.value })}
-                  className="w-full text-sm p-2 border border-slate-200 rounded focus:ring-1 focus:ring-emerald-500 outline-none"
-                  autoFocus
-                />
-                <div className="flex justify-end mt-2">
-                  <button 
-                    onClick={() => {
-                      const newFilters = { ...filters };
-                      delete newFilters[activeFilterColumn];
-                      setFilters(newFilters);
-                      setActiveFilterColumn(null);
-                    }}
-                    className="text-xs text-slate-500 hover:text-slate-700"
-                  >
-                    Clear
-                  </button>
-                </div>
-              </div>
-            )}
-            
-            {/* Custom Table */}
-            <div className="flex-1 overflow-auto border border-slate-200 rounded-lg bg-white shadow-sm">
-              <table className="w-full min-w-max text-sm text-left">
-                <thead className="bg-slate-50 sticky top-0 z-20 shadow-sm">
-                  <tr>
-                    <DndContext 
-                      sensors={sensors} 
-                      collisionDetection={closestCenter} 
-                      onDragStart={handleDragStart}
-                      onDragEnd={(e) => handleDragEnd(e, 'columns')}
-                    >
+            {/*
+             * Fix: wrap the whole table (not just <tr>) with the column DndContext
+             * so DragOverlay can be placed outside the <table> element.
+             * A <th> rendered by DragOverlay outside a <table> is invalid HTML
+             * and causes layout issues — we use a <div> in the overlay instead.
+             */}
+            <DndContext
+              sensors={sensors}
+              collisionDetection={closestCenter}
+              onDragStart={handleDragStart}
+              onDragEnd={(e) => handleDragEnd(e, 'columns')}
+            >
+              {/* Custom Table */}
+              <div className="flex-1 overflow-auto border border-slate-200 rounded-lg bg-white shadow-sm min-h-0">
+                <table className="w-full min-w-max text-sm text-left">
+                  <thead className="bg-slate-50 sticky top-0 z-20 shadow-sm">
+                    <tr>
                       <SortableContext items={keys} strategy={horizontalListSortingStrategy}>
                         {keys.map(key => (
-                          <SortableHeader 
-                            key={key} 
-                            id={key} 
-                            column={key} 
-                            sortConfig={sortConfig} 
+                          <SortableHeader
+                            key={key}
+                            id={key}
+                            column={key}
+                            sortConfig={sortConfig}
                             onSort={handleSort}
                             onFilterClick={(col) => setActiveFilterColumn(activeFilterColumn === col ? null : col)}
                             colors={columnColors[key]}
+                            isFiltered={!!filters[key]}
                           />
                         ))}
                       </SortableContext>
-                      <DragOverlay dropAnimation={defaultDropAnimationSideEffects({ styles: { active: { opacity: '0.5' } } })}>
-                        {activeDragColumn ? (
-                          <th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-wider border border-emerald-500 bg-emerald-50 text-emerald-700 shadow-lg opacity-90">
-                            {activeDragColumn}
-                          </th>
-                        ) : null}
-                      </DragOverlay>
-                    </DndContext>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {processedData.length > 0 ? (
-                    processedData.map((row, i) => (
-                      <tr key={i} className="hover:bg-slate-50 transition-colors">
-                        {keys.map(key => {
-                          const colors = columnColors[key];
-                          const style = colors ? { 
-                            backgroundColor: colors.bg ? `${colors.bg}20` : undefined, // 20 is hex for 12% opacity
-                            color: colors.text,
-                            fontWeight: colors.text ? '500' : 'normal'
-                          } : {};
-                          
-                          return (
-                            <td key={key} className="px-4 py-2.5 whitespace-nowrap text-slate-600" style={style}>
-                              {row[key] !== null && row[key] !== undefined ? String(row[key]) : <span className="text-slate-300 italic">null</span>}
-                            </td>
-                          );
-                        })}
-                      </tr>
-                    ))
-                  ) : (
-                    <tr>
-                      <td colSpan={keys.length} className="px-4 py-8 text-center text-slate-500 italic">
-                        No results match the current filters.
-                      </td>
                     </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-            
+                    {/* Inline filter row — avoids floating popup positioning bugs */}
+                    {showFilterRow && (
+                      <tr className="bg-white border-b border-slate-100">
+                        {keys.map(key => (
+                          <th key={key} className="px-2 py-1.5">
+                            <input
+                              type="text"
+                              placeholder={`Filter ${key}…`}
+                              value={filters[key] || ''}
+                              onChange={(e) => setFilters({ ...filters, [key]: e.target.value })}
+                              autoFocus={activeFilterColumn === key}
+                              className="w-full text-xs p-1.5 border border-slate-200 rounded focus:ring-1 focus:ring-emerald-500 outline-none min-w-[60px] font-normal"
+                            />
+                          </th>
+                        ))}
+                      </tr>
+                    )}
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {processedData.length > 0 ? (
+                      processedData.map((row, i) => (
+                        <tr key={i} className="hover:bg-slate-50 transition-colors">
+                          {keys.map(key => {
+                            const colors = columnColors[key];
+                            const style = colors ? {
+                              backgroundColor: colors.bg ? `${colors.bg}20` : undefined,
+                              color: colors.text,
+                              fontWeight: colors.text ? '500' : 'normal'
+                            } : {};
+
+                            return (
+                              <td key={key} className="px-4 py-2.5 whitespace-nowrap text-slate-600" style={style}>
+                                {row[key] !== null && row[key] !== undefined ? String(row[key]) : <span className="text-slate-300 italic">null</span>}
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      ))
+                    ) : (
+                      <tr>
+                        <td colSpan={keys.length} className="px-4 py-8 text-center text-slate-500 italic">
+                          No results match the current filters.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+
+              {/*
+               * Fix: DragOverlay is now outside the <table> so its portal-rendered
+               * element is semantically valid. We render a <div> (not <th>).
+               * Fix: dropAnimation must be a DropAnimation config object —
+               * defaultDropAnimationSideEffects returns a SideEffect function and
+               * must be assigned to the `sideEffects` key, not used directly.
+               */}
+              <DragOverlay dropAnimation={{ sideEffects: defaultDropAnimationSideEffects({ styles: { active: { opacity: '0.5' } } }) }}>
+                {activeDragColumn ? (
+                  <div className="px-4 py-3 text-left text-xs font-bold uppercase tracking-wider border border-emerald-500 bg-emerald-50 text-emerald-700 shadow-lg rounded opacity-90">
+                    {activeDragColumn}
+                  </div>
+                ) : null}
+              </DragOverlay>
+            </DndContext>
+
             {/* Status Bar */}
             <div className="mt-2 text-xs text-slate-500 flex justify-between items-center shrink-0">
               <span>Showing {processedData.length} of {queryResult.length} rows</span>
-              {Object.keys(filters).length > 0 && (
-                <button 
-                  onClick={() => setFilters({})}
+              {hasActiveFilters && (
+                <button
+                  onClick={() => { setFilters({}); setActiveFilterColumn(null); }}
                   className="text-emerald-600 hover:underline flex items-center gap-1"
                 >
                   <X size={12} /> Clear all filters
@@ -680,6 +685,7 @@ export function BuilderPane() {
             </div>
           </div>
         );
+      }
     }
   };
 
