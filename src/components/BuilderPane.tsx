@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { useAppStore } from '../store';
 import { 
   DndContext, 
@@ -7,27 +7,86 @@ import {
   PointerSensor,
   useSensor,
   useSensors,
-  DragEndEvent
+  DragEndEvent,
+  DragOverlay,
+  defaultDropAnimationSideEffects
 } from '@dnd-kit/core';
 import {
   arrayMove,
   SortableContext,
   sortableKeyboardCoordinates,
   verticalListSortingStrategy,
+  horizontalListSortingStrategy,
   useSortable
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { GripVertical, X, Table, BarChart2, PieChart, LineChart, Play, Save, Sparkles, Star, RefreshCw } from 'lucide-react';
+import { GripVertical, X, Table, BarChart2, PieChart, LineChart, Play, Save, Sparkles, Star, RefreshCw, Maximize2, Minimize2, Palette, ArrowUp, ArrowDown, Filter } from 'lucide-react';
 import { 
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Legend, ResponsiveContainer,
   LineChart as RechartsLineChart, Line, PieChart as RechartsPieChart, Pie, Cell
 } from 'recharts';
 import clsx from 'clsx';
-import { AgGridReact } from 'ag-grid-react';
-import 'ag-grid-community/styles/ag-grid.css';
-import 'ag-grid-community/styles/ag-theme-alpine.css';
-import { Maximize2, Minimize2, Palette } from 'lucide-react';
 
+const SortableHeader: React.FC<{ 
+  id: string, 
+  column: string, 
+  sortConfig: { key: string, direction: 'asc' | 'desc' } | null,
+  onSort: (key: string) => void,
+  onFilterClick: (key: string) => void,
+  colors?: { bg?: string, text?: string }
+}> = ({ id, column, sortConfig, onSort, onFilterClick, colors }) => {
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging
+  } = useSortable({ id });
+
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    backgroundColor: colors?.bg || '#f8fafc',
+    color: colors?.text || '#1e293b',
+    opacity: isDragging ? 0.5 : 1,
+    zIndex: isDragging ? 10 : 1,
+  };
+
+  return (
+    <th 
+      ref={setNodeRef} 
+      style={style} 
+      className="px-4 py-3 text-left text-xs font-bold uppercase tracking-wider border-b border-slate-200 relative group select-none"
+    >
+      <div className="flex items-center justify-between gap-2">
+        <div 
+          className="flex items-center gap-1 cursor-pointer flex-1 overflow-hidden"
+          onClick={() => onSort(column)}
+        >
+          <span className="truncate">{column}</span>
+          {sortConfig?.key === column && (
+            <span className="text-emerald-600 shrink-0">
+              {sortConfig.direction === 'asc' ? <ArrowUp size={14} /> : <ArrowDown size={14} />}
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
+          <button 
+            onClick={(e) => { e.stopPropagation(); onFilterClick(column); }}
+            className="p-1 hover:bg-black/5 rounded text-slate-400 hover:text-slate-600"
+            title="Filter"
+          >
+            <Filter size={14} />
+          </button>
+          <div {...attributes} {...listeners} className="cursor-grab p-1 hover:bg-black/5 rounded text-slate-400 hover:text-slate-600">
+            <GripVertical size={14} />
+          </div>
+        </div>
+      </div>
+    </th>
+  );
+};
 const SortableItem: React.FC<{ id: string, item: any, onRemove: () => void }> = ({ id, item, onRemove }) => {
   const {
     attributes,
@@ -66,6 +125,26 @@ export function BuilderPane() {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [columnColors, setColumnColors] = useState<Record<string, { bg?: string, text?: string }>>({});
   const [showColorPicker, setShowColorPicker] = useState<string | null>(null);
+  
+  // Custom Table State
+  const [sortConfig, setSortConfig] = useState<{ key: string, direction: 'asc' | 'desc' } | null>(null);
+  const [filters, setFilters] = useState<Record<string, string>>({});
+  const [activeFilterColumn, setActiveFilterColumn] = useState<string | null>(null);
+  const [columnOrder, setColumnOrder] = useState<string[]>([]);
+  const [activeDragColumn, setActiveDragColumn] = useState<string | null>(null);
+
+  // Initialize column order when results change
+  useEffect(() => {
+    if (queryResult && queryResult.length > 0) {
+      const keys = Object.keys(queryResult[0]);
+      // Only update if it's a completely new set of columns
+      if (columnOrder.length === 0 || !keys.every(k => columnOrder.includes(k))) {
+        setColumnOrder(keys);
+      }
+    } else {
+      setColumnOrder([]);
+    }
+  }, [queryResult]);
 
   const tables = Object.keys(schema).sort((a, b) => {
     const favA = tableMetadata[a]?.is_favorite ? 1 : 0;
@@ -163,17 +242,31 @@ export function BuilderPane() {
     })
   );
 
-  const handleDragEnd = (event: DragEndEvent, type: 'dimensions' | 'measures') => {
+  const handleDragEnd = (event: DragEndEvent, type: 'dimensions' | 'measures' | 'columns') => {
     const { active, over } = event;
-    if (active.id !== over?.id) {
+    if (!over || active.id === over.id) {
+      setActiveDragColumn(null);
+      return;
+    }
+
+    if (type === 'columns') {
+      const oldIndex = columnOrder.indexOf(active.id as string);
+      const newIndex = columnOrder.indexOf(over.id as string);
+      setColumnOrder(arrayMove(columnOrder, oldIndex, newIndex));
+      setActiveDragColumn(null);
+    } else {
       const oldIndex = queryConfig[type].findIndex((i: any) => (i.name || i.column) === active.id);
-      const newIndex = queryConfig[type].findIndex((i: any) => (i.name || i.column) === over?.id);
+      const newIndex = queryConfig[type].findIndex((i: any) => (i.name || i.column) === over.id);
       
       setQueryConfig({
         ...queryConfig,
         [type]: arrayMove(queryConfig[type] as any[], oldIndex, newIndex),
       });
     }
+  };
+
+  const handleDragStart = (event: any) => {
+    setActiveDragColumn(event.active.id);
   };
 
   const addDimension = (col: string) => {
@@ -310,10 +403,55 @@ export function BuilderPane() {
       );
     }
 
-    const keys = Object.keys(queryResult[0]);
+    const keys = columnOrder.length > 0 ? columnOrder : Object.keys(queryResult[0]);
     // Try to guess dimension vs measure
     const dimKey = (queryConfig.dimensions[0] as any)?.name || keys[0];
     const measureKeys = keys.filter(k => k !== dimKey);
+
+    // Apply sorting and filtering
+    let processedData = [...queryResult];
+    
+    // Filter
+    Object.entries(filters).forEach(([key, value]) => {
+      if (value && typeof value === 'string') {
+        const lowerValue = value.toLowerCase();
+        processedData = processedData.filter(row => {
+          const cellValue = row[key];
+          if (cellValue == null) return false;
+          return String(cellValue).toLowerCase().includes(lowerValue);
+        });
+      }
+    });
+
+    // Sort
+    if (sortConfig) {
+      processedData.sort((a, b) => {
+        const aVal = a[sortConfig.key];
+        const bVal = b[sortConfig.key];
+        
+        if (aVal === bVal) return 0;
+        
+        const aIsNum = !isNaN(Number(aVal)) && aVal !== null && aVal !== '';
+        const bIsNum = !isNaN(Number(bVal)) && bVal !== null && bVal !== '';
+        
+        let comparison = 0;
+        if (aIsNum && bIsNum) {
+          comparison = Number(aVal) - Number(bVal);
+        } else {
+          comparison = String(aVal || '').localeCompare(String(bVal || ''));
+        }
+        
+        return sortConfig.direction === 'asc' ? comparison : -comparison;
+      });
+    }
+
+    const handleSort = (key: string) => {
+      let direction: 'asc' | 'desc' = 'asc';
+      if (sortConfig && sortConfig.key === key && sortConfig.direction === 'asc') {
+        direction = 'desc';
+      }
+      setSortConfig({ key, direction });
+    };
 
     switch (visualType) {
       case 'bar':
@@ -371,30 +509,10 @@ export function BuilderPane() {
         );
       case 'table':
       default:
-        const columnDefs = keys.map(key => ({
-          field: key,
-          headerName: key,
-          sortable: true,
-          filter: true,
-          resizable: true,
-          cellStyle: (params: any) => {
-            const colors = columnColors[key];
-            if (colors) {
-              return { 
-                backgroundColor: colors.bg || undefined, 
-                color: colors.text || undefined,
-                fontWeight: colors.text ? 'bold' : 'normal'
-              };
-            }
-            return null;
-          },
-          headerClass: 'font-bold text-slate-800'
-        }));
-
         return (
-          <div className="flex flex-col h-full">
+          <div className="flex flex-col h-full relative">
             {/* Color Picker Toolbar */}
-            <div className="flex flex-wrap items-center gap-2 mb-3 p-2 bg-slate-50 border border-slate-200 rounded-lg">
+            <div className="flex flex-wrap items-center gap-2 mb-3 p-2 bg-slate-50 border border-slate-200 rounded-lg shrink-0">
               <span className="text-xs font-semibold text-slate-500 uppercase tracking-wider flex items-center gap-1">
                 <Palette size={14} /> Style Columns:
               </span>
@@ -410,24 +528,30 @@ export function BuilderPane() {
                     {key}
                   </button>
                   {showColorPicker === key && (
-                    <div className="absolute top-full left-0 mt-1 p-2 bg-white border border-slate-200 rounded-lg shadow-xl z-50 flex flex-col gap-2 min-w-[150px]">
+                    <div className="absolute top-full left-0 mt-1 p-3 bg-white border border-slate-200 rounded-lg shadow-xl z-50 flex flex-col gap-3 min-w-[180px]">
                       <div>
-                        <label className="text-[10px] font-bold text-slate-500 uppercase">Background</label>
-                        <input 
-                          type="color" 
-                          value={columnColors[key]?.bg || '#ffffff'} 
-                          onChange={(e) => setColumnColors(prev => ({ ...prev, [key]: { ...prev[key], bg: e.target.value } }))}
-                          className="w-full h-6 cursor-pointer"
-                        />
+                        <label className="text-[10px] font-bold text-slate-500 uppercase mb-1 block">Background Color</label>
+                        <div className="flex items-center gap-2">
+                          <input 
+                            type="color" 
+                            value={columnColors[key]?.bg || '#ffffff'} 
+                            onChange={(e) => setColumnColors(prev => ({ ...prev, [key]: { ...prev[key], bg: e.target.value } }))}
+                            className="w-8 h-8 cursor-pointer rounded border border-slate-200 p-0"
+                          />
+                          <span className="text-xs text-slate-500 font-mono">{columnColors[key]?.bg || '#ffffff'}</span>
+                        </div>
                       </div>
                       <div>
-                        <label className="text-[10px] font-bold text-slate-500 uppercase">Text</label>
-                        <input 
-                          type="color" 
-                          value={columnColors[key]?.text || '#000000'} 
-                          onChange={(e) => setColumnColors(prev => ({ ...prev, [key]: { ...prev[key], text: e.target.value } }))}
-                          className="w-full h-6 cursor-pointer"
-                        />
+                        <label className="text-[10px] font-bold text-slate-500 uppercase mb-1 block">Text Color</label>
+                        <div className="flex items-center gap-2">
+                          <input 
+                            type="color" 
+                            value={columnColors[key]?.text || '#000000'} 
+                            onChange={(e) => setColumnColors(prev => ({ ...prev, [key]: { ...prev[key], text: e.target.value } }))}
+                            className="w-8 h-8 cursor-pointer rounded border border-slate-200 p-0"
+                          />
+                          <span className="text-xs text-slate-500 font-mono">{columnColors[key]?.text || '#000000'}</span>
+                        </div>
                       </div>
                       <button 
                         onClick={() => {
@@ -436,33 +560,123 @@ export function BuilderPane() {
                           setColumnColors(newColors);
                           setShowColorPicker(null);
                         }}
-                        className="text-xs text-red-500 hover:bg-red-50 p-1 rounded mt-1"
+                        className="text-xs text-red-600 hover:bg-red-50 border border-red-200 p-1.5 rounded mt-1 font-medium transition-colors"
                       >
-                        Reset
+                        Reset to Default
                       </button>
                     </div>
                   )}
                 </div>
               ))}
             </div>
+
+            {/* Filter Popup */}
+            {activeFilterColumn && (
+              <div className="absolute z-50 bg-white border border-slate-200 rounded-lg shadow-xl p-3 min-w-[200px]" style={{ top: '60px', left: '20px' }}>
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs font-bold text-slate-700 uppercase">Filter: {activeFilterColumn}</span>
+                  <button onClick={() => setActiveFilterColumn(null)} className="text-slate-400 hover:text-slate-600"><X size={14} /></button>
+                </div>
+                <input 
+                  type="text"
+                  placeholder="Contains..."
+                  value={filters[activeFilterColumn] || ''}
+                  onChange={(e) => setFilters({ ...filters, [activeFilterColumn]: e.target.value })}
+                  className="w-full text-sm p-2 border border-slate-200 rounded focus:ring-1 focus:ring-emerald-500 outline-none"
+                  autoFocus
+                />
+                <div className="flex justify-end mt-2">
+                  <button 
+                    onClick={() => {
+                      const newFilters = { ...filters };
+                      delete newFilters[activeFilterColumn];
+                      setFilters(newFilters);
+                      setActiveFilterColumn(null);
+                    }}
+                    className="text-xs text-slate-500 hover:text-slate-700"
+                  >
+                    Clear
+                  </button>
+                </div>
+              </div>
+            )}
             
-            <div className="ag-theme-alpine w-full rounded-lg overflow-hidden border border-slate-200 flex-1 min-h-[400px]" style={{ height: isFullscreen ? 'calc(100vh - 150px)' : '100%' }}>
-              <AgGridReact
-                rowData={queryResult}
-                columnDefs={columnDefs}
-                defaultColDef={{
-                  flex: 1,
-                  minWidth: 100,
-                  filter: true,
-                  sortable: true,
-                  resizable: true,
-                }}
-                rowSelection="multiple"
-                animateRows={true}
-                enableCellTextSelection={true}
-                pagination={true}
-                paginationPageSize={100}
-              />
+            {/* Custom Table */}
+            <div className="flex-1 overflow-auto border border-slate-200 rounded-lg bg-white shadow-sm">
+              <table className="w-full min-w-max text-sm text-left">
+                <thead className="bg-slate-50 sticky top-0 z-20 shadow-sm">
+                  <tr>
+                    <DndContext 
+                      sensors={sensors} 
+                      collisionDetection={closestCenter} 
+                      onDragStart={handleDragStart}
+                      onDragEnd={(e) => handleDragEnd(e, 'columns')}
+                    >
+                      <SortableContext items={keys} strategy={horizontalListSortingStrategy}>
+                        {keys.map(key => (
+                          <SortableHeader 
+                            key={key} 
+                            id={key} 
+                            column={key} 
+                            sortConfig={sortConfig} 
+                            onSort={handleSort}
+                            onFilterClick={(col) => setActiveFilterColumn(activeFilterColumn === col ? null : col)}
+                            colors={columnColors[key]}
+                          />
+                        ))}
+                      </SortableContext>
+                      <DragOverlay dropAnimation={defaultDropAnimationSideEffects({ styles: { active: { opacity: '0.5' } } })}>
+                        {activeDragColumn ? (
+                          <th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-wider border border-emerald-500 bg-emerald-50 text-emerald-700 shadow-lg opacity-90">
+                            {activeDragColumn}
+                          </th>
+                        ) : null}
+                      </DragOverlay>
+                    </DndContext>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {processedData.length > 0 ? (
+                    processedData.map((row, i) => (
+                      <tr key={i} className="hover:bg-slate-50 transition-colors">
+                        {keys.map(key => {
+                          const colors = columnColors[key];
+                          const style = colors ? { 
+                            backgroundColor: colors.bg ? `${colors.bg}20` : undefined, // 20 is hex for 12% opacity
+                            color: colors.text,
+                            fontWeight: colors.text ? '500' : 'normal'
+                          } : {};
+                          
+                          return (
+                            <td key={key} className="px-4 py-2.5 whitespace-nowrap text-slate-600" style={style}>
+                              {row[key] !== null && row[key] !== undefined ? String(row[key]) : <span className="text-slate-300 italic">null</span>}
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    ))
+                  ) : (
+                    <tr>
+                      <td colSpan={keys.length} className="px-4 py-8 text-center text-slate-500 italic">
+                        No results match the current filters.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+            
+            {/* Status Bar */}
+            <div className="mt-2 text-xs text-slate-500 flex justify-between items-center shrink-0">
+              <span>Showing {processedData.length} of {queryResult.length} rows</span>
+              {Object.keys(filters).length > 0 && (
+                <button 
+                  onClick={() => setFilters({})}
+                  className="text-emerald-600 hover:underline flex items-center gap-1"
+                >
+                  <X size={12} /> Clear all filters
+                </button>
+              )}
             </div>
           </div>
         );
@@ -636,7 +850,7 @@ export function BuilderPane() {
         </div>
 
         {/* Results Area */}
-        <div className="flex-1 p-6 overflow-y-auto bg-slate-50/50 flex flex-col gap-4">
+        <div className="flex-1 p-6 overflow-hidden bg-slate-50/50 flex flex-col gap-4">
           {suggestedVisual && suggestedVisual !== visualType && (
             <div className="bg-blue-50 border border-blue-100 rounded-xl p-3 flex items-center justify-between shadow-sm">
               <div className="flex items-center gap-2 text-blue-700 text-sm">
@@ -653,10 +867,10 @@ export function BuilderPane() {
           )}
 
           <div className={clsx(
-            "bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden flex flex-col flex-1 transition-all duration-300",
-            isFullscreen ? "fixed inset-4 z-50 shadow-2xl" : ""
+            "bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden flex flex-col transition-all duration-300",
+            isFullscreen ? "fixed inset-4 z-50 shadow-2xl" : "flex-1"
           )}>
-            <div className="p-4 border-b border-slate-100 flex items-center justify-between bg-white">
+            <div className="p-4 border-b border-slate-100 flex items-center justify-between bg-white shrink-0">
               <h3 className="text-sm font-semibold text-slate-800">Results</h3>
               <div className="flex items-center gap-2">
                 <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg">
