@@ -21,7 +21,7 @@ import {
   useSortable
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { GripVertical, X, Table, BarChart2, PieChart, LineChart, Play, Save, Sparkles, Star, RefreshCw, Maximize2, Minimize2, Palette, ArrowUp, ArrowDown, Filter } from 'lucide-react';
+import { GripVertical, X, Table, BarChart2, PieChart, LineChart, Play, Save, Sparkles, Star, RefreshCw, Maximize2, Minimize2, Palette, ArrowUp, ArrowDown, Filter, RotateCcw } from 'lucide-react';
 import { 
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Legend, ResponsiveContainer,
   LineChart as RechartsLineChart, Line, PieChart as RechartsPieChart, Pie, Cell
@@ -235,6 +235,18 @@ export function BuilderPane() {
     } finally {
       setIsRefreshingSchema(false);
     }
+  };
+
+  const handleClear = () => {
+    setQueryConfig({ dimensions: [], measures: [], filters: [] });
+    setQueryResult([]);
+    setVisualType('table');
+    setSortConfig(null);
+    setFilters({});
+    setActiveFilterColumn(null);
+    setColumnOrder([]);
+    setColumnColors({});
+    setSuggestedVisual(null);
   };
 
   const sensors = useSensors(
@@ -692,12 +704,21 @@ export function BuilderPane() {
 
   return (
     <div className="flex flex-col h-full bg-slate-50">
-      {/* Top Configuration Bar */}
-      <div className="bg-white border-b border-slate-200 p-4 space-y-4">
+      {/* Top Configuration Bar — shrink-0 prevents it from being squashed by the results area */}
+      <div className="bg-white border-b border-slate-200 p-4 space-y-3 shrink-0">
         <div className="flex items-center justify-between">
           <h2 className="text-lg font-semibold text-slate-800">Visual Builder</h2>
           <div className="flex items-center gap-2">
-            <button 
+            <button
+              onClick={handleClear}
+              disabled={queryConfig.dimensions.length === 0 && queryConfig.measures.length === 0 && (!queryResult || queryResult.length === 0)}
+              className="flex items-center gap-2 bg-white border border-slate-200 hover:bg-red-50 hover:border-red-200 hover:text-red-600 text-slate-500 px-3 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed shadow-sm"
+              title="Clear all dimensions, measures and results"
+            >
+              <RotateCcw size={15} />
+              Clear
+            </button>
+            <button
               onClick={handleSaveToDashboard}
               disabled={isSaving || !queryResult || queryResult.length === 0}
               className="flex items-center gap-2 bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
@@ -705,7 +726,7 @@ export function BuilderPane() {
               <Save size={16} />
               {isSaving ? 'Saving...' : 'Save'}
             </button>
-            <button 
+            <button
               onClick={buildAndExecuteQuery}
               disabled={isExecuting || (queryConfig.dimensions.length === 0 && queryConfig.measures.length === 0)}
               className="flex items-center gap-2 bg-emerald-500 hover:bg-emerald-600 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
@@ -716,13 +737,14 @@ export function BuilderPane() {
           </div>
         </div>
 
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-2 gap-3">
           {/* Dimensions Dropzone */}
           <div className="bg-slate-50 border border-slate-200 rounded-xl p-3">
             <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Dimensions (Rows/Columns)</div>
             <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={(e) => handleDragEnd(e, 'dimensions')}>
               <SortableContext items={queryConfig.dimensions.map((d: any) => d.name)} strategy={verticalListSortingStrategy}>
-                <div className="min-h-[40px] flex flex-wrap gap-2">
+                {/* max-h caps growth when many fields are added, preventing the results area from being pushed off-screen */}
+                <div className="min-h-[40px] max-h-28 overflow-y-auto flex flex-wrap gap-2 pr-0.5">
                   {queryConfig.dimensions.length === 0 && (
                     <div className="text-sm text-slate-400 italic w-full text-center py-2 border-2 border-dashed border-slate-200 rounded-lg">
                       Drag fields here
@@ -741,7 +763,7 @@ export function BuilderPane() {
             <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Measures (Values)</div>
             <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={(e) => handleDragEnd(e, 'measures')}>
               <SortableContext items={queryConfig.measures.map((m: any) => m.column)} strategy={verticalListSortingStrategy}>
-                <div className="min-h-[40px] flex flex-wrap gap-2">
+                <div className="min-h-[40px] max-h-28 overflow-y-auto flex flex-wrap gap-2 pr-0.5">
                   {queryConfig.measures.length === 0 && (
                     <div className="text-sm text-slate-400 italic w-full text-center py-2 border-2 border-dashed border-slate-200 rounded-lg">
                       Drag fields here
@@ -856,8 +878,8 @@ export function BuilderPane() {
           </div>
         </div>
 
-        {/* Results Area */}
-        <div className="flex-1 p-6 overflow-hidden bg-slate-50/50 flex flex-col gap-4">
+        {/* Results Area — overflow-auto so content is reachable on small screens */}
+        <div className="flex-1 p-6 overflow-auto bg-slate-50/50 flex flex-col gap-4 min-w-0">
           {suggestedVisual && suggestedVisual !== visualType && (
             <div className="bg-blue-50 border border-blue-100 rounded-xl p-3 flex items-center justify-between shadow-sm">
               <div className="flex items-center gap-2 text-blue-700 text-sm">
