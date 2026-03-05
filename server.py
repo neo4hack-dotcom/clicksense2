@@ -220,8 +220,9 @@ def test_llm():
     provider = data.get("provider")
     try:
         if provider == "ollama":
+            ollama_url = data.get("ollamaUrl") or "http://localhost:11434"
             resp = _http_get(
-                f"{data['ollamaUrl']}/api/tags", timeout=10
+                f"{ollama_url}/api/tags", timeout=10
             )
             if not resp.ok:
                 raise Exception(f"Ollama error: {resp.status_code}")
@@ -233,8 +234,9 @@ def test_llm():
             resp = _http_get(
                 f"{base_url}/v1/models", headers=headers, timeout=10
             )
-            if not resp.ok:
-                raise Exception(f"HTTP error: {resp.status_code}")
+            # 404 is acceptable — server is reachable but may not expose /v1/models
+            if not resp.ok and resp.status_code != 404:
+                raise Exception(f"HTTP LLM server returned {resp.status_code}")
         return jsonify({"success": True})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
@@ -261,9 +263,11 @@ def get_llm_models():
                 f"{base_url}/v1/models", headers=headers, timeout=10
             )
             if not resp.ok:
+                if resp.status_code == 404:
+                    return jsonify({"models": []})
                 raise Exception(f"HTTP error: {resp.status_code}")
             data = resp.json()
-            models = [m["id"] for m in data.get("data", [])]
+            models = [m.get("id") or m.get("name", "") for m in data.get("data", []) if m.get("id") or m.get("name")]
             return jsonify({"models": models})
         else:
             return jsonify({"models": []})
@@ -523,7 +527,9 @@ def chat():
                 or resp_data.get("content")
                 or ""
             )
-            content = content.replace("```json", "").replace("```", "").strip()
+            content = content.replace("```json", "").replace("```JSON", "").replace("```", "").strip()
+            if not content:
+                raise Exception("Le LLM a renvoyé une réponse vide. Vérifiez que le modèle supporte la sortie JSON.")
             return jsonify(json.loads(content))
 
         elif llm_config["provider"] == "ollama":
