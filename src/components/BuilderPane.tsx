@@ -1,8 +1,8 @@
-import React, { useState, useMemo, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { useAppStore } from '../store';
-import { 
-  DndContext, 
+import {
+  DndContext,
   closestCenter,
   KeyboardSensor,
   PointerSensor,
@@ -21,69 +21,126 @@ import {
   useSortable
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { GripVertical, X, Table, BarChart2, PieChart, LineChart, Play, Save, Sparkles, Star, RefreshCw, Maximize2, Minimize2, Palette, ArrowUp, ArrowDown, Filter, RotateCcw, Search, Plus } from 'lucide-react';
-import { 
+import {
+  GripVertical, X, Table, BarChart2, PieChart, LineChart, Play, Save, Sparkles, Star, RefreshCw,
+  Maximize2, Minimize2, Palette, ArrowUp, ArrowDown, Filter, RotateCcw, Search, Plus,
+  History, Brain, AlertTriangle, Lightbulb, TrendingUp, Grid3X3, AreaChart, ScatterChart,
+  ChevronRight, Clock, LayoutGrid, Activity
+} from 'lucide-react';
+import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Legend, ResponsiveContainer,
-  LineChart as RechartsLineChart, Line, PieChart as RechartsPieChart, Pie, Cell
+  LineChart as RechartsLineChart, Line, PieChart as RechartsPieChart, Pie, Cell,
+  AreaChart as RechartsAreaChart, Area, ScatterChart as RechartsScatterChart, Scatter,
+  RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis
 } from 'recharts';
 import clsx from 'clsx';
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+const CHART_COLORS = ['#10b981', '#3b82f6', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4', '#84cc16'];
+const MAX_ROWS = 1000;
+
+const AGG_OPTIONS = [
+  { value: 'count',        label: 'COUNT' },
+  { value: 'count_distinct', label: 'COUNT DISTINCT' },
+  { value: 'sum',          label: 'SUM' },
+  { value: 'avg',          label: 'AVG' },
+  { value: 'min',          label: 'MIN' },
+  { value: 'max',          label: 'MAX' },
+  { value: 'median',       label: 'MEDIAN' },
+  { value: 'p90',          label: 'P90' },
+  { value: 'p95',          label: 'P95' },
+  { value: 'p99',          label: 'P99' },
+  { value: 'stddevPop',    label: 'STDDEV' },
+  { value: 'varPop',       label: 'VARIANCE' },
+  { value: 'uniqExact',    label: 'UNIQ (exact)' },
+  { value: 'uniqHLL12',    label: 'UNIQ (approx)' },
+  { value: 'first_value',  label: 'FIRST VALUE' },
+  { value: 'last_value',   label: 'LAST VALUE' },
+];
 
 /** Format a cell value: integers and floats get a thousands separator. */
 function formatCellValue(value: unknown): string {
   if (value === null || value === undefined) return '';
   const n = Number(value);
   if (typeof value !== 'string' && isFinite(n)) {
-    return n.toLocaleString(undefined, { maximumFractionDigits: 10 });
+    return n.toLocaleString(undefined, { maximumFractionDigits: 6 });
   }
-  // String that looks purely numeric (no leading zeros, no scientific notation edge-cases)
   if (typeof value === 'string' && value.trim() !== '' && !isNaN(Number(value)) && !/^0\d/.test(value.trim())) {
     const parsed = Number(value);
-    if (isFinite(parsed)) return parsed.toLocaleString(undefined, { maximumFractionDigits: 10 });
+    if (isFinite(parsed)) return parsed.toLocaleString(undefined, { maximumFractionDigits: 6 });
   }
   return String(value);
 }
 
+/** Convert #rrggbb to rgba(r,g,b,alpha) */
+function hexToRgba(hex: string, alpha: number): string {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
+/** Build the SQL expression for a measure */
+function measureSql(m: { column: string; agg: string }): string {
+  const alias = m.column === '*' ? `${m.agg}_all` : `${m.agg}_${m.column}`;
+  const col = m.column === '*' ? '*' : m.column;
+  switch (m.agg) {
+    case 'count':         return `count(${col}) AS ${alias}`;
+    case 'count_distinct':return `uniqExact(${col}) AS count_distinct_${m.column}`;
+    case 'sum':           return `sum(${col}) AS ${alias}`;
+    case 'avg':           return `avg(${col}) AS ${alias}`;
+    case 'min':           return `min(${col}) AS ${alias}`;
+    case 'max':           return `max(${col}) AS ${alias}`;
+    case 'median':        return `median(${col}) AS ${alias}`;
+    case 'p90':           return `quantile(0.9)(${col}) AS ${alias}`;
+    case 'p95':           return `quantile(0.95)(${col}) AS ${alias}`;
+    case 'p99':           return `quantile(0.99)(${col}) AS ${alias}`;
+    case 'stddevPop':     return `stddevPop(${col}) AS ${alias}`;
+    case 'varPop':        return `varPop(${col}) AS ${alias}`;
+    case 'uniqExact':     return `uniqExact(${col}) AS ${alias}`;
+    case 'uniqHLL12':     return `uniqHLL12(${col}) AS ${alias}`;
+    case 'first_value':   return `first_value(${col}) AS ${alias}`;
+    case 'last_value':    return `last_value(${col}) AS ${alias}`;
+    default:              return `${m.agg}(${col}) AS ${alias}`;
+  }
+}
+
 const SortableHeader: React.FC<{
-  id: string,
-  column: string,
-  sortConfig: { key: string, direction: 'asc' | 'desc' } | null,
-  onSort: (key: string) => void,
-  onFilterClick: (key: string) => void,
-  colors?: { bg?: string, text?: string },
-  isFiltered?: boolean,
+  id: string;
+  column: string;
+  sortConfig: { key: string; direction: 'asc' | 'desc' } | null;
+  onSort: (key: string) => void;
+  onFilterClick: (key: string) => void;
+  colors?: { bg?: string; text?: string };
+  isFiltered?: boolean;
 }> = ({ id, column, sortConfig, onSort, onFilterClick, colors, isFiltered }) => {
-  const {
-    attributes,
-    listeners,
-    setNodeRef,
-    transform,
-    transition,
-    isDragging
-  } = useSortable({ id });
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id });
+
+  const bgColor = colors?.bg ? hexToRgba(colors.bg, 0.25) : '#f8fafc';
+  const textColor = colors?.text || '#1e293b';
 
   const style = {
     transform: CSS.Transform.toString(transform),
     transition,
-    backgroundColor: colors?.bg || '#f8fafc',
-    color: colors?.text || '#1e293b',
+    backgroundColor: bgColor,
+    color: textColor,
     opacity: isDragging ? 0.5 : 1,
     zIndex: isDragging ? 10 : 1,
   };
 
   return (
-    <th 
-      ref={setNodeRef} 
-      style={style} 
+    <th
+      ref={setNodeRef}
+      style={style}
       className="px-4 py-3 text-left text-xs font-bold uppercase tracking-wider border-b border-slate-200 relative group select-none"
     >
       <div className="flex items-center justify-between gap-2">
-        <div 
-          className="flex items-center gap-1 cursor-pointer flex-1 overflow-hidden"
-          onClick={() => onSort(column)}
-        >
+        <div className="flex items-center gap-1 cursor-pointer flex-1 overflow-hidden" onClick={() => onSort(column)}>
           <span className="truncate">{column}</span>
           {sortConfig?.key === column && (
-            <span className="text-emerald-600 shrink-0">
+            <span className="shrink-0" style={{ color: colors?.text ? textColor : '#10b981' }}>
               {sortConfig.direction === 'asc' ? <ArrowUp size={14} /> : <ArrowDown size={14} />}
             </span>
           )}
@@ -91,12 +148,12 @@ const SortableHeader: React.FC<{
         <div className={clsx("flex items-center gap-1 transition-opacity shrink-0", isFiltered ? "opacity-100" : "opacity-0 group-hover:opacity-100")}>
           <button
             onClick={(e) => { e.stopPropagation(); onFilterClick(column); }}
-            className={clsx("p-1 hover:bg-black/5 rounded", isFiltered ? "text-emerald-600" : "text-slate-400 hover:text-slate-600")}
+            className={clsx("p-1 hover:bg-black/10 rounded", isFiltered ? "text-emerald-600" : "text-slate-400 hover:text-slate-600")}
             title="Filter"
           >
             <Filter size={14} />
           </button>
-          <div {...attributes} {...listeners} className="cursor-grab p-1 hover:bg-black/5 rounded text-slate-400 hover:text-slate-600">
+          <div {...attributes} {...listeners} className="cursor-grab p-1 hover:bg-black/10 rounded text-slate-400 hover:text-slate-600">
             <GripVertical size={14} />
           </div>
         </div>
@@ -132,35 +189,79 @@ const SortableItem: React.FC<{ id: string, item: any, onRemove: () => void }> = 
   );
 }
 
+type VisualType = 'table' | 'matrix' | 'bar' | 'line' | 'area' | 'pie' | 'scatter' | 'radar';
+
+interface DrillThroughState {
+  visible: boolean;
+  sql: string;
+  data: any[];
+  loading: boolean;
+  error: string | null;
+  title: string;
+}
+
+interface AiAnalysisState {
+  visible: boolean;
+  loading: boolean;
+  alerts: string[];
+  suggestions: string[];
+  projections: string[];
+  optimized_sql: string;
+  risk_level: string;
+  error: string | null;
+  sql: string;
+}
+
+interface HistoryEntry {
+  id: number;
+  query_text: string;
+  sql: string;
+  created_at: string;
+}
+
 export function BuilderPane() {
   const { schema, queryResult, queryConfig, setQueryConfig, setQueryResult, currentUser, savedQueries, setSavedQueries, tableMetadata, setTableMetadata, selectedTable, setSelectedTable } = useAppStore();
-  const [visualType, setVisualType] = useState<'table' | 'bar' | 'line' | 'pie'>('table');
+  const [visualType, setVisualType] = useState<VisualType>('table');
   const [isExecuting, setIsExecuting] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
-  const [suggestedVisual, setSuggestedVisual] = useState<'table' | 'bar' | 'line' | 'pie' | null>(null);
+  const [suggestedVisual, setSuggestedVisual] = useState<VisualType | null>(null);
   const [isRefreshingSchema, setIsRefreshingSchema] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [columnColors, setColumnColors] = useState<Record<string, { bg?: string, text?: string }>>({});
+  const [columnColors, setColumnColors] = useState<Record<string, { bg?: string; text?: string }>>({});
   const [showColorPicker, setShowColorPicker] = useState<string | null>(null);
-  
   const [fieldSearch, setFieldSearch] = useState('');
+  const [showHistory, setShowHistory] = useState(false);
+  const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>([]);
+  const [loadingHistory, setLoadingHistory] = useState(false);
+
+  // Drill-through state
+  const [drillThrough, setDrillThrough] = useState<DrillThroughState>({
+    visible: false, sql: '', data: [], loading: false, error: null, title: ''
+  });
+
+  // AI Analysis state
+  const [aiAnalysis, setAiAnalysis] = useState<AiAnalysisState>({
+    visible: false, loading: false, alerts: [], suggestions: [], projections: [],
+    optimized_sql: '', risk_level: 'low', error: null, sql: ''
+  });
 
   // Row/Column dimension split
-  const [rowDims, setRowDims] = useState<{name: string}[]>([]);
-  const [colDims, setColDims] = useState<{name: string}[]>([]);
+  const [rowDims, setRowDims] = useState<{ name: string }[]>([]);
+  const [colDims, setColDims] = useState<{ name: string }[]>([]);
 
   // Pre-query WHERE filters
-  const [preFilters, setPreFilters] = useState<{id: string, column: string, operator: string, value: string}[]>([]);
+  const [preFilters, setPreFilters] = useState<{ id: string; column: string; operator: string; value: string }[]>([]);
 
-  // Output limit
+  // Output limit — always capped at 1000
   const [queryLimit, setQueryLimit] = useState<string>('100');
 
-  // Custom Table State
-  const [sortConfig, setSortConfig] = useState<{ key: string, direction: 'asc' | 'desc' } | null>(null);
+  // Table display state
+  const [sortConfig, setSortConfig] = useState<{ key: string; direction: 'asc' | 'desc' } | null>(null);
   const [filters, setFilters] = useState<Record<string, string>>({});
   const [activeFilterColumn, setActiveFilterColumn] = useState<string | null>(null);
   const [columnOrder, setColumnOrder] = useState<string[]>([]);
   const [activeDragColumn, setActiveDragColumn] = useState<string | null>(null);
+  const [addMeasureFor, setAddMeasureFor] = useState<string | null>(null);
 
   // Initialize column order when results change
   useEffect(() => {
@@ -279,6 +380,7 @@ export function BuilderPane() {
     setColDims([]);
     setPreFilters([]);
     setQueryLimit('100');
+    setAddMeasureFor(null);
   };
 
   const sensors = useSensors(
@@ -344,6 +446,97 @@ export function BuilderPane() {
     if (!queryConfig.measures.find((m: any) => m.column === col && m.agg === agg)) {
       setQueryConfig({ ...queryConfig, measures: [...queryConfig.measures, { column: col, agg }] });
     }
+    setAddMeasureFor(null);
+  };
+
+  // Fetch query history
+  const fetchHistory = async () => {
+    if (!currentUser) return;
+    setLoadingHistory(true);
+    try {
+      const res = await fetch(`/api/history/${currentUser.id}`);
+      const data = await res.json();
+      setHistoryEntries(data);
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setLoadingHistory(false);
+    }
+  };
+
+  const handleShowHistory = () => {
+    setShowHistory(v => !v);
+    if (!showHistory) fetchHistory();
+  };
+
+  // Replay a historical query
+  const replayHistoryEntry = async (sql: string) => {
+    setIsExecuting(true);
+    setShowHistory(false);
+    try {
+      const res = await fetch('/api/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: sql }),
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      setQueryResult(data.data);
+    } catch (error: any) {
+      alert(`Query Error: ${error.message}`);
+    } finally {
+      setIsExecuting(false);
+    }
+  };
+
+  // Drill-through: run SELECT * with dimension filters
+  const handleDrillThrough = async (row: Record<string, unknown>) => {
+    if (!selectedTable) return;
+    const allDims = [...rowDims, ...colDims];
+    if (allDims.length === 0) return;
+    const dimFilters = allDims.map(d => ({ column: d.name, value: row[d.name] }));
+    const where = buildWhereClause(dimFilters);
+    const drillSql = `SELECT * FROM ${selectedTable}${where} LIMIT ${MAX_ROWS}`;
+    const title = allDims.map(d => `${d.name}=${row[d.name]}`).join(', ');
+    setDrillThrough({ visible: true, sql: drillSql, data: [], loading: true, error: null, title });
+    try {
+      const res = await fetch('/api/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: drillSql }),
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      setDrillThrough(prev => ({ ...prev, loading: false, data: data.data }));
+    } catch (error: any) {
+      setDrillThrough(prev => ({ ...prev, loading: false, error: error.message }));
+    }
+  };
+
+  // AI Query Analysis
+  const handleRunAI = async () => {
+    let sql: string;
+    try { sql = buildSql(); } catch (e: any) { alert(e.message); return; }
+    setAiAnalysis({ visible: true, loading: true, alerts: [], suggestions: [], projections: [], optimized_sql: '', risk_level: 'low', error: null, sql });
+    try {
+      const res = await fetch('/api/analyze', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sql, schema }),
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      setAiAnalysis(prev => ({
+        ...prev, loading: false,
+        alerts: data.alerts || [],
+        suggestions: data.suggestions || [],
+        projections: data.projections || [],
+        optimized_sql: data.optimized_sql || '',
+        risk_level: data.risk_level || 'low',
+      }));
+    } catch (error: any) {
+      setAiAnalysis(prev => ({ ...prev, loading: false, error: error.message }));
+    }
   };
 
   const removeRowDimension = (col: string) => {
@@ -382,53 +575,67 @@ export function BuilderPane() {
     setPreFilters(prev => prev.filter(f => f.id !== id));
   };
 
-  const buildSql = () => {
+  const buildWhereClause = useCallback((extraFilters?: { column: string; value: unknown }[]) => {
+    const conditions: string[] = [];
+    preFilters
+      .filter(f => f.column && f.operator && (f.value !== '' || f.operator === 'IS NULL' || f.operator === 'IS NOT NULL'))
+      .forEach(f => {
+        if (f.operator === 'IS NULL') { conditions.push(`${f.column} IS NULL`); return; }
+        if (f.operator === 'IS NOT NULL') { conditions.push(`${f.column} IS NOT NULL`); return; }
+        const isLike = f.operator === 'LIKE' || f.operator === 'NOT LIKE';
+        const isNum = !isLike && !isNaN(Number(f.value));
+        const val = isNum ? f.value : `'${f.value.replace(/'/g, "''")}'`;
+        conditions.push(`${f.column} ${f.operator} ${val}`);
+      });
+    if (extraFilters) {
+      extraFilters.forEach(({ column, value }) => {
+        if (value === null || value === undefined) {
+          conditions.push(`${column} IS NULL`);
+        } else {
+          const isNum = !isNaN(Number(value));
+          const val = isNum ? String(value) : `'${String(value).replace(/'/g, "''")}'`;
+          conditions.push(`${column} = ${val}`);
+        }
+      });
+    }
+    return conditions.length > 0 ? ` WHERE ${conditions.join(' AND ')}` : '';
+  }, [preFilters]);
+
+  const buildSql = useCallback(() => {
     const table = selectedTable;
     if (!table) throw new Error("No table selected");
     const allDims = [...rowDims, ...colDims];
     const selects = [
       ...allDims.map(d => d.name),
-      ...queryConfig.measures.map((m: any) => m.column === '*' ? `count(*) AS count_all` : `${m.agg}(${m.column}) AS ${m.agg}_${m.column}`)
+      ...queryConfig.measures.map((m: any) => measureSql(m))
     ];
+    if (selects.length === 0) throw new Error("Add at least one dimension or measure");
     let sql = `SELECT ${selects.join(', ')} FROM ${table}`;
-    const whereConditions = preFilters
-      .filter(f => f.column && f.operator && (f.value !== '' || f.operator === 'IS NULL' || f.operator === 'IS NOT NULL'))
-      .map(f => {
-        if (f.operator === 'IS NULL') return `${f.column} IS NULL`;
-        if (f.operator === 'IS NOT NULL') return `${f.column} IS NOT NULL`;
-        const isLike = f.operator === 'LIKE' || f.operator === 'NOT LIKE';
-        const isNum = !isLike && f.value !== '' && !isNaN(Number(f.value));
-        const val = isNum ? f.value : `'${f.value.replace(/'/g, "''")}'`;
-        return `${f.column} ${f.operator} ${val}`;
-      });
-    if (whereConditions.length > 0) sql += ` WHERE ${whereConditions.join(' AND ')}`;
+    sql += buildWhereClause();
     if (allDims.length > 0 && queryConfig.measures.length > 0) {
       sql += ` GROUP BY ${allDims.map(d => d.name).join(', ')}`;
     }
-    const lim = parseInt(queryLimit, 10);
-    if (!isNaN(lim) && lim > 0) sql += ` LIMIT ${lim}`;
+    const lim = Math.min(parseInt(queryLimit, 10) || 100, MAX_ROWS);
+    sql += ` LIMIT ${lim}`;
     return sql;
-  };
+  }, [selectedTable, rowDims, colDims, queryConfig.measures, queryLimit, buildWhereClause]);
 
   const buildAndExecuteQuery = async () => {
     const allDims = [...rowDims, ...colDims];
     if (allDims.length === 0 && queryConfig.measures.length === 0) return;
     setIsExecuting(true);
-
     try {
       const sql = buildSql();
-
       const res = await fetch('/api/query', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query: sql }),
       });
-
       const data = await res.json();
       if (data.error) throw new Error(data.error);
-
       setQueryResult(data.data);
-
+      // Auto-switch to matrix when colDims are set
+      if (colDims.length > 0) setVisualType('matrix');
       // Save to history
       if (currentUser) {
         fetch('/api/history', {
@@ -437,7 +644,6 @@ export function BuilderPane() {
           body: JSON.stringify({ user_id: currentUser.id, query_text: 'Built via Visual Builder', sql }),
         }).catch(console.error);
       }
-
     } catch (error: any) {
       alert(`Query Error: ${error.message}`);
     } finally {
@@ -479,7 +685,92 @@ export function BuilderPane() {
     }
   };
 
-  const COLORS = ['#10b981', '#3b82f6', '#f59e0b', '#ef4444', '#8b5cf6'];
+  // ---------------------------------------------------------------------------
+  // Matrix (pivot) renderer
+  // ---------------------------------------------------------------------------
+  const renderMatrix = () => {
+    if (!queryResult || queryResult.length === 0) return null;
+    if (rowDims.length === 0 || colDims.length === 0 || queryConfig.measures.length === 0) {
+      return <p className="text-sm text-slate-500 italic p-4">Matrix requires at least one Row dimension, one Column dimension, and one Measure.</p>;
+    }
+    const measureKeys = queryResult.length > 0
+      ? Object.keys(queryResult[0]).filter(k => !rowDims.find(d => d.name === k) && !colDims.find(d => d.name === k))
+      : [];
+    // Build unique col header values (combination of colDim values)
+    const colKey = (row: any): string => colDims.map(d => row[d.name]).join(' / ');
+    const rowKey = (row: any): string => rowDims.map(d => row[d.name]).join(' / ');
+    const uniqueColValues: string[] = Array.from(new Set(queryResult.map(colKey)));
+    const uniqueRowValues: string[] = Array.from(new Set(queryResult.map(rowKey)));
+    // Build lookup map
+    const lookup: Record<string, Record<string, any>> = {};
+    queryResult.forEach(row => {
+      const rk = rowKey(row);
+      const ck = colKey(row);
+      if (!lookup[rk]) lookup[rk] = {};
+      lookup[rk][ck] = row;
+    });
+    return (
+      <div className="flex-1 overflow-auto border border-slate-200 rounded-lg bg-white shadow-sm min-h-0">
+        <table className="w-full text-sm text-left">
+          <thead className="bg-slate-50 sticky top-0 z-10">
+            <tr>
+              {rowDims.map(d => (
+                <th key={d.name} className="px-4 py-3 text-xs font-bold uppercase tracking-wider border-b border-r border-slate-200 text-slate-600 bg-slate-100">{d.name}</th>
+              ))}
+              {uniqueColValues.map(cv => (
+                <th key={cv} className="px-4 py-3 text-xs font-bold uppercase tracking-wider border-b border-slate-200 text-purple-700 bg-purple-50 text-center" colSpan={measureKeys.length}>
+                  {cv}
+                </th>
+              ))}
+            </tr>
+            {measureKeys.length > 1 && (
+              <tr className="bg-slate-50">
+                {rowDims.map(d => <th key={d.name} className="border-b border-r border-slate-100" />)}
+                {uniqueColValues.flatMap(cv =>
+                  measureKeys.map(mk => (
+                    <th key={`${cv}-${mk}`} className="px-2 py-1 text-[10px] text-slate-500 font-medium text-center border-b border-slate-100 uppercase">{mk}</th>
+                  ))
+                )}
+              </tr>
+            )}
+          </thead>
+          <tbody className="divide-y divide-slate-100">
+            {uniqueRowValues.map((rv, ri) => (
+              <tr
+                key={rv}
+                className="hover:bg-slate-50 cursor-context-menu"
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  const rowData = lookup[rv]?.[uniqueColValues[0]] || {};
+                  handleDrillThrough(rowData);
+                }}
+                title="Right-click for drill-through"
+              >
+                {rowDims.map(d => {
+                  const val = queryResult.find(r => rowKey(r) === rv)?.[d.name];
+                  return <td key={d.name} className="px-4 py-2.5 font-medium text-slate-700 border-r border-slate-100 whitespace-nowrap">{formatCellValue(val)}</td>;
+                })}
+                {uniqueColValues.flatMap(cv =>
+                  measureKeys.map(mk => {
+                    const cellData = lookup[rv]?.[cv];
+                    const val = cellData ? cellData[mk] : null;
+                    return (
+                      <td key={`${cv}-${mk}`} className="px-4 py-2.5 text-center text-slate-600 tabular-nums whitespace-nowrap">
+                        {val !== null && val !== undefined ? formatCellValue(val) : <span className="text-slate-300 text-xs">—</span>}
+                      </td>
+                    );
+                  })
+                )}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <div className="px-4 py-2 text-xs text-slate-400 border-t border-slate-100 bg-slate-50">
+          {uniqueRowValues.length} rows × {uniqueColValues.length} columns — Right-click a row for drill-through
+        </div>
+      </div>
+    );
+  };
 
   const renderVisual = () => {
     if (!queryResult || queryResult.length === 0) {
@@ -492,7 +783,6 @@ export function BuilderPane() {
     }
 
     const keys = columnOrder.length > 0 ? columnOrder : Object.keys(queryResult[0]);
-    // Try to guess dimension vs measure
     const dimKey = rowDims[0]?.name || colDims[0]?.name || keys[0];
     const measureKeys = keys.filter(k => k !== dimKey);
 
@@ -541,60 +831,112 @@ export function BuilderPane() {
       setSortConfig({ key, direction });
     };
 
+    const tooltipStyle = { borderRadius: '8px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)', fontSize: '12px' };
+
     switch (visualType) {
+      case 'matrix':
+        return renderMatrix();
+
       case 'bar':
         return (
           <ResponsiveContainer width="100%" height={400}>
             <BarChart data={queryResult}>
               <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
-              <XAxis dataKey={dimKey} axisLine={false} tickLine={false} tick={{fill: '#64748b', fontSize: 12}} />
-              <YAxis axisLine={false} tickLine={false} tick={{fill: '#64748b', fontSize: 12}} />
-              <RechartsTooltip cursor={{fill: '#f1f5f9'}} contentStyle={{borderRadius: '8px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}} />
-              <Legend iconType="circle" wrapperStyle={{fontSize: '12px'}} />
+              <XAxis dataKey={dimKey} axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
+              <YAxis axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
+              <RechartsTooltip cursor={{ fill: '#f1f5f9' }} contentStyle={tooltipStyle} />
+              <Legend iconType="circle" wrapperStyle={{ fontSize: '12px' }} />
               {measureKeys.map((key, i) => (
-                <Bar key={key} dataKey={key} fill={COLORS[i % COLORS.length]} radius={[4, 4, 0, 0]} />
+                <Bar key={key} dataKey={key} fill={CHART_COLORS[i % CHART_COLORS.length]} radius={[4, 4, 0, 0]} />
               ))}
             </BarChart>
           </ResponsiveContainer>
         );
+
       case 'line':
         return (
           <ResponsiveContainer width="100%" height={400}>
             <RechartsLineChart data={queryResult}>
               <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
-              <XAxis dataKey={dimKey} axisLine={false} tickLine={false} tick={{fill: '#64748b', fontSize: 12}} />
-              <YAxis axisLine={false} tickLine={false} tick={{fill: '#64748b', fontSize: 12}} />
-              <RechartsTooltip contentStyle={{borderRadius: '8px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}} />
-              <Legend iconType="circle" wrapperStyle={{fontSize: '12px'}} />
+              <XAxis dataKey={dimKey} axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
+              <YAxis axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
+              <RechartsTooltip contentStyle={tooltipStyle} />
+              <Legend iconType="circle" wrapperStyle={{ fontSize: '12px' }} />
               {measureKeys.map((key, i) => (
-                <Line key={key} type="monotone" dataKey={key} stroke={COLORS[i % COLORS.length]} strokeWidth={3} dot={{r: 4, strokeWidth: 2}} activeDot={{r: 6}} />
+                <Line key={key} type="monotone" dataKey={key} stroke={CHART_COLORS[i % CHART_COLORS.length]} strokeWidth={3} dot={{ r: 4, strokeWidth: 2 }} activeDot={{ r: 6 }} />
               ))}
             </RechartsLineChart>
           </ResponsiveContainer>
         );
+
+      case 'area':
+        return (
+          <ResponsiveContainer width="100%" height={400}>
+            <RechartsAreaChart data={queryResult}>
+              <defs>
+                {measureKeys.map((key, i) => (
+                  <linearGradient key={key} id={`grad-${i}`} x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor={CHART_COLORS[i % CHART_COLORS.length]} stopOpacity={0.3} />
+                    <stop offset="95%" stopColor={CHART_COLORS[i % CHART_COLORS.length]} stopOpacity={0} />
+                  </linearGradient>
+                ))}
+              </defs>
+              <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
+              <XAxis dataKey={dimKey} axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
+              <YAxis axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
+              <RechartsTooltip contentStyle={tooltipStyle} />
+              <Legend iconType="circle" wrapperStyle={{ fontSize: '12px' }} />
+              {measureKeys.map((key, i) => (
+                <Area key={key} type="monotone" dataKey={key} stroke={CHART_COLORS[i % CHART_COLORS.length]} strokeWidth={2} fill={`url(#grad-${i})`} />
+              ))}
+            </RechartsAreaChart>
+          </ResponsiveContainer>
+        );
+
       case 'pie':
         return (
           <ResponsiveContainer width="100%" height={400}>
             <RechartsPieChart>
-              <Pie
-                data={queryResult}
-                dataKey={measureKeys[0]}
-                nameKey={dimKey}
-                cx="50%"
-                cy="50%"
-                outerRadius={150}
-                innerRadius={80}
-                paddingAngle={2}
-              >
-                {queryResult.map((entry, index) => (
-                  <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
+              <Pie data={queryResult} dataKey={measureKeys[0]} nameKey={dimKey} cx="50%" cy="50%" outerRadius={150} innerRadius={80} paddingAngle={2}>
+                {queryResult.map((_entry, index) => (
+                  <Cell key={`cell-${index}`} fill={CHART_COLORS[index % CHART_COLORS.length]} />
                 ))}
               </Pie>
-              <RechartsTooltip contentStyle={{borderRadius: '8px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}} />
-              <Legend iconType="circle" wrapperStyle={{fontSize: '12px'}} />
+              <RechartsTooltip contentStyle={tooltipStyle} />
+              <Legend iconType="circle" wrapperStyle={{ fontSize: '12px' }} />
             </RechartsPieChart>
           </ResponsiveContainer>
         );
+
+      case 'scatter':
+        return (
+          <ResponsiveContainer width="100%" height={400}>
+            <RechartsScatterChart>
+              <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+              <XAxis dataKey={measureKeys[0] || dimKey} name={measureKeys[0] || dimKey} axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
+              <YAxis dataKey={measureKeys[1] || measureKeys[0]} name={measureKeys[1] || measureKeys[0]} axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
+              <RechartsTooltip cursor={{ strokeDasharray: '3 3' }} contentStyle={tooltipStyle} />
+              <Scatter data={queryResult} fill={CHART_COLORS[0]} fillOpacity={0.7} />
+            </RechartsScatterChart>
+          </ResponsiveContainer>
+        );
+
+      case 'radar':
+        return (
+          <ResponsiveContainer width="100%" height={400}>
+            <RadarChart data={queryResult} cx="50%" cy="50%" outerRadius={150}>
+              <PolarGrid stroke="#e2e8f0" />
+              <PolarAngleAxis dataKey={dimKey} tick={{ fill: '#64748b', fontSize: 12 }} />
+              <PolarRadiusAxis axisLine={false} tick={{ fill: '#94a3b8', fontSize: 10 }} />
+              {measureKeys.map((key, i) => (
+                <Radar key={key} name={key} dataKey={key} stroke={CHART_COLORS[i % CHART_COLORS.length]} fill={CHART_COLORS[i % CHART_COLORS.length]} fillOpacity={0.2} />
+              ))}
+              <Legend iconType="circle" wrapperStyle={{ fontSize: '12px' }} />
+              <RechartsTooltip contentStyle={tooltipStyle} />
+            </RadarChart>
+          </ResponsiveContainer>
+        );
+
       case 'table':
       default: {
         const hasActiveFilters = Object.values(filters).some(v => v);
@@ -714,15 +1056,21 @@ export function BuilderPane() {
                   <tbody className="divide-y divide-slate-100">
                     {processedData.length > 0 ? (
                       processedData.map((row, i) => (
-                        <tr key={i} className="hover:bg-slate-50 transition-colors">
+                        <tr
+                          key={i}
+                          className="hover:bg-slate-50 transition-colors cursor-context-menu"
+                          onContextMenu={(e) => {
+                            e.preventDefault();
+                            if ([...rowDims, ...colDims].length > 0) handleDrillThrough(row);
+                          }}
+                          title={[...rowDims, ...colDims].length > 0 ? "Right-click for drill-through" : undefined}
+                        >
                           {keys.map(key => {
-                            const colors = columnColors[key];
-                            const style = colors ? {
-                              backgroundColor: colors.bg ? `${colors.bg}20` : undefined,
-                              color: colors.text,
-                              fontWeight: colors.text ? '500' : 'normal'
+                            const col = columnColors[key];
+                            const style = col ? {
+                              backgroundColor: col.bg ? hexToRgba(col.bg, 0.15) : undefined,
+                              color: col.text || undefined,
                             } : {};
-
                             return (
                               <td key={key} className="px-4 py-2.5 whitespace-nowrap text-slate-600" style={style}>
                                 {row[key] !== null && row[key] !== undefined ? formatCellValue(row[key]) : <span className="text-slate-300 italic">null</span>}
@@ -787,10 +1135,21 @@ export function BuilderPane() {
               onClick={handleClear}
               disabled={queryConfig.dimensions.length === 0 && queryConfig.measures.length === 0 && (!queryResult || queryResult.length === 0)}
               className="flex items-center gap-2 bg-white border border-slate-200 hover:bg-red-50 hover:border-red-200 hover:text-red-600 text-slate-500 px-3 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed shadow-sm"
-              title="Clear all dimensions, measures and results"
+              title="Clear all"
             >
               <RotateCcw size={15} />
               Clear
+            </button>
+            <button
+              onClick={handleShowHistory}
+              className={clsx(
+                "flex items-center gap-2 border px-3 py-2 rounded-lg text-sm font-medium transition-colors shadow-sm",
+                showHistory ? "bg-slate-800 border-slate-700 text-white" : "bg-white border-slate-200 text-slate-600 hover:bg-slate-50"
+              )}
+              title="Query History"
+            >
+              <History size={15} />
+              History
             </button>
             <button
               onClick={handleSaveToDashboard}
@@ -799,6 +1158,15 @@ export function BuilderPane() {
             >
               <Save size={16} />
               {isSaving ? 'Saving...' : 'Save'}
+            </button>
+            <button
+              onClick={handleRunAI}
+              disabled={[...rowDims, ...colDims].length === 0 && queryConfig.measures.length === 0}
+              className="flex items-center gap-2 bg-violet-500 hover:bg-violet-600 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
+              title="Analyze query with AI before running"
+            >
+              <Brain size={16} />
+              Run AI
             </button>
             <button
               onClick={buildAndExecuteQuery}
@@ -995,11 +1363,16 @@ export function BuilderPane() {
                   <div className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">Suggested Measures</div>
                   <div className="flex flex-wrap gap-2">
                     <button onClick={() => addMeasure('*', 'count')} className="text-xs font-medium bg-emerald-100 text-emerald-700 px-2.5 py-1.5 rounded-md hover:bg-emerald-200 transition-colors border border-emerald-200 shadow-sm">
-                      Count Records
+                      Count *
                     </button>
-                    {schema[selectedTable].filter((c: any) => c.type.includes('Int') || c.type.includes('Float') || c.type.includes('Decimal')).slice(0, 4).map((col: any) => (
-                      <button key={col.name} onClick={() => addMeasure(col.name, 'sum')} className="text-xs font-medium bg-blue-100 text-blue-700 px-2.5 py-1.5 rounded-md hover:bg-blue-200 transition-colors border border-blue-200 shadow-sm">
-                        Sum {col.name}
+                    {schema[selectedTable].filter((c: any) => c.type.includes('Int') || c.type.includes('Float') || c.type.includes('Decimal')).slice(0, 3).map((col: any) => (
+                      <button key={`sum-${col.name}`} onClick={() => addMeasure(col.name, 'sum')} className="text-xs font-medium bg-blue-100 text-blue-700 px-2.5 py-1.5 rounded-md hover:bg-blue-200 transition-colors border border-blue-200 shadow-sm">
+                        SUM({col.name})
+                      </button>
+                    ))}
+                    {schema[selectedTable].filter((c: any) => c.type.includes('Int') || c.type.includes('Float') || c.type.includes('Decimal')).slice(0, 2).map((col: any) => (
+                      <button key={`avg-${col.name}`} onClick={() => addMeasure(col.name, 'avg')} className="text-xs font-medium bg-amber-100 text-amber-700 px-2.5 py-1.5 rounded-md hover:bg-amber-200 transition-colors border border-amber-200 shadow-sm">
+                        AVG({col.name})
                       </button>
                     ))}
                   </div>
@@ -1041,13 +1414,30 @@ export function BuilderPane() {
                                 <div className={clsx("w-2 h-2 rounded-full shrink-0", isNumeric ? "bg-blue-400" : "bg-emerald-400")} />
                                 <span className="text-sm text-slate-700 truncate" title={col.name}>{col.name}</span>
                               </div>
-                              <div className="opacity-0 group-hover:opacity-100 flex items-center gap-1 transition-opacity">
+                              <div className="opacity-0 group-hover:opacity-100 flex items-center gap-1 transition-opacity relative">
                                 <button onClick={() => addRowDimension(col.name)} className="text-[10px] font-medium bg-emerald-100 hover:bg-emerald-200 text-emerald-700 px-1.5 py-0.5 rounded">Row</button>
                                 <button onClick={() => addColDimension(col.name)} className="text-[10px] font-medium bg-purple-100 hover:bg-purple-200 text-purple-700 px-1.5 py-0.5 rounded">Col</button>
-                                {isNumeric && (
-                                  <button onClick={() => addMeasure(col.name, 'sum')} className="text-[10px] font-medium bg-blue-100 hover:bg-blue-200 text-blue-700 px-1.5 py-0.5 rounded">Sum</button>
-                                )}
-                                <button onClick={() => addMeasure(col.name, 'count')} className="text-[10px] font-medium bg-slate-200 hover:bg-slate-300 text-slate-700 px-1.5 py-0.5 rounded">Cnt</button>
+                                <div className="relative">
+                                  <button
+                                    onClick={(e) => { e.stopPropagation(); setAddMeasureFor(addMeasureFor === col.name ? null : col.name); }}
+                                    className="text-[10px] font-medium bg-blue-100 hover:bg-blue-200 text-blue-700 px-1.5 py-0.5 rounded flex items-center gap-0.5"
+                                  >
+                                    Agg <ChevronRight size={9} className={clsx("transition-transform", addMeasureFor === col.name ? "rotate-90" : "")} />
+                                  </button>
+                                  {addMeasureFor === col.name && (
+                                    <div className="absolute right-0 top-full mt-1 z-50 bg-white border border-slate-200 rounded-lg shadow-xl py-1 min-w-[150px]">
+                                      {AGG_OPTIONS.map(opt => (
+                                        <button
+                                          key={opt.value}
+                                          onClick={() => addMeasure(col.name, opt.value)}
+                                          className="w-full text-left px-3 py-1.5 text-xs hover:bg-slate-50 text-slate-700 font-mono"
+                                        >
+                                          {opt.label}
+                                        </button>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
                               </div>
                             </div>
                           );
@@ -1060,6 +1450,45 @@ export function BuilderPane() {
             )}
           </div>
         </div>
+
+        {/* History Panel (slide-in from right) */}
+        {showHistory && (
+          <div className="w-80 bg-white border-l border-slate-200 flex flex-col h-full overflow-hidden shrink-0">
+            <div className="p-4 border-b border-slate-200 flex items-center justify-between bg-white shrink-0">
+              <div className="flex items-center gap-2">
+                <History size={16} className="text-slate-600" />
+                <h3 className="text-sm font-semibold text-slate-800">Query History</h3>
+              </div>
+              <button onClick={() => setShowHistory(false)} className="text-slate-400 hover:text-slate-600"><X size={16} /></button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-3 space-y-2">
+              {loadingHistory ? (
+                <div className="text-sm text-slate-400 text-center py-8">Loading…</div>
+              ) : historyEntries.length === 0 ? (
+                <div className="text-sm text-slate-400 text-center py-8 italic">No history yet.</div>
+              ) : (
+                historyEntries.map(entry => (
+                  <div key={entry.id} className="group bg-slate-50 border border-slate-200 rounded-lg p-3 hover:border-slate-300 transition-colors">
+                    <div className="flex items-start justify-between gap-2 mb-1">
+                      <div className="flex items-center gap-1 text-[10px] text-slate-400">
+                        <Clock size={10} />
+                        {new Date(entry.created_at).toLocaleString()}
+                      </div>
+                      <button
+                        onClick={() => replayHistoryEntry(entry.sql)}
+                        className="shrink-0 opacity-0 group-hover:opacity-100 transition-opacity text-[10px] font-medium bg-emerald-100 text-emerald-700 hover:bg-emerald-200 px-2 py-0.5 rounded border border-emerald-200 flex items-center gap-1"
+                        title="Replay this query"
+                      >
+                        <Play size={9} /> Run
+                      </button>
+                    </div>
+                    <pre className="text-[10px] text-slate-600 whitespace-pre-wrap break-all font-mono leading-relaxed line-clamp-4 overflow-hidden">{entry.sql}</pre>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        )}
 
         {/* Results Area — overflow-auto so content is reachable on small screens */}
         <div className="flex-1 p-6 overflow-auto bg-slate-50/50 flex flex-col gap-4 min-w-0">
@@ -1093,14 +1522,19 @@ export function BuilderPane() {
                   <div className="flex items-center gap-2">
                     <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg">
                       {[
-                        { id: 'table', icon: Table },
-                        { id: 'bar', icon: BarChart2 },
-                        { id: 'line', icon: LineChart },
-                        { id: 'pie', icon: PieChart },
+                        { id: 'table',  icon: Table,       title: 'Table' },
+                        { id: 'matrix', icon: LayoutGrid,   title: 'Matrix / Pivot' },
+                        { id: 'bar',    icon: BarChart2,    title: 'Bar Chart' },
+                        { id: 'line',   icon: LineChart,    title: 'Line Chart' },
+                        { id: 'area',   icon: Activity,     title: 'Area Chart' },
+                        { id: 'pie',    icon: PieChart,     title: 'Pie Chart' },
+                        { id: 'scatter',icon: ScatterChart, title: 'Scatter Plot' },
+                        { id: 'radar',  icon: Grid3X3,      title: 'Radar Chart' },
                       ].map((v) => (
                         <button
                           key={v.id}
-                          onClick={() => setVisualType(v.id as any)}
+                          onClick={() => setVisualType(v.id as VisualType)}
+                          title={v.title}
                           className={clsx(
                             "p-1.5 rounded-md transition-all",
                             visualType === v.id ? "bg-white shadow-sm text-emerald-600" : "text-slate-500 hover:text-slate-700"
@@ -1129,6 +1563,195 @@ export function BuilderPane() {
           })()}
         </div>
       </div>
+
+      {/* ------------------------------------------------------------------ */}
+      {/* Drill-through Modal                                                  */}
+      {/* ------------------------------------------------------------------ */}
+      {drillThrough.visible && createPortal(
+        <div className="fixed inset-0 z-[300] flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-5xl max-h-[80vh] flex flex-col overflow-hidden">
+            <div className="p-4 border-b border-slate-200 flex items-center justify-between shrink-0">
+              <div>
+                <h3 className="text-sm font-bold text-slate-800">Drill-Through Details</h3>
+                <p className="text-xs text-slate-500 mt-0.5 font-mono">{drillThrough.title}</p>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-slate-400 font-mono bg-slate-100 px-2 py-1 rounded">LIMIT {MAX_ROWS}</span>
+                <button onClick={() => setDrillThrough(prev => ({ ...prev, visible: false }))} className="text-slate-400 hover:text-slate-600 p-1.5 hover:bg-slate-100 rounded-md">
+                  <X size={16} />
+                </button>
+              </div>
+            </div>
+            <div className="flex-1 overflow-auto p-1">
+              {drillThrough.loading ? (
+                <div className="flex items-center justify-center h-40 text-slate-400 text-sm">Fetching rows…</div>
+              ) : drillThrough.error ? (
+                <div className="p-4 text-red-600 text-sm bg-red-50 rounded-lg m-4">{drillThrough.error}</div>
+              ) : drillThrough.data.length === 0 ? (
+                <div className="flex items-center justify-center h-40 text-slate-400 text-sm italic">No rows found.</div>
+              ) : (
+                <table className="w-full text-xs text-left min-w-max">
+                  <thead className="bg-slate-50 sticky top-0">
+                    <tr>
+                      {Object.keys(drillThrough.data[0]).map(k => (
+                        <th key={k} className="px-3 py-2 text-[10px] font-bold uppercase tracking-wider text-slate-500 border-b border-slate-200 whitespace-nowrap">{k}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {drillThrough.data.map((row, i) => (
+                      <tr key={i} className="hover:bg-slate-50">
+                        {Object.values(row).map((val, j) => (
+                          <td key={j} className="px-3 py-1.5 text-slate-600 whitespace-nowrap font-mono">
+                            {val === null || val === undefined ? <span className="text-slate-300 italic">null</span> : String(val)}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+            <div className="p-3 border-t border-slate-100 bg-slate-50 text-xs text-slate-400 shrink-0 font-mono">
+              SELECT * FROM {selectedTable} … — {drillThrough.data.length} rows
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {/* ------------------------------------------------------------------ */}
+      {/* AI Analysis Modal                                                    */}
+      {/* ------------------------------------------------------------------ */}
+      {aiAnalysis.visible && createPortal(
+        <div className="fixed inset-0 z-[300] flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[85vh] flex flex-col overflow-hidden">
+            <div className="p-4 border-b border-slate-200 flex items-center justify-between shrink-0">
+              <div className="flex items-center gap-2">
+                <Brain size={18} className="text-violet-600" />
+                <h3 className="text-sm font-bold text-slate-800">AI Query Analysis</h3>
+                {!aiAnalysis.loading && aiAnalysis.risk_level && (
+                  <span className={clsx(
+                    "text-[10px] font-bold px-2 py-0.5 rounded-full uppercase",
+                    aiAnalysis.risk_level === 'high' ? "bg-red-100 text-red-700" :
+                    aiAnalysis.risk_level === 'medium' ? "bg-amber-100 text-amber-700" :
+                    "bg-emerald-100 text-emerald-700"
+                  )}>
+                    {aiAnalysis.risk_level} risk
+                  </span>
+                )}
+              </div>
+              <button onClick={() => setAiAnalysis(prev => ({ ...prev, visible: false }))} className="text-slate-400 hover:text-slate-600 p-1.5 hover:bg-slate-100 rounded-md">
+                <X size={16} />
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-5 space-y-4">
+              {/* SQL Preview */}
+              <div className="bg-slate-900 rounded-lg p-3">
+                <div className="text-[10px] text-slate-400 uppercase tracking-wider mb-2 font-bold">Query to be executed</div>
+                <pre className="text-xs text-emerald-400 font-mono whitespace-pre-wrap break-all leading-relaxed">{aiAnalysis.sql}</pre>
+              </div>
+
+              {aiAnalysis.loading ? (
+                <div className="flex flex-col items-center justify-center py-10 text-slate-400 gap-3">
+                  <Brain size={32} className="text-violet-400 animate-pulse" />
+                  <p className="text-sm">AI is analyzing your query…</p>
+                </div>
+              ) : aiAnalysis.error ? (
+                <div className="p-4 text-red-600 text-sm bg-red-50 rounded-lg border border-red-200">{aiAnalysis.error}</div>
+              ) : (
+                <>
+                  {aiAnalysis.alerts.length > 0 && (
+                    <div>
+                      <div className="flex items-center gap-2 mb-2">
+                        <AlertTriangle size={14} className="text-red-500" />
+                        <span className="text-xs font-bold text-red-700 uppercase tracking-wider">Alerts</span>
+                      </div>
+                      <ul className="space-y-1.5">
+                        {aiAnalysis.alerts.map((a, i) => (
+                          <li key={i} className="flex items-start gap-2 text-sm text-red-700 bg-red-50 rounded-lg px-3 py-2 border border-red-100">
+                            <span className="text-red-400 mt-0.5 shrink-0">•</span>{a}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
+                  {aiAnalysis.suggestions.length > 0 && (
+                    <div>
+                      <div className="flex items-center gap-2 mb-2">
+                        <Lightbulb size={14} className="text-amber-500" />
+                        <span className="text-xs font-bold text-amber-700 uppercase tracking-wider">Suggestions</span>
+                      </div>
+                      <ul className="space-y-1.5">
+                        {aiAnalysis.suggestions.map((s, i) => (
+                          <li key={i} className="flex items-start gap-2 text-sm text-amber-800 bg-amber-50 rounded-lg px-3 py-2 border border-amber-100">
+                            <span className="text-amber-400 mt-0.5 shrink-0">•</span>{s}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
+                  {aiAnalysis.projections.length > 0 && (
+                    <div>
+                      <div className="flex items-center gap-2 mb-2">
+                        <TrendingUp size={14} className="text-blue-500" />
+                        <span className="text-xs font-bold text-blue-700 uppercase tracking-wider">Projections</span>
+                      </div>
+                      <ul className="space-y-1.5">
+                        {aiAnalysis.projections.map((p, i) => (
+                          <li key={i} className="flex items-start gap-2 text-sm text-blue-800 bg-blue-50 rounded-lg px-3 py-2 border border-blue-100">
+                            <span className="text-blue-400 mt-0.5 shrink-0">•</span>{p}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
+                  {aiAnalysis.optimized_sql && (
+                    <div>
+                      <div className="flex items-center gap-2 mb-2">
+                        <Sparkles size={14} className="text-violet-500" />
+                        <span className="text-xs font-bold text-violet-700 uppercase tracking-wider">Optimized SQL</span>
+                      </div>
+                      <div className="bg-slate-900 rounded-lg p-3">
+                        <pre className="text-xs text-violet-300 font-mono whitespace-pre-wrap break-all leading-relaxed">{aiAnalysis.optimized_sql}</pre>
+                      </div>
+                    </div>
+                  )}
+
+                  {aiAnalysis.alerts.length === 0 && aiAnalysis.suggestions.length === 0 && aiAnalysis.projections.length === 0 && (
+                    <div className="flex items-center gap-2 text-emerald-700 bg-emerald-50 rounded-lg px-4 py-3 border border-emerald-200">
+                      <span className="text-emerald-500">✓</span>
+                      <span className="text-sm font-medium">Query looks good — no issues detected.</span>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+
+            <div className="p-4 border-t border-slate-200 flex justify-end gap-3 shrink-0 bg-slate-50">
+              <button
+                onClick={() => setAiAnalysis(prev => ({ ...prev, visible: false }))}
+                className="px-4 py-2 text-sm font-medium text-slate-600 hover:bg-slate-200 rounded-lg transition-colors border border-slate-200 bg-white"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => { setAiAnalysis(prev => ({ ...prev, visible: false })); buildAndExecuteQuery(); }}
+                disabled={aiAnalysis.loading}
+                className="flex items-center gap-2 px-4 py-2 text-sm font-medium bg-emerald-500 hover:bg-emerald-600 text-white rounded-lg transition-colors disabled:opacity-50"
+              >
+                <Play size={14} />
+                Run Query Anyway
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
     </div>
   );
 }

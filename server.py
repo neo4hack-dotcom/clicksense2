@@ -557,6 +557,93 @@ def chat():
 
 
 # ---------------------------------------------------------------------------
+# AI Query Analyzer
+# ---------------------------------------------------------------------------
+@app.route("/api/analyze", methods=["POST"])
+def analyze_query():
+    data = request.get_json()
+    sql = data.get("sql", "")
+    schema = data.get("schema", {})
+
+    system_prompt = f"""
+You are an expert ClickHouse SQL performance analyst and data engineer.
+Analyze the following SQL query and provide:
+1. Performance alerts (full table scans, missing LIMIT, unoptimized aggregations, etc.)
+2. Correctness concerns (potential wrong results, type mismatches, NULL handling)
+3. Optimization suggestions (better functions, indexes, partitioning hints)
+4. Data projections (estimated result size, cardinality warnings)
+
+Database schema context:
+{json.dumps(schema, indent=2)}
+
+Return ONLY a JSON object (no markdown, no code blocks) with this exact structure:
+{{
+  "alerts": ["alert message 1", "alert message 2"],
+  "suggestions": ["suggestion 1", "suggestion 2"],
+  "projections": ["projection/estimate 1"],
+  "optimized_sql": "improved SQL or empty string if already optimal",
+  "risk_level": "low" | "medium" | "high"
+}}
+"""
+
+    user_message = f"Analyze this ClickHouse SQL query:\n\n{sql}"
+
+    try:
+        if llm_config["provider"] == "http":
+            headers = {"Content-Type": "application/json"}
+            if llm_config.get("apiKey"):
+                headers["Authorization"] = f"Bearer {llm_config['apiKey']}"
+            base_url = (llm_config.get("httpUrl") or "http://localhost:8000").rstrip("/")
+            resp = _http_post(
+                f"{base_url}/v1/chat/completions",
+                json={
+                    "model": llm_config.get("model") or "local-model",
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_message},
+                    ],
+                    "temperature": 0.3,
+                },
+                headers=headers,
+                timeout=60,
+            )
+            if not resp.ok:
+                raise Exception(f"HTTP LLM Error: {resp.status_code} - {resp.text}")
+            resp_data = resp.json()
+            content = (
+                resp_data.get("choices", [{}])[0].get("message", {}).get("content")
+                or resp_data.get("content")
+                or ""
+            )
+            content = content.replace("```json", "").replace("```JSON", "").replace("```", "").strip()
+            return jsonify(json.loads(content))
+
+        elif llm_config["provider"] == "ollama":
+            resp = _http_post(
+                f"{llm_config['ollamaUrl']}/api/chat",
+                json={
+                    "model": llm_config.get("model", "llama3"),
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_message},
+                    ],
+                    "stream": False,
+                    "format": "json",
+                },
+                timeout=60,
+            )
+            resp_data = resp.json()
+            return jsonify(json.loads(resp_data["message"]["content"]))
+
+        else:
+            return jsonify({"error": "Invalid LLM provider"}), 400
+
+    except Exception as exc:
+        print(f"Analyze error: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+
+# ---------------------------------------------------------------------------
 # Serve built frontend (production)
 # ---------------------------------------------------------------------------
 @app.route("/", defaults={"path": ""})
