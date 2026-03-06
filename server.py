@@ -69,6 +69,7 @@ DEFAULT_DB = {
     "saved_queries": [],
     "query_history": [],
     "table_metadata": [],
+    "table_mappings": [],
 }
 
 
@@ -352,6 +353,45 @@ def update_table_metadata():
 
 
 # ---------------------------------------------------------------------------
+# Table mappings (friendly names for ClickHouse tables)
+# ---------------------------------------------------------------------------
+@app.route("/api/table_mappings", methods=["GET"])
+def get_table_mappings():
+    db = read_db()
+    mappings = db.get("table_mappings", [])
+    result = {m["table_name"]: m["mapping_name"] for m in mappings}
+    return jsonify(result)
+
+
+@app.route("/api/table_mappings", methods=["POST"])
+def update_table_mapping():
+    data = request.get_json()
+    table_name = data["table_name"]
+    mapping_name = data.get("mapping_name", "")
+
+    db = read_db()
+    if "table_mappings" not in db:
+        db["table_mappings"] = []
+
+    idx = next(
+        (i for i, m in enumerate(db["table_mappings"]) if m["table_name"] == table_name),
+        None,
+    )
+    if mapping_name:
+        if idx is not None:
+            db["table_mappings"][idx]["mapping_name"] = mapping_name
+        else:
+            db["table_mappings"].append({"table_name": table_name, "mapping_name": mapping_name})
+    else:
+        # Remove mapping if name is cleared
+        if idx is not None:
+            db["table_mappings"].pop(idx)
+
+    write_db(db)
+    return jsonify({"success": True})
+
+
+# ---------------------------------------------------------------------------
 # Query history
 # ---------------------------------------------------------------------------
 @app.route("/api/history", methods=["POST"])
@@ -456,6 +496,26 @@ def chat():
     messages = data["messages"]
     schema = data.get("schema", {})
     table_metadata = data.get("tableMetadata", {})
+    # selectedMappings: list of technical table names to restrict the search scope
+    selected_mappings = data.get("selectedMappings", [])
+    # tableMappings: dict of {technical_name: friendly_name}
+    table_mappings = data.get("tableMappings", {})
+
+    # Filter schema to only selected tables if a selection is active
+    if selected_mappings:
+        schema = {k: v for k, v in schema.items() if k in selected_mappings}
+        table_metadata = {k: v for k, v in table_metadata.items() if k in selected_mappings}
+
+    # Build a mapping context string for the prompt
+    mapping_context = ""
+    if table_mappings:
+        lines = [
+            f"- Technical table name: `{tech}` → Business name: \"{friendly}\""
+            for tech, friendly in table_mappings.items()
+            if tech in schema  # only include tables present in the (possibly filtered) schema
+        ]
+        if lines:
+            mapping_context = "\n      Table name mapping (use the technical name in SQL, refer to business name in explanations):\n      " + "\n      ".join(lines)
 
     system_prompt = f"""
       You are an expert ClickHouse data analyst.
@@ -466,6 +526,7 @@ def chat():
 
       Here is the table metadata (functional descriptions):
       {json.dumps(table_metadata, indent=2)}
+{mapping_context}
 
       Here is the functional knowledge base to help you understand the business context:
       {knowledge_base}

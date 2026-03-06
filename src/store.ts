@@ -6,9 +6,17 @@ interface AppState {
 
   schema: Record<string, { name: string; type: string }[]>;
   setSchema: (schema: Record<string, { name: string; type: string }[]>) => void;
-  
+
   tableMetadata: Record<string, { description: string; is_favorite: boolean }>;
   setTableMetadata: (meta: Record<string, { description: string; is_favorite: boolean }>) => void;
+
+  // tableMappings: technical table name -> friendly business name
+  tableMappings: Record<string, string>;
+  setTableMappings: (mappings: Record<string, string>) => void;
+
+  // selectedMappings: list of technical table names selected in the chat filter
+  selectedMappings: string[];
+  setSelectedMappings: (mappings: string[]) => void;
 
   selectedTable: string | null;
   setSelectedTable: (table: string | null) => void;
@@ -43,9 +51,15 @@ export const useAppStore = create<AppState>((set) => ({
 
   schema: {},
   setSchema: (schema) => set({ schema }),
-  
+
   tableMetadata: {},
   setTableMetadata: (tableMetadata) => set({ tableMetadata }),
+
+  tableMappings: {},
+  setTableMappings: (tableMappings) => set({ tableMappings }),
+
+  selectedMappings: [],
+  setSelectedMappings: (selectedMappings) => set({ selectedMappings }),
 
   selectedTable: null,
   setSelectedTable: (selectedTable) => set({ selectedTable }),

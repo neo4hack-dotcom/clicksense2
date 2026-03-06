@@ -1,11 +1,125 @@
 import { useState, useRef, useEffect } from 'react';
-import { Send, Bot, User, Loader2, Sparkles, Play, Save, History, Trash2 } from 'lucide-react';
+import { Send, Bot, User, Loader2, Sparkles, Play, Save, History, Trash2, Tags, X, ChevronDown } from 'lucide-react';
 import { useAppStore } from '../store';
 import clsx from 'clsx';
 import { motion } from 'motion/react';
 
+function MappingSelector() {
+  const { tableMappings, setTableMappings, selectedMappings, setSelectedMappings } = useAppStore();
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  // Load mappings on mount
+  useEffect(() => {
+    fetch('/api/table_mappings')
+      .then(res => res.json())
+      .then(data => setTableMappings(data));
+  }, []);
+
+  // Close dropdown when clicking outside
+  useEffect(() => {
+    function handleClick(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener('mousedown', handleClick);
+    return () => document.removeEventListener('mousedown', handleClick);
+  }, []);
+
+  const mappedTables = Object.entries(tableMappings).filter(([, name]) => name.trim());
+  if (mappedTables.length === 0) return null;
+
+  const toggle = (techName: string) => {
+    setSelectedMappings(
+      selectedMappings.includes(techName)
+        ? selectedMappings.filter(t => t !== techName)
+        : [...selectedMappings, techName]
+    );
+  };
+
+  const clearAll = () => setSelectedMappings([]);
+
+  return (
+    <div className="px-4 pb-2" ref={ref}>
+      <div className="relative">
+        <div className="flex items-center gap-2 flex-wrap">
+          {selectedMappings.length > 0 && (
+            <div className="flex items-center gap-1.5 flex-wrap">
+              {selectedMappings.map(tech => (
+                <span
+                  key={tech}
+                  className="flex items-center gap-1 bg-emerald-100 text-emerald-800 text-xs font-medium px-2.5 py-1 rounded-full"
+                >
+                  {tableMappings[tech] || tech}
+                  <button
+                    onClick={() => toggle(tech)}
+                    className="ml-0.5 text-emerald-600 hover:text-emerald-900"
+                  >
+                    <X size={11} />
+                  </button>
+                </span>
+              ))}
+              <button
+                onClick={clearAll}
+                className="text-xs text-slate-400 hover:text-red-500 px-1 transition-colors"
+              >
+                Clear all
+              </button>
+            </div>
+          )}
+          <button
+            onClick={() => setOpen(o => !o)}
+            className={clsx(
+              'flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-full border transition-all',
+              selectedMappings.length > 0
+                ? 'border-emerald-300 text-emerald-700 bg-emerald-50 hover:bg-emerald-100'
+                : 'border-slate-200 text-slate-500 bg-slate-50 hover:bg-slate-100'
+            )}
+          >
+            <Tags size={13} />
+            {selectedMappings.length > 0 ? `${selectedMappings.length} scope(s) actif${selectedMappings.length > 1 ? 's' : ''}` : 'Filtrer par table'}
+            <ChevronDown size={12} className={clsx('transition-transform', open && 'rotate-180')} />
+          </button>
+        </div>
+
+        {open && (
+          <div className="absolute bottom-full mb-2 left-0 z-20 bg-white border border-slate-200 rounded-xl shadow-lg w-72 max-h-60 overflow-y-auto">
+            <div className="p-2 border-b border-slate-100 flex items-center justify-between">
+              <span className="text-xs font-semibold text-slate-600 px-1">Restreindre l'IA à ces tables</span>
+              {selectedMappings.length > 0 && (
+                <button onClick={clearAll} className="text-xs text-slate-400 hover:text-red-500 px-2">
+                  Tout désélectionner
+                </button>
+              )}
+            </div>
+            {mappedTables.map(([tech, friendly]) => {
+              const checked = selectedMappings.includes(tech);
+              return (
+                <label
+                  key={tech}
+                  className="flex items-center gap-3 px-3 py-2.5 hover:bg-slate-50 cursor-pointer transition-colors"
+                >
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={() => toggle(tech)}
+                    className="rounded border-slate-300 text-emerald-500 focus:ring-emerald-500"
+                  />
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium text-slate-800 truncate">{friendly}</div>
+                    <div className="text-[11px] text-slate-400 font-mono truncate">{tech}</div>
+                  </div>
+                </label>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function ChatPane() {
-  const { chatHistory, addChatMessage, clearChatHistory, schema, setQueryResult, currentUser, queryHistory, setQueryHistory, tableMetadata } = useAppStore();
+  const { chatHistory, addChatMessage, clearChatHistory, schema, setQueryResult, currentUser, queryHistory, setQueryHistory, tableMetadata, tableMappings, selectedMappings } = useAppStore();
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -28,7 +142,7 @@ export function ChatPane() {
 
   const handleSend = async () => {
     if (!input.trim()) return;
-    
+
     const userMsg = input;
     setInput('');
     addChatMessage({ role: 'user', content: userMsg });
@@ -43,16 +157,22 @@ export function ChatPane() {
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: messagesToSend, schema, tableMetadata }),
+        body: JSON.stringify({
+          messages: messagesToSend,
+          schema,
+          tableMetadata,
+          tableMappings,
+          selectedMappings,
+        }),
       });
-      
+
       const data = await res.json();
-      
+
       if (data.error) {
         addChatMessage({ role: 'assistant', content: `Error: ${data.error}` });
       } else {
-        addChatMessage({ 
-          role: 'assistant', 
+        addChatMessage({
+          role: 'assistant',
           content: data.explanation || 'Here is the query I generated:',
           sql: data.sql,
           visual: data.suggestedVisual
@@ -77,7 +197,7 @@ export function ChatPane() {
         alert(`Query Error: ${data.error}`);
       } else {
         setQueryResult(data.data);
-        
+
         // Save to history
         if (currentUser) {
           fetch('/api/history', {
@@ -98,7 +218,7 @@ export function ChatPane() {
 
   const handleSaveToDashboard = async (sql: string, visual: string, name: string) => {
     if (!currentUser) return alert("Please select a user first");
-    
+
     try {
       await fetch('/api/saved_queries', {
         method: 'POST',
@@ -107,7 +227,7 @@ export function ChatPane() {
           user_id: currentUser.id,
           name: name || "Saved from Chat",
           sql,
-          config: { dimensions: [], measures: [] }, // Chat queries might not have builder config
+          config: { dimensions: [], measures: [] },
           visual_type: visual || 'table'
         }),
       });
@@ -124,10 +244,10 @@ export function ChatPane() {
     "Search for the value '[value]' in the table [table_name]"
   ];
 
-  const suggestions = queryHistory.length > 0 
+  const suggestions = queryHistory.length > 0
     ? Array.from(new Set(queryHistory.map(h => h.query_text))).filter(q => q !== 'Built via Visual Builder').slice(0, 3)
     : defaultSuggestions;
-  
+
   if (suggestions.length === 0) suggestions.push(...defaultSuggestions);
 
   return (
@@ -168,7 +288,7 @@ export function ChatPane() {
             </div>
             <div className="flex flex-wrap gap-2 justify-center max-w-lg">
               {suggestions.map((s, i) => (
-                <button 
+                <button
                   key={i}
                   onClick={() => setInput(s)}
                   className="bg-white border border-slate-200 px-4 py-2 rounded-full text-sm text-slate-600 hover:border-emerald-500 hover:text-emerald-600 transition-colors shadow-sm flex items-center gap-2"
@@ -181,10 +301,10 @@ export function ChatPane() {
           </div>
         ) : (
           chatHistory.map((msg, i) => (
-            <motion.div 
+            <motion.div
               initial={{ opacity: 0, y: 10 }}
               animate={{ opacity: 1, y: 0 }}
-              key={i} 
+              key={i}
               className={clsx("flex gap-4", msg.role === 'user' ? "flex-row-reverse" : "")}
             >
               <div className={clsx(
@@ -203,14 +323,14 @@ export function ChatPane() {
                     <div className="flex items-center justify-between px-4 py-2 bg-slate-800/50 border-b border-slate-800">
                       <span className="text-xs font-mono text-slate-400">Generated SQL</span>
                       <div className="flex gap-2">
-                        <button 
+                        <button
                           onClick={() => handleSaveToDashboard(msg.sql!, msg.visual || 'table', chatHistory[i-1]?.content)}
                           className="flex items-center gap-1 text-xs bg-slate-700 hover:bg-slate-600 text-white px-3 py-1.5 rounded-md transition-colors font-medium"
                         >
                           <Save size={12} />
                           Save
                         </button>
-                        <button 
+                        <button
                           onClick={() => handleExecuteQuery(msg.sql!, chatHistory[i-1]?.content || 'Chat Query')}
                           className="flex items-center gap-1 text-xs bg-emerald-500 hover:bg-emerald-400 text-white px-3 py-1.5 rounded-md transition-colors font-medium"
                         >
@@ -242,23 +362,26 @@ export function ChatPane() {
         <div ref={messagesEndRef} />
       </div>
 
-      <div className="p-4 bg-white border-t border-slate-200">
-        <div className="relative flex items-center">
-          <input
-            type="text"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleSend()}
-            placeholder="Ask a question about your data..."
-            className="w-full bg-slate-50 border border-slate-200 rounded-full pl-6 pr-14 py-4 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all shadow-sm"
-          />
-          <button
-            onClick={handleSend}
-            disabled={!input.trim() || isLoading}
-            className="absolute right-2 p-2.5 bg-emerald-500 text-white rounded-full hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-sm"
-          >
-            <Send size={18} />
-          </button>
+      <div className="bg-white border-t border-slate-200">
+        <MappingSelector />
+        <div className="p-4 pt-2">
+          <div className="relative flex items-center">
+            <input
+              type="text"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && handleSend()}
+              placeholder="Ask a question about your data..."
+              className="w-full bg-slate-50 border border-slate-200 rounded-full pl-6 pr-14 py-4 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all shadow-sm"
+            />
+            <button
+              onClick={handleSend}
+              disabled={!input.trim() || isLoading}
+              className="absolute right-2 p-2.5 bg-emerald-500 text-white rounded-full hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-sm"
+            >
+              <Send size={18} />
+            </button>
+          </div>
         </div>
       </div>
     </div>
