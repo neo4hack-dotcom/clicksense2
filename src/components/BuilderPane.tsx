@@ -22,7 +22,7 @@ import {
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import {
-  GripVertical, X, Table, BarChart2, PieChart, LineChart, Play, Save, Sparkles, Star, RefreshCw,
+  GripVertical, X, Table, BarChart2, PieChart, LineChart, Play, Sparkles, Star, RefreshCw,
   Maximize2, Minimize2, Palette, ArrowUp, ArrowDown, Filter, RotateCcw, Search, Plus,
   History, Brain, AlertTriangle, Lightbulb, TrendingUp, Grid3X3, AreaChart, ScatterChart,
   ChevronRight, Clock, LayoutGrid, Activity
@@ -230,6 +230,7 @@ export function BuilderPane() {
   const [columnColors, setColumnColors] = useState<Record<string, { bg?: string; text?: string }>>({});
   const [showColorPicker, setShowColorPicker] = useState<string | null>(null);
   const [fieldSearch, setFieldSearch] = useState('');
+  const [tableSearch, setTableSearch] = useState('');
   const [showHistory, setShowHistory] = useState(false);
   const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
@@ -1152,14 +1153,6 @@ export function BuilderPane() {
               History
             </button>
             <button
-              onClick={handleSaveToDashboard}
-              disabled={isSaving || !queryResult || queryResult.length === 0}
-              className="flex items-center gap-2 bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
-            >
-              <Save size={16} />
-              {isSaving ? 'Saving...' : 'Save'}
-            </button>
-            <button
               onClick={handleRunAI}
               disabled={[...rowDims, ...colDims].length === 0 && queryConfig.measures.length === 0}
               className="flex items-center gap-2 bg-violet-500 hover:bg-violet-600 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
@@ -1311,7 +1304,7 @@ export function BuilderPane() {
           <div className="p-4 border-b border-slate-200 shrink-0">
             <div className="flex items-center justify-between mb-2">
               <h3 className="text-sm font-semibold text-slate-800">Select Table</h3>
-              <button 
+              <button
                 onClick={handleRefreshSchema}
                 disabled={isRefreshingSchema}
                 className="p-1.5 text-slate-400 hover:text-emerald-600 hover:bg-emerald-50 rounded-md transition-colors disabled:opacity-50"
@@ -1320,15 +1313,31 @@ export function BuilderPane() {
                 <RefreshCw size={14} className={isRefreshingSchema ? "animate-spin" : ""} />
               </button>
             </div>
-            <div className="max-h-48 overflow-y-auto border border-slate-200 rounded-lg bg-slate-50">
-              {tables.map(t => (
-                <div 
-                  key={t} 
+            {/* Table search */}
+            <div className="relative mb-2">
+              <Search size={12} className="absolute left-2 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
+              <input
+                type="text"
+                placeholder="Search tables…"
+                value={tableSearch}
+                onChange={(e) => setTableSearch(e.target.value)}
+                className="w-full text-xs pl-6 pr-6 py-1.5 border border-slate-200 rounded-md focus:ring-1 focus:ring-emerald-500 outline-none bg-slate-50"
+              />
+              {tableSearch && (
+                <button onClick={() => setTableSearch('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600">
+                  <X size={11} />
+                </button>
+              )}
+            </div>
+            <div className="max-h-[38px] overflow-y-auto border border-slate-200 rounded-lg bg-slate-50">
+              {tables.filter(t => !tableSearch || t.toLowerCase().includes(tableSearch.toLowerCase())).map(t => (
+                <div
+                  key={t}
                   onClick={() => handleTableSelect(t)}
-                  className={clsx("px-3 py-2 text-sm cursor-pointer flex items-center justify-between hover:bg-slate-100 border-b border-slate-100 last:border-0", selectedTable === t && "bg-emerald-50 text-emerald-700 font-medium")}
+                  className={clsx("px-3 py-1.5 text-sm cursor-pointer flex items-center justify-between hover:bg-slate-100 border-b border-slate-100 last:border-0", selectedTable === t && "bg-emerald-50 text-emerald-700 font-medium")}
                 >
                   <span className="truncate">{t}</span>
-                  <button 
+                  <button
                     onClick={(e) => { e.stopPropagation(); toggleFavorite(t); }}
                     className={clsx("shrink-0 p-1 rounded hover:bg-slate-200", tableMetadata[t]?.is_favorite ? "text-amber-400" : "text-slate-300")}
                   >
