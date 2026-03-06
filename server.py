@@ -419,6 +419,158 @@ def _parse_llm_json(content: str) -> dict:
     )
 
 
+# ---------------------------------------------------------------------------
+# Token budget utilities
+# ---------------------------------------------------------------------------
+import re as _re
+
+# Cache: model name -> max context window (tokens)
+_model_context_cache: dict = {}
+
+# Known context windows for common models
+_KNOWN_CONTEXT_LIMITS: dict = {
+    "llama3": 8192,
+    "llama3.1": 131072,
+    "llama3.2": 131072,
+    "llama3.3": 131072,
+    "mistral": 32768,
+    "mixtral": 32768,
+    "gemma2": 8192,
+    "gemma3": 131072,
+    "qwen2.5": 131072,
+    "qwen2": 32768,
+    "phi3": 131072,
+    "phi4": 131072,
+    "deepseek": 65536,
+    "codellama": 16384,
+    "vicuna": 4096,
+    "gpt-4": 128000,
+    "gpt-3.5": 16385,
+    "claude": 200000,
+}
+
+# Budget: reserve this fraction of the context for conversation + output
+_SYSTEM_PROMPT_BUDGET_FRACTION = 0.5
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate: ~4 chars per token for typical text."""
+    return max(1, len(text) // 4)
+
+
+def _get_model_context_limit() -> int:
+    """Return the context window (tokens) for the current LLM model.
+
+    Order of precedence:
+    1. In-memory cache (from a previous call).
+    2. Known limits dict (matched by substring of model name).
+    3. Ask the LLM itself, cache the result.
+    4. Conservative default (4 096 tokens).
+    """
+    model = (llm_config.get("model") or "unknown").lower()
+
+    if model in _model_context_cache:
+        return _model_context_cache[model]
+
+    for known_name, limit in _KNOWN_CONTEXT_LIMITS.items():
+        if known_name in model:
+            _model_context_cache[model] = limit
+            print(f"[Token budget] Known context limit for '{model}': {limit} tokens")
+            return limit
+
+    # Unknown model – ask the LLM
+    try:
+        answer = _call_llm(
+            "You are a helpful assistant. Answer with a single integer only.",
+            [{"role": "user", "content": "What is your maximum context window size in tokens? Reply with just the number, no other text."}],
+            temperature=0.0,
+        )
+        # Extract first integer-like sequence from the answer
+        match = _re.search(r"\d[\d,. ]*", answer)
+        if match:
+            limit = int(_re.sub(r"[^0-9]", "", match.group()))
+            _model_context_cache[model] = limit
+            print(f"[Token budget] Model '{model}' self-reported context limit: {limit} tokens")
+            return limit
+    except Exception as exc:
+        print(f"[Token budget] Could not query model context limit: {exc}")
+
+    default = 4096
+    _model_context_cache[model] = default
+    print(f"[Token budget] Unknown model '{model}', using conservative default: {default} tokens")
+    return default
+
+
+def _truncate_prompt_context(
+    schema: dict,
+    table_metadata: dict,
+    knowledge_context: str,
+    base_tokens: int,
+) -> tuple:
+    """Progressively shrink schema/metadata/knowledge to fit within the token budget.
+
+    Returns (schema, table_metadata, knowledge_context) – possibly truncated.
+    """
+    context_limit = _get_model_context_limit()
+    budget = int(context_limit * _SYSTEM_PROMPT_BUDGET_FRACTION)
+    remaining = budget - base_tokens
+
+    if remaining <= 0:
+        # Base prompt alone is already too large – send nothing extra
+        print("[Token budget] Base prompt exceeds budget, sending empty schema/metadata/knowledge")
+        return {}, {}, ""
+
+    def _fits(s_str: str, m_str: str, k_str: str) -> bool:
+        return _estimate_tokens(s_str + m_str + k_str) <= remaining
+
+    schema_full = json.dumps(schema, indent=2)
+    meta_full = json.dumps(table_metadata, indent=2)
+
+    # Step 1 – full schema + metadata + knowledge
+    if _fits(schema_full, meta_full, knowledge_context):
+        return schema, table_metadata, knowledge_context
+
+    # Step 2 – compress schema: keep only column names (drop types)
+    schema_compact = {tbl: [c["name"] if isinstance(c, dict) else c for c in cols]
+                      for tbl, cols in schema.items()}
+    schema_compact_str = json.dumps(schema_compact, indent=2)
+    if _fits(schema_compact_str, meta_full, knowledge_context):
+        print("[Token budget] Schema compressed (column names only) to fit budget")
+        return schema_compact, table_metadata, knowledge_context
+
+    # Step 3 – compact schema + no metadata
+    if _fits(schema_compact_str, "{}", knowledge_context):
+        print("[Token budget] Table metadata dropped to fit budget")
+        return schema_compact, {}, knowledge_context
+
+    # Step 4 – compact schema + no metadata + truncated knowledge
+    available_for_knowledge = remaining - _estimate_tokens(schema_compact_str) - 20
+    if available_for_knowledge > 50:
+        truncated_knowledge = knowledge_context[:available_for_knowledge * 4]
+        print(f"[Token budget] Knowledge context truncated to ~{available_for_knowledge} tokens")
+        return schema_compact, {}, truncated_knowledge
+
+    # Step 5 – only table names (no columns)
+    schema_names_only = {tbl: [] for tbl in schema}
+    print("[Token budget] Sending table names only – context extremely tight")
+    return schema_names_only, {}, ""
+
+
+def _is_list_tables_request(messages: list) -> bool:
+    """Return True when the user's last message is asking to list all tables."""
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            text = msg.get("content", "").lower().strip()
+            patterns = [
+                "list of all tables", "show tables", "list tables",
+                "all tables", "what tables", "which tables", "show all tables",
+                "liste des tables", "lister les tables", "toutes les tables",
+                "liste toutes les tables",
+            ]
+            return any(p in text for p in patterns)
+    return False
+
+
 def _messages_to_prompt(system_prompt: str, messages: list) -> str:
     """Flatten system prompt + conversation history into a single prompt string."""
     parts = []
@@ -1204,6 +1356,19 @@ def chat():
         schema = {t: cols for t, cols in schema.items() if t in table_mapping_filter}
         table_metadata = {t: v for t, v in table_metadata.items() if t in table_mapping_filter}
 
+    formatted_messages = [{"role": m["role"], "content": m["content"]} for m in messages]
+
+    # ------------------------------------------------------------------
+    # Special case: "list all tables" → generate SQL directly, no need
+    # to send the full schema to the LLM (would be very token-expensive).
+    # ------------------------------------------------------------------
+    if _is_list_tables_request(messages):
+        return jsonify({
+            "sql": "SHOW TABLES",
+            "explanation": "Lists all tables available in the current ClickHouse database.",
+            "suggestedVisual": "table",
+        })
+
     # Build a mapping note for the system prompt
     mapping_lines = []
     for tbl in schema:
@@ -1213,6 +1378,53 @@ def chat():
         "The following tables have friendly business names. When communicating with the user use the friendly name, but always use the technical name in SQL:\n"
         + "\n".join(mapping_lines)
     ) if mapping_lines else ""
+
+    # ------------------------------------------------------------------
+    # Token budget: base prompt without dynamic content
+    # ------------------------------------------------------------------
+    base_prompt_template = """You are an expert ClickHouse data analyst.
+Your goal is to help the user query their database.
+
+AMBIGUITY HANDLING — CRITICAL:
+Before generating SQL, check if the user request is ambiguous:
+
+1. TABLE AMBIGUITY: If the user mentions a concept (e.g., "orders") but there are multiple tables that could match,
+   return a clarification request instead of generating SQL.
+
+2. FIELD AMBIGUITY: If the user asks to display or use a field type (e.g., "date", "id", "name")
+   and there are MULTIPLE fields of that type in the same table, return a clarification.
+
+When ambiguous, return ONLY this JSON:
+{
+  "needs_clarification": true,
+  "question": "Clear question in the user's language asking them to choose",
+  "options": ["option1", "option2", "option3"],
+  "type": "field_selection" | "table_selection"
+}
+
+CLICKHOUSE INSTRUCTIONS:
+- Use advanced ClickHouse functions when appropriate.
+- For funnels: windowFunnel(). For retention: retention(). For patterns: sequenceMatch().
+- For latest status: argMax(). For top-K: topK(). For unique counts: uniqHLL12().
+- For response times: quantilesTiming(). For JSON: JSONExtract(). For conditionals: sumIf(), countIf().
+- Always write highly optimized SQL.
+
+When NOT ambiguous, return ONLY this JSON:
+{
+  "sql": "SELECT ...",
+  "explanation": "Brief explanation of what the query does.",
+  "suggestedVisual": "table" | "bar" | "line" | "pie"
+}
+
+Do not include markdown formatting. Just the raw JSON.
+"""
+    messages_tokens = sum(_estimate_tokens(m.get("content", "")) for m in formatted_messages)
+    base_tokens = _estimate_tokens(base_prompt_template) + _estimate_tokens(mapping_note) + messages_tokens
+
+    # Truncate dynamic context (schema / metadata / knowledge) to fit the budget
+    schema, table_metadata, knowledge_context = _truncate_prompt_context(
+        schema, table_metadata, knowledge_context, base_tokens
+    )
 
     system_prompt = f"""You are an expert ClickHouse data analyst.
 Your goal is to help the user query their database.
@@ -1262,8 +1474,6 @@ When NOT ambiguous, return ONLY this JSON:
 Do not include markdown formatting. Just the raw JSON.
 """
 
-    formatted_messages = [{"role": m["role"], "content": m["content"]} for m in messages]
-
     try:
         content = _call_llm(system_prompt, formatted_messages, temperature=0.3)
         return jsonify(_parse_llm_json(content))
@@ -1281,6 +1491,29 @@ def analyze_query():
     data = request.get_json()
     sql = data.get("sql", "")
     schema = data.get("schema", {})
+
+    # Token budget: base prompt without the schema blob
+    base_analyze_prompt = """You are an expert ClickHouse SQL performance analyst.
+Analyze the following SQL query and provide:
+1. Performance alerts (full table scans, missing LIMIT, unoptimized aggregations)
+2. Correctness concerns (wrong results, type mismatches, NULL handling)
+3. Optimization suggestions (better functions, indexes, partitioning hints)
+4. Data projections (estimated result size, cardinality warnings)
+
+Return ONLY a JSON object (no markdown) with:
+{
+  "alerts": ["alert message 1"],
+  "suggestions": ["suggestion 1"],
+  "projections": ["projection 1"],
+  "optimized_sql": "improved SQL or empty string",
+  "risk_level": "low" | "medium" | "high"
+}
+"""
+    user_message = f"Analyze this ClickHouse SQL query:\n\n{sql}"
+    base_tokens = _estimate_tokens(base_analyze_prompt) + _estimate_tokens(user_message)
+
+    # Truncate schema context to fit within budget
+    schema, _, _ = _truncate_prompt_context(schema, {}, "", base_tokens)
 
     system_prompt = f"""You are an expert ClickHouse SQL performance analyst.
 Analyze the following SQL query and provide:
@@ -1301,8 +1534,6 @@ Return ONLY a JSON object (no markdown) with:
   "risk_level": "low" | "medium" | "high"
 }}
 """
-
-    user_message = f"Analyze this ClickHouse SQL query:\n\n{sql}"
 
     try:
         content = _call_llm(system_prompt, [{"role": "user", "content": user_message}], temperature=0.3)
