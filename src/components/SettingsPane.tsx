@@ -7,7 +7,7 @@ export function SettingsPane() {
 
   const [config, setConfig] = useState({
     clickhouse: { host: '', username: '', password: '', database: '' },
-    llm: { provider: 'ollama', model: '', ollamaUrl: '', httpUrl: '', apiKey: '' }
+    llm: { provider: 'ollama', model: '', baseUrl: '', apiKey: '' }
   });
   const [isSaving, setIsSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -269,31 +269,38 @@ export function SettingsPane() {
             <label className={labelClass}>Provider</label>
             <select value={config.llm.provider} onChange={e => setConfig({ ...config, llm: { ...config.llm, provider: e.target.value } })} className={inputClass}>
               <option value="ollama">Ollama (Local)</option>
-              <option value="http">Custom HTTP (OpenAI Compatible)</option>
+              <option value="local_http">Local HTTP (OpenAI Compatible — LM Studio, LocalAI…)</option>
+              <option value="n8n">n8n (Automation Webhook)</option>
             </select>
           </div>
-          {config.llm.provider === 'ollama' && (
+          <div className="space-y-2">
+            <label className={labelClass}>
+              {config.llm.provider === 'ollama' ? 'Ollama Server URL' :
+               config.llm.provider === 'local_http' ? 'Endpoint URL (full path)' :
+               'Webhook URL'}
+            </label>
+            <input
+              type="text"
+              value={config.llm.baseUrl || ''}
+              onChange={e => setConfig({ ...config, llm: { ...config.llm, baseUrl: e.target.value } })}
+              className={inputClass}
+              placeholder={
+                config.llm.provider === 'ollama' ? 'http://localhost:11434' :
+                config.llm.provider === 'local_http' ? 'http://localhost:8000/v1/chat/completions' :
+                'https://your-n8n.example.com/webhook/...'
+              }
+            />
+          </div>
+          {(config.llm.provider === 'local_http' || config.llm.provider === 'n8n') && (
             <div className="space-y-2">
-              <label className={labelClass}>Ollama URL</label>
-              <input type="text" value={config.llm.ollamaUrl || ''} onChange={e => setConfig({ ...config, llm: { ...config.llm, ollamaUrl: e.target.value } })} className={inputClass} placeholder="http://localhost:11434" />
-            </div>
-          )}
-          {config.llm.provider === 'http' && (
-            <div className="space-y-4">
-              <div className="space-y-2">
-                <label className={labelClass}>HTTP Endpoint URL</label>
-                <input type="text" value={config.llm.httpUrl || ''} onChange={e => setConfig({ ...config, llm: { ...config.llm, httpUrl: e.target.value } })} className={inputClass} placeholder="http://localhost:1234" />
-              </div>
-              <div className="space-y-2">
-                <label className={labelClass}>API Key (Optional)</label>
-                <input type="password" value={config.llm.apiKey || ''} onChange={e => setConfig({ ...config, llm: { ...config.llm, apiKey: e.target.value } })} className={inputClass} placeholder="sk-..." />
-              </div>
+              <label className={labelClass}>API Key {config.llm.provider === 'n8n' ? '(sent as Authorization header)' : '(Optional)'}</label>
+              <input type="password" value={config.llm.apiKey || ''} onChange={e => setConfig({ ...config, llm: { ...config.llm, apiKey: e.target.value } })} className={inputClass} placeholder={config.llm.provider === 'n8n' ? 'your-secret-key' : 'sk-...'} />
             </div>
           )}
           <div className="space-y-2">
             <label className={labelClass}>Model Name</label>
             <div className="flex gap-2">
-              <input list="model-list" type="text" value={config.llm.model || ''} onChange={e => setConfig({ ...config, llm: { ...config.llm, model: e.target.value } })} className={inputClass} placeholder={config.llm.provider === 'ollama' ? 'llama3' : 'gpt-3.5-turbo'} />
+              <input list="model-list" type="text" value={config.llm.model || ''} onChange={e => setConfig({ ...config, llm: { ...config.llm, model: e.target.value } })} className={inputClass} placeholder={config.llm.provider === 'ollama' ? 'llama3' : config.llm.provider === 'n8n' ? '(optional)' : 'local-model'} />
               <datalist id="model-list">{models.map(m => <option key={m} value={m} />)}</datalist>
               <button onClick={fetchModels} disabled={isLoadingModels} className="shrink-0 flex items-center gap-2 bg-slate-100 hover:bg-slate-200 text-slate-700 px-4 py-2.5 rounded-lg text-sm font-medium transition-colors border border-slate-200">
                 <RefreshCw size={16} className={isLoadingModels ? "animate-spin" : ""} /> Refresh

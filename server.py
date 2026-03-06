@@ -105,8 +105,7 @@ clickhouse_config = {
 llm_config = {
     "provider": "ollama",
     "model": "llama3",
-    "ollamaUrl": "http://localhost:11434",
-    "httpUrl": "http://localhost:1234",
+    "baseUrl": "http://localhost:11434",
     "apiKey": "",
 }
 
@@ -327,6 +326,14 @@ def _strip_llm_markdown(text: str) -> str:
     return text.strip()
 
 
+def _clean_llm_output(text: str) -> str:
+    """Remove <think>...</think> blocks (DeepSeek etc.) and residual HTML tags."""
+    import re
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    text = re.sub(r'<[^>]+>', '', text)
+    return text.strip()
+
+
 def _parse_response_json(resp, label: str = "LLM") -> dict:
     """Safely parse JSON from an HTTP response with descriptive errors.
 
@@ -392,53 +399,121 @@ def _parse_llm_json(content: str) -> dict:
     )
 
 
-def _call_llm(system_prompt: str, messages: list, temperature: float = 0.7) -> str:
-    """Call the configured LLM and return the content string."""
-    if llm_config["provider"] == "http":
+def _messages_to_prompt(system_prompt: str, messages: list) -> str:
+    """Flatten system prompt + conversation history into a single prompt string."""
+    parts = []
+    if system_prompt:
+        parts.append(f"System: {system_prompt}")
+    for msg in messages:
+        role = msg.get("role", "user").capitalize()
+        content = msg.get("content", "")
+        parts.append(f"{role}: {content}")
+    parts.append("Assistant:")
+    return "\n\n".join(parts)
+
+
+def _call_llm(system_prompt: str, messages: list, temperature: float = 0.7,
+              language: str = None) -> str:
+    """Call the configured LLM and return the content string.
+
+    Supports providers: ollama, local_http, n8n.
+    """
+    # Append language instruction to the last user message if requested
+    if language:
+        lang_instruction = (
+            "Vous DEVEZ écrire votre réponse ENTIÈRE en FRANÇAIS"
+            if language == "fr"
+            else "You MUST write your entire response in ENGLISH"
+        )
+        if messages:
+            last = messages[-1]
+            messages = messages[:-1] + [{
+                **last,
+                "content": last.get("content", "") + f"\n\n{lang_instruction}",
+            }]
+        else:
+            system_prompt = system_prompt + f"\n\n{lang_instruction}"
+
+    provider = llm_config.get("provider", "ollama")
+    base_url = (llm_config.get("baseUrl") or "").rstrip("/")
+
+    if provider == "local_http":
+        # Full endpoint URL is stored directly in baseUrl
+        endpoint = base_url or "http://localhost:8000/v1/chat/completions"
         headers = {"Content-Type": "application/json"}
         if llm_config.get("apiKey"):
             headers["Authorization"] = f"Bearer {llm_config['apiKey']}"
-        base_url = (llm_config.get("httpUrl") or "http://localhost:8000").rstrip("/")
         resp = _http_post(
-            f"{base_url}/v1/chat/completions",
+            endpoint,
             json={
                 "model": llm_config.get("model") or "local-model",
                 "messages": [{"role": "system", "content": system_prompt}] + messages,
                 "temperature": temperature,
-                "stream": False,
             },
             headers=headers,
             timeout=120,
         )
         if not resp.ok:
-            raise Exception(f"HTTP LLM Error: {resp.status_code} - {resp.text}")
-        resp_data = _parse_response_json(resp, "HTTP LLM")
+            raise Exception(f"local_http LLM Error: {resp.status_code} - {resp.text}")
+        resp_data = _parse_response_json(resp, "local_http LLM")
         content = (
             resp_data.get("choices", [{}])[0].get("message", {}).get("content")
             or resp_data.get("content")
             or ""
         )
-        return _strip_llm_markdown(content)
+        return _clean_llm_output(_strip_llm_markdown(content))
 
-    elif llm_config["provider"] == "ollama":
+    elif provider == "ollama":
+        ollama_url = base_url or "http://localhost:11434"
+        prompt = _messages_to_prompt(system_prompt, messages)
+        body = {
+            "model": llm_config.get("model", "llama3"),
+            "prompt": prompt,
+            "stream": False,
+        }
         resp = _http_post(
-            f"{llm_config['ollamaUrl']}/api/chat",
-            json={
-                "model": llm_config.get("model", "llama3"),
-                "messages": [{"role": "system", "content": system_prompt}] + messages,
-                "stream": False,
-                "format": "json",
-            },
+            f"{ollama_url}/api/generate",
+            json=body,
             timeout=120,
         )
         if not resp.ok:
             raise Exception(f"Ollama LLM Error: {resp.status_code} - {resp.text}")
         resp_data = _parse_response_json(resp, "Ollama LLM")
-        content = resp_data.get("message", {}).get("content", "")
-        return _strip_llm_markdown(content)
+        content = resp_data.get("response", "")
+        return _clean_llm_output(_strip_llm_markdown(content))
+
+    elif provider == "n8n":
+        endpoint = base_url or ""
+        if not endpoint:
+            raise Exception("n8n provider requires a baseUrl (webhook URL)")
+        headers = {"Content-Type": "application/json"}
+        if llm_config.get("apiKey"):
+            headers["Authorization"] = llm_config["apiKey"]  # raw value, no Bearer
+        prompt = _messages_to_prompt(system_prompt, messages)
+        resp = _http_post(
+            endpoint,
+            json={
+                "prompt": prompt,
+                "model": llm_config.get("model", ""),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+            headers=headers,
+            timeout=120,
+        )
+        if not resp.ok:
+            raise Exception(f"n8n LLM Error: {resp.status_code} - {resp.text}")
+        resp_data = _parse_response_json(resp, "n8n LLM")
+        content = (
+            resp_data.get("output")
+            or resp_data.get("text")
+            or resp_data.get("response")
+            or resp_data.get("content")
+            or ""
+        )
+        return _clean_llm_output(content)
 
     else:
-        raise Exception("Invalid LLM provider")
+        raise Exception(f"Invalid LLM provider: {provider!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -700,49 +775,7 @@ Instructions:
         formatted_messages = [{"role": m["role"], "content": m["content"]} for m in history]
         formatted_messages.append({"role": "user", "content": query})
 
-        # For RAG we return plain text, not JSON
-        if llm_config["provider"] == "http":
-            headers = {"Content-Type": "application/json"}
-            if llm_config.get("apiKey"):
-                headers["Authorization"] = f"Bearer {llm_config['apiKey']}"
-            base_url = (llm_config.get("httpUrl") or "http://localhost:8000").rstrip("/")
-            resp = _http_post(
-                f"{base_url}/v1/chat/completions",
-                json={
-                    "model": llm_config.get("model") or "local-model",
-                    "messages": [{"role": "system", "content": system_prompt}] + formatted_messages,
-                    "temperature": 0.3,
-                },
-                headers=headers,
-                timeout=120,
-            )
-            if not resp.ok:
-                raise Exception(f"LLM Error: {resp.status_code} - {resp.text}")
-            resp_data = _parse_response_json(resp, "HTTP LLM")
-            answer = (
-                resp_data.get("choices", [{}])[0].get("message", {}).get("content")
-                or resp_data.get("content")
-                or ""
-            )
-
-        elif llm_config["provider"] == "ollama":
-            resp = _http_post(
-                f"{llm_config['ollamaUrl']}/api/chat",
-                json={
-                    "model": llm_config.get("model", "llama3"),
-                    "messages": [{"role": "system", "content": system_prompt}] + formatted_messages,
-                    "stream": False,
-                },
-                timeout=120,
-            )
-            if not resp.ok:
-                raise Exception(f"Ollama LLM Error: {resp.status_code} - {resp.text}")
-            resp_data = _parse_response_json(resp, "Ollama LLM")
-            answer = resp_data.get("message", {}).get("content", "")
-
-        else:
-            raise Exception("Invalid LLM provider")
-
+        answer = _call_llm(system_prompt, formatted_messages, temperature=0.3)
         return jsonify({"answer": answer, "sources": sources})
 
     except Exception as exc:
@@ -774,22 +807,57 @@ def test_clickhouse():
 # ---------------------------------------------------------------------------
 @app.route("/api/llm/test", methods=["POST"])
 def test_llm():
+    """Test LLM connection by sending a simple hello prompt."""
     data = request.get_json()
     provider = data.get("provider")
+    base_url = (data.get("baseUrl") or "").rstrip("/")
+    test_prompt = "Hello, are you online? Respond with 'Yes'."
     try:
         if provider == "ollama":
-            ollama_url = data.get("ollamaUrl") or "http://localhost:11434"
-            resp = _http_get(f"{ollama_url}/api/tags", timeout=10)
+            ollama_url = base_url or "http://localhost:11434"
+            resp = _http_post(
+                f"{ollama_url}/api/generate",
+                json={"model": data.get("model", "llama3"), "prompt": test_prompt, "stream": False},
+                timeout=30,
+            )
             if not resp.ok:
-                raise Exception(f"Ollama error: {resp.status_code}")
-        elif provider == "http":
-            headers = {}
+                raise Exception(f"Ollama error: {resp.status_code} - {resp.text}")
+        elif provider == "local_http":
+            endpoint = base_url or "http://localhost:8000/v1/chat/completions"
+            headers = {"Content-Type": "application/json"}
             if data.get("apiKey"):
                 headers["Authorization"] = f"Bearer {data['apiKey']}"
-            base_url = (data.get("httpUrl") or "http://localhost:8000").rstrip("/")
-            resp = _http_get(f"{base_url}/v1/models", headers=headers, timeout=10)
-            if not resp.ok and resp.status_code != 404:
-                raise Exception(f"HTTP LLM server returned {resp.status_code}")
+            resp = _http_post(
+                endpoint,
+                json={
+                    "model": data.get("model") or "local-model",
+                    "messages": [{"role": "user", "content": test_prompt}],
+                    "temperature": 0.7,
+                },
+                headers=headers,
+                timeout=30,
+            )
+            if not resp.ok:
+                raise Exception(f"local_http LLM error: {resp.status_code} - {resp.text}")
+        elif provider == "n8n":
+            endpoint = base_url
+            if not endpoint:
+                raise Exception("n8n provider requires a baseUrl (webhook URL)")
+            headers = {"Content-Type": "application/json"}
+            if data.get("apiKey"):
+                headers["Authorization"] = data["apiKey"]
+            resp = _http_post(
+                endpoint,
+                json={
+                    "prompt": test_prompt,
+                    "model": data.get("model", ""),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+                headers=headers,
+                timeout=30,
+            )
+            if not resp.ok:
+                raise Exception(f"n8n LLM error: {resp.status_code} - {resp.text}")
         return jsonify({"success": True})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
@@ -797,19 +865,25 @@ def test_llm():
 
 @app.route("/api/llm/models", methods=["GET"])
 def get_llm_models():
+    """Fetch available model list (Ollama and local_http only)."""
     try:
-        if llm_config["provider"] == "ollama":
-            resp = _http_get(f"{llm_config['ollamaUrl']}/api/tags", timeout=10)
+        provider = llm_config.get("provider", "ollama")
+        base_url = (llm_config.get("baseUrl") or "").rstrip("/")
+        if provider == "ollama":
+            ollama_url = base_url or "http://localhost:11434"
+            resp = _http_get(f"{ollama_url}/api/tags", timeout=10)
             if not resp.ok:
                 raise Exception(f"Ollama error: {resp.status_code}")
             models = [m["name"] for m in resp.json().get("models", [])]
             return jsonify({"models": models})
-        elif llm_config["provider"] == "http":
+        elif provider == "local_http":
+            # Derive base from endpoint URL (strip /v1/chat/completions suffix if present)
+            endpoint = base_url or "http://localhost:8000/v1/chat/completions"
+            api_base = endpoint.split("/v1/chat")[0].split("/v1/models")[0]
             headers = {}
             if llm_config.get("apiKey"):
                 headers["Authorization"] = f"Bearer {llm_config['apiKey']}"
-            base_url = (llm_config.get("httpUrl") or "http://localhost:8000").rstrip("/")
-            resp = _http_get(f"{base_url}/v1/models", headers=headers, timeout=10)
+            resp = _http_get(f"{api_base}/v1/models", headers=headers, timeout=10)
             if not resp.ok:
                 if resp.status_code == 404:
                     return jsonify({"models": []})
