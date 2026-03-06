@@ -300,7 +300,11 @@ def _strip_llm_markdown(text: str) -> str:
 
 
 def _parse_response_json(resp, label: str = "LLM") -> dict:
-    """Safely parse JSON from an HTTP response with descriptive errors."""
+    """Safely parse JSON from an HTTP response with descriptive errors.
+
+    Also handles SSE (Server-Sent Events) streaming responses by extracting
+    the last complete data chunk that contains the assistant message.
+    """
     if not resp.text or not resp.text.strip():
         raise Exception(
             f"{label} returned an empty response body (HTTP {resp.status_code}). "
@@ -308,11 +312,28 @@ def _parse_response_json(resp, label: str = "LLM") -> dict:
         )
     try:
         return resp.json()
-    except Exception as exc:
-        raise Exception(
-            f"{label} response is not valid JSON (HTTP {resp.status_code}): "
-            f"{resp.text[:300]!r}"
-        ) from exc
+    except Exception:
+        pass
+
+    # Fallback: try to parse as an SSE stream (lines starting with "data: ")
+    text = resp.text.strip()
+    if "data:" in text:
+        import re
+        chunks = re.findall(r"^data:\s*(.+)$", text, re.MULTILINE)
+        # Walk chunks in reverse to find the first one that parses as JSON
+        for chunk in reversed(chunks):
+            chunk = chunk.strip()
+            if chunk == "[DONE]":
+                continue
+            try:
+                return json.loads(chunk)
+            except json.JSONDecodeError:
+                continue
+
+    raise Exception(
+        f"{label} response is not valid JSON (HTTP {resp.status_code}): "
+        f"{resp.text[:300]!r}"
+    )
 
 
 def _parse_llm_json(content: str) -> dict:
@@ -356,6 +377,7 @@ def _call_llm(system_prompt: str, messages: list, temperature: float = 0.7) -> s
                 "model": llm_config.get("model") or "local-model",
                 "messages": [{"role": "system", "content": system_prompt}] + messages,
                 "temperature": temperature,
+                "stream": False,
             },
             headers=headers,
             timeout=120,
