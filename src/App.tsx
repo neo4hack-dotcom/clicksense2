@@ -10,7 +10,7 @@ import { useAppStore } from './store';
 import { MessageSquare } from 'lucide-react';
 
 export default function App() {
-  const { activeTab, setSchema, setTableMetadata, chatPaneSize, setChatPaneSize } = useAppStore();
+  const { activeTab, setSchema, setTableMetadata, chatPaneSize, setChatPaneSize, setTableMappings } = useAppStore();
 
   useEffect(() => {
     fetch('/api/schema')
@@ -24,7 +24,12 @@ export default function App() {
       .then(res => res.json())
       .then(data => setTableMetadata(data))
       .catch(err => console.error("Failed to fetch metadata", err));
-  }, [setSchema, setTableMetadata]);
+
+    fetch('/api/table-mappings')
+      .then(res => res.json())
+      .then(data => setTableMappings(data))
+      .catch(err => console.error("Failed to fetch table mappings", err));
+  }, [setSchema, setTableMetadata, setTableMappings]);
 
   const chatWidthClass =
     chatPaneSize === 'expanded'

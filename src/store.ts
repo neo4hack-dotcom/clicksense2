@@ -8,6 +8,11 @@ export interface KnowledgeFolder {
   updated_at: string;
 }
 
+export interface TableMapping {
+  table_name: string;
+  mapping_name: string;
+}
+
 export interface RagConfig {
   esHost: string;
   esIndex: string;
@@ -84,6 +89,12 @@ interface AppState {
   knowledgeFolders: KnowledgeFolder[];
   setKnowledgeFolders: (folders: KnowledgeFolder[]) => void;
 
+  tableMappings: TableMapping[];
+  setTableMappings: (mappings: TableMapping[]) => void;
+
+  selectedTableMappings: string[];
+  setSelectedTableMappings: (tables: string[]) => void;
+
   ragConfig: RagConfig;
   setRagConfig: (config: RagConfig) => void;
 
@@ -126,6 +137,12 @@ export const useAppStore = create<AppState>((set) => ({
 
   knowledgeFolders: [],
   setKnowledgeFolders: (knowledgeFolders) => set({ knowledgeFolders }),
+
+  tableMappings: [],
+  setTableMappings: (tableMappings) => set({ tableMappings }),
+
+  selectedTableMappings: [],
+  setSelectedTableMappings: (selectedTableMappings) => set({ selectedTableMappings }),
 
   ragConfig: {
     esHost: 'http://localhost:9200',

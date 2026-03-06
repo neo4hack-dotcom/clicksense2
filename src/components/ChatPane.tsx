@@ -1,18 +1,21 @@
 import { useState, useRef, useEffect } from 'react';
 import {
   Send, Bot, Loader2, Sparkles, Play, Save, History, Trash2,
-  Maximize2, Minimize2, Minus, CheckSquare
+  Maximize2, Minimize2, Minus, CheckSquare, Filter, X
 } from 'lucide-react';
 import { useAppStore } from '../store';
 import clsx from 'clsx';
-import { motion } from 'motion/react';
+import { motion, AnimatePresence } from 'motion/react';
 
 export function ChatPane() {
   const {
     chatHistory, addChatMessage, clearChatHistory,
     schema, setQueryResult, queryHistory, setQueryHistory,
-    tableMetadata, chatPaneSize, setChatPaneSize
+    tableMetadata, chatPaneSize, setChatPaneSize,
+    tableMappings, selectedTableMappings, setSelectedTableMappings,
   } = useAppStore();
+
+  const [filterOpen, setFilterOpen] = useState(false);
 
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -43,7 +46,12 @@ export function ChatPane() {
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: messagesToSend, schema, tableMetadata }),
+        body: JSON.stringify({
+          messages: messagesToSend,
+          schema,
+          tableMetadata,
+          tableMappingFilter: selectedTableMappings,
+        }),
       });
 
       const data = await res.json();
@@ -129,44 +137,149 @@ export function ChatPane() {
     else setChatPaneSize('normal');
   };
 
+  // Only show mapped tables in the filter
+  const mappedTables = tableMappings.filter(m => m.mapping_name);
+  const toggleTableFilter = (tableName: string) => {
+    if (selectedTableMappings.includes(tableName)) {
+      setSelectedTableMappings(selectedTableMappings.filter(t => t !== tableName));
+    } else {
+      setSelectedTableMappings([...selectedTableMappings, tableName]);
+    }
+  };
+
   return (
     <div className="flex flex-col h-full bg-slate-50 border-r border-slate-200">
       {/* Header */}
-      <div className="p-4 border-b border-slate-200 bg-white flex items-center justify-between shrink-0">
-        <div className="flex items-center gap-3">
-          <div className="bg-emerald-100 p-2 rounded-full text-emerald-600">
-            <Sparkles size={18} />
+      <div className="border-b border-slate-200 bg-white shrink-0">
+        <div className="p-4 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="bg-emerald-100 p-2 rounded-full text-emerald-600">
+              <Sparkles size={18} />
+            </div>
+            <div>
+              <h2 className="text-base font-semibold text-slate-800">AI Data Analyst</h2>
+              <p className="text-xs text-slate-500">Ask questions in plain English</p>
+            </div>
           </div>
-          <div>
-            <h2 className="text-base font-semibold text-slate-800">AI Data Analyst</h2>
-            <p className="text-xs text-slate-500">Ask questions in plain English</p>
-          </div>
-        </div>
-        <div className="flex items-center gap-1">
-          {chatHistory.length > 0 && (
+          <div className="flex items-center gap-1">
+            {mappedTables.length > 0 && (
+              <button
+                onClick={() => setFilterOpen(o => !o)}
+                className={clsx(
+                  "p-1.5 rounded-lg transition-colors relative",
+                  filterOpen || selectedTableMappings.length > 0
+                    ? "text-emerald-600 bg-emerald-50 hover:bg-emerald-100"
+                    : "text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+                )}
+                title="Filter by table scope"
+              >
+                <Filter size={15} />
+                {selectedTableMappings.length > 0 && (
+                  <span className="absolute -top-1 -right-1 w-4 h-4 bg-emerald-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center">
+                    {selectedTableMappings.length}
+                  </span>
+                )}
+              </button>
+            )}
+            {chatHistory.length > 0 && (
+              <button
+                onClick={clearChatHistory}
+                className="p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"
+                title="Clear conversation"
+              >
+                <Trash2 size={15} />
+              </button>
+            )}
             <button
-              onClick={clearChatHistory}
-              className="p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"
-              title="Clear conversation"
+              onClick={toggleSize}
+              className="p-1.5 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-lg transition-colors"
+              title={chatPaneSize === 'expanded' ? 'Restore size' : 'Expand'}
             >
-              <Trash2 size={15} />
+              {chatPaneSize === 'expanded' ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
             </button>
-          )}
-          <button
-            onClick={toggleSize}
-            className="p-1.5 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-lg transition-colors"
-            title={chatPaneSize === 'expanded' ? 'Restore size' : 'Expand'}
-          >
-            {chatPaneSize === 'expanded' ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
-          </button>
-          <button
-            onClick={() => setChatPaneSize('minimized')}
-            className="p-1.5 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-lg transition-colors"
-            title="Minimize"
-          >
-            <Minus size={15} />
-          </button>
+            <button
+              onClick={() => setChatPaneSize('minimized')}
+              className="p-1.5 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-lg transition-colors"
+              title="Minimize"
+            >
+              <Minus size={15} />
+            </button>
+          </div>
         </div>
+
+        {/* Table scope filter panel */}
+        <AnimatePresence>
+          {filterOpen && mappedTables.length > 0 && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: 'auto', opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              className="overflow-hidden border-t border-slate-100"
+            >
+              <div className="px-4 py-3">
+                <div className="flex items-center justify-between mb-2">
+                  <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide flex items-center gap-1.5">
+                    <Filter size={11} />
+                    Restrict to tables
+                  </p>
+                  {selectedTableMappings.length > 0 && (
+                    <button
+                      onClick={() => setSelectedTableMappings([])}
+                      className="text-xs text-slate-400 hover:text-slate-600 flex items-center gap-1"
+                    >
+                      <X size={11} /> Clear all
+                    </button>
+                  )}
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {mappedTables.map(m => {
+                    const active = selectedTableMappings.includes(m.table_name);
+                    return (
+                      <button
+                        key={m.table_name}
+                        onClick={() => toggleTableFilter(m.table_name)}
+                        className={clsx(
+                          "px-2.5 py-1 rounded-full text-xs font-medium transition-colors border",
+                          active
+                            ? "bg-emerald-500 text-white border-emerald-500"
+                            : "bg-white text-slate-600 border-slate-200 hover:border-emerald-400 hover:text-emerald-600"
+                        )}
+                        title={`Technical: ${m.table_name}`}
+                      >
+                        {m.mapping_name}
+                      </button>
+                    );
+                  })}
+                </div>
+                {selectedTableMappings.length > 0 && (
+                  <p className="mt-2 text-xs text-emerald-600">
+                    AI will only search in {selectedTableMappings.length} selected table{selectedTableMappings.length > 1 ? 's' : ''}.
+                  </p>
+                )}
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Active filter chips (always visible when filter active but panel closed) */}
+        {!filterOpen && selectedTableMappings.length > 0 && (
+          <div className="px-4 pb-2 flex flex-wrap gap-1.5 border-t border-slate-100 pt-2">
+            {selectedTableMappings.map(tName => {
+              const m = tableMappings.find(x => x.table_name === tName);
+              return (
+                <span
+                  key={tName}
+                  className="flex items-center gap-1 px-2 py-0.5 bg-emerald-100 text-emerald-700 rounded-full text-xs font-medium"
+                >
+                  {m?.mapping_name ?? tName}
+                  <button onClick={() => toggleTableFilter(tName)} className="hover:text-emerald-900">
+                    <X size={10} />
+                  </button>
+                </span>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       {/* Messages */}
