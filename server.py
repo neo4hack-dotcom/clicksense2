@@ -355,7 +355,27 @@ def _parse_response_json(resp, label: str = "LLM") -> dict:
     if "data:" in text:
         import re
         chunks = re.findall(r"^data:\s*(.+)$", text, re.MULTILINE)
-        # Walk chunks in reverse to find the first one that parses as JSON
+        # Accumulate all delta content from streaming chunks
+        accumulated_content = ""
+        has_valid_chunk = False
+        for chunk in chunks:
+            chunk = chunk.strip()
+            if chunk == "[DONE]":
+                continue
+            try:
+                chunk_data = json.loads(chunk)
+                delta_content = (
+                    chunk_data.get("choices", [{}])[0]
+                    .get("delta", {})
+                    .get("content") or ""
+                )
+                accumulated_content += delta_content
+                has_valid_chunk = True
+            except json.JSONDecodeError:
+                continue
+        if has_valid_chunk and accumulated_content:
+            return {"choices": [{"message": {"content": accumulated_content}}]}
+        # If no delta content found, try returning the last parseable chunk as-is
         for chunk in reversed(chunks):
             chunk = chunk.strip()
             if chunk == "[DONE]":
@@ -449,6 +469,7 @@ def _call_llm(system_prompt: str, messages: list, temperature: float = 0.7,
                 "model": llm_config.get("model") or "local-model",
                 "messages": [{"role": "system", "content": system_prompt}] + messages,
                 "temperature": temperature,
+                "stream": False,
             },
             headers=headers,
             timeout=120,
