@@ -12,16 +12,14 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 def _http_get(url, **kwargs):
-    """GET with SSL verification disabled for plain-HTTP URLs."""
-    if url.startswith("http://"):
-        kwargs.setdefault("verify", False)
+    """GET with SSL verification disabled (supports self-signed certificates)."""
+    kwargs.setdefault("verify", False)
     return http_requests.get(url, **kwargs)
 
 
 def _http_post(url, **kwargs):
-    """POST with SSL verification disabled for plain-HTTP URLs."""
-    if url.startswith("http://"):
-        kwargs.setdefault("verify", False)
+    """POST with SSL verification disabled (supports self-signed certificates)."""
+    kwargs.setdefault("verify", False)
     return http_requests.post(url, **kwargs)
 
 
