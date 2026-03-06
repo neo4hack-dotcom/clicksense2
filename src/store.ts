@@ -61,6 +61,15 @@ interface AppState {
     question?: string;
     options?: string[];
     clarification_type?: 'field_selection' | 'table_selection';
+    is_agent?: boolean;
+    agent_steps?: {
+      step: number;
+      reasoning: string;
+      sql: string;
+      result_summary: string;
+      row_count: number;
+      ok: boolean;
+    }[];
   }[];
   addChatMessage: (msg: {
     role: 'user' | 'assistant';
@@ -71,6 +80,15 @@ interface AppState {
     question?: string;
     options?: string[];
     clarification_type?: 'field_selection' | 'table_selection';
+    is_agent?: boolean;
+    agent_steps?: {
+      step: number;
+      reasoning: string;
+      sql: string;
+      result_summary: string;
+      row_count: number;
+      ok: boolean;
+    }[];
   }) => void;
   clearChatHistory: () => void;
 

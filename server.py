@@ -1489,6 +1489,186 @@ Do not include markdown formatting. Just the raw JSON.
 
 
 # ---------------------------------------------------------------------------
+# Agent Analysis — agentic loop (up to 10 distinct ClickHouse queries)
+# ---------------------------------------------------------------------------
+@app.route("/api/agent", methods=["POST"])
+def agent_analysis():
+    """Orchestrated multi-step analysis: the LLM autonomously decides which
+    ClickHouse queries to run (up to MAX_AGENT_STEPS), analyses each result,
+    and finally synthesises a detailed answer for the user."""
+
+    MAX_AGENT_STEPS = 10
+
+    data = request.get_json()
+    user_question = data.get("question", "")
+    schema = data.get("schema", {})
+    table_metadata = data.get("tableMetadata", {})
+    table_mapping_filter = data.get("tableMappingFilter", [])
+
+    if not user_question.strip():
+        return jsonify({"error": "No question provided"}), 400
+
+    # Apply table filter
+    if table_mapping_filter:
+        schema = {t: cols for t, cols in schema.items() if t in table_mapping_filter}
+        table_metadata = {t: v for t, v in table_metadata.items() if t in table_mapping_filter}
+
+    # Knowledge base context
+    db = read_db()
+    folders = db.get("knowledge_folders", [])
+    knowledge_context = "\n\n".join(
+        f"[{f['title']}]\n{f['content']}" for f in folders if f.get("content")
+    ) or knowledge_base
+
+    # Build friendly-name mapping note
+    all_mappings = {m["table_name"]: m["mapping_name"] for m in db.get("table_mappings", [])}
+    mapping_lines = [
+        f"  - {tbl}  →  \"{all_mappings[tbl]}\""
+        for tbl in schema if tbl in all_mappings
+    ]
+    mapping_note = (
+        "Friendly business names for tables (use technical name in SQL, friendly name when talking to the user):\n"
+        + "\n".join(mapping_lines)
+    ) if mapping_lines else ""
+
+    schema_str = json.dumps(schema, indent=2)
+    metadata_str = json.dumps(table_metadata, indent=2)
+
+    # Accumulate steps
+    steps: list = []
+
+    def _run_agent_step(steps_so_far: list) -> dict:
+        """Ask the LLM for its next action given the accumulated context."""
+        steps_context = ""
+        for i, s in enumerate(steps_so_far, 1):
+            steps_context += (
+                f"\n--- Step {i} ---\n"
+                f"Reasoning: {s['reasoning']}\n"
+                f"SQL executed:\n{s['sql']}\n"
+                f"Result summary: {s['result_summary']}\n"
+            )
+
+        system_prompt = f"""You are an autonomous ClickHouse data analyst agent.
+Your goal is to answer the user's question by executing a sequence of targeted ClickHouse SQL queries.
+You may run up to {MAX_AGENT_STEPS} distinct queries in total. Each query must bring NEW information
+(no pure duplicate of a previous one). After gathering enough evidence you MUST produce a final answer.
+
+DATABASE SCHEMA:
+{schema_str}
+
+TABLE METADATA (functional descriptions):
+{metadata_str}
+
+{mapping_note}
+
+KNOWLEDGE BASE:
+{knowledge_context}
+
+CLICKHOUSE INSTRUCTIONS:
+- Use advanced ClickHouse functions when appropriate (windowFunnel, retention, argMax, topK, uniqHLL12, quantilesTiming, JSONExtract, sumIf, countIf …).
+- Always write highly optimised SQL with a LIMIT where appropriate.
+- Each query must explore a genuinely distinct angle (different aggregation, filter, dimension, or sub-question).
+
+CURRENT ANALYSIS PROGRESS ({len(steps_so_far)}/{MAX_AGENT_STEPS} steps used):
+{steps_context if steps_context else "None yet — this is the first step."}
+
+USER QUESTION:
+{user_question}
+
+INSTRUCTIONS:
+If you need more data to answer thoroughly, respond with action "query".
+If you have gathered sufficient evidence to give a complete, detailed answer, respond with action "finish".
+{"IMPORTANT: You have used all available steps — you MUST respond with action 'finish'." if len(steps_so_far) >= MAX_AGENT_STEPS else ""}
+
+Respond ONLY with valid JSON in one of these two forms:
+
+For a new query:
+{{
+  "action": "query",
+  "reasoning": "Why this specific query is needed and what new insight it will provide",
+  "sql": "SELECT ..."
+}}
+
+For the final answer:
+{{
+  "action": "finish",
+  "reasoning": "Why you have enough information to conclude",
+  "final_answer": "A detailed, structured answer for the user based on all query results"
+}}
+
+No markdown fences. Only raw JSON."""
+
+        content = _call_llm(system_prompt, [{"role": "user", "content": "Proceed with the next step."}], temperature=0.2)
+        return _parse_llm_json(content)
+
+    def _execute_and_summarise(sql: str, max_rows: int = 20) -> dict:
+        """Execute a ClickHouse query and return a compact summary."""
+        try:
+            client = get_clickhouse_client()
+            result = client.query(sql)
+            rows = _rows_to_dicts(result)
+            total_rows = len(rows)
+            preview = rows[:max_rows]
+            col_names = list(preview[0].keys()) if preview else []
+            summary_lines = [", ".join(str(r.get(c, "")) for c in col_names) for r in preview[:10]]
+            summary = (
+                f"{total_rows} row(s) returned. Columns: {col_names}.\n"
+                f"Sample data:\n" + "\n".join(summary_lines)
+            )
+            return {"ok": True, "summary": summary, "rows": preview, "total_rows": total_rows}
+        except Exception as exc:
+            return {"ok": False, "summary": f"Query failed: {exc}", "rows": [], "total_rows": 0}
+
+    # ---- Agentic loop ----
+    try:
+        final_answer = None
+        for iteration in range(MAX_AGENT_STEPS):
+            decision = _run_agent_step(steps)
+
+            action = decision.get("action", "finish")
+            reasoning = decision.get("reasoning", "")
+
+            if action == "query" and iteration < MAX_AGENT_STEPS:
+                sql = decision.get("sql", "").strip()
+                exec_result = _execute_and_summarise(sql)
+                steps.append({
+                    "step": iteration + 1,
+                    "reasoning": reasoning,
+                    "sql": sql,
+                    "result_summary": exec_result["summary"],
+                    "row_count": exec_result["total_rows"],
+                    "ok": exec_result["ok"],
+                })
+            else:
+                # action == "finish" or max steps reached
+                final_answer = decision.get("final_answer", "")
+                break
+
+        # If the loop exhausted all steps without a finish, ask for synthesis
+        if final_answer is None:
+            synth_prompt = f"""Based on the following analysis steps, write a detailed final answer for the user.
+
+USER QUESTION: {user_question}
+
+STEPS AND RESULTS:
+""" + "\n".join(
+                f"Step {s['step']}: {s['reasoning']}\nSQL: {s['sql']}\nResult: {s['result_summary']}"
+                for s in steps
+            ) + "\n\nProvide a comprehensive, structured answer."
+            final_answer = _call_llm(synth_prompt, [{"role": "user", "content": "Synthesise the final answer."}], temperature=0.3)
+
+        return jsonify({
+            "steps": steps,
+            "final_answer": final_answer,
+            "total_steps": len(steps),
+        })
+
+    except Exception as exc:
+        print(f"Agent error: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+
+# ---------------------------------------------------------------------------
 # AI Query Analyzer
 # ---------------------------------------------------------------------------
 @app.route("/api/analyze", methods=["POST"])
