@@ -116,11 +116,8 @@ rag_config = {
     "esIndex": os.environ.get("ES_INDEX", "clicksense_rag"),
     "esUsername": os.environ.get("ES_USER", ""),
     "esPassword": os.environ.get("ES_PASSWORD", ""),
-    "embeddingProvider": "ollama",
-    "embeddingModel": "nomic-embed-text",
-    "embeddingUrl": "http://localhost:11434",
-    "embeddingUsername": "",
-    "embeddingPassword": "",
+    "embeddingUrl": "http://localhost:11434/v1/embeddings",
+    "embeddingModel": "",
     "embeddingApiKey": "",
     "topK": 5,
     "chunkSize": 500,
@@ -177,65 +174,26 @@ def _rows_to_dicts(result) -> list:
 # Embedding helper
 # ---------------------------------------------------------------------------
 def _get_embedding(text: str, cfg: dict) -> list:
-    """Compute embedding for text using configured provider."""
-    provider = cfg.get("embeddingProvider", "ollama")
-    model = cfg.get("embeddingModel", "nomic-embed-text")
-
-    if provider == "ollama":
-        url = (cfg.get("embeddingUrl") or "http://localhost:11434").rstrip("/")
-        resp = _http_post(
-            f"{url}/api/embeddings",
-            json={"model": model, "prompt": text},
-            timeout=60,
-        )
-        if not resp.ok:
-            raise Exception(f"Ollama embedding error: {resp.status_code} {resp.text}")
-        return resp.json()["embedding"]
-
-    elif provider == "http":
-        url = (cfg.get("embeddingUrl") or "http://localhost:1234").rstrip("/")
-        headers = {"Content-Type": "application/json"}
-        if cfg.get("embeddingApiKey"):
-            headers["Authorization"] = f"Bearer {cfg['embeddingApiKey']}"
-        emb_username = cfg.get("embeddingUsername", "")
-        emb_auth = (emb_username, cfg.get("embeddingPassword", "")) if emb_username else None
-        resp = _http_post(
-            f"{url}/v1/embeddings",
-            json={"model": model, "input": text},
-            headers=headers,
-            auth=emb_auth,
-            timeout=60,
-        )
-        if not resp.ok:
-            raise Exception(f"HTTP embedding error: {resp.status_code} {resp.text}")
-        data = resp.json()
+    """Compute embedding via any OpenAI-compatible /v1/embeddings endpoint."""
+    url = (cfg.get("embeddingUrl") or "http://localhost:11434/v1/embeddings").strip()
+    model = cfg.get("embeddingModel", "") or None
+    headers = {"Content-Type": "application/json"}
+    if cfg.get("embeddingApiKey"):
+        headers["Authorization"] = f"Bearer {cfg['embeddingApiKey']}"
+    body = {"input": text}
+    if model:
+        body["model"] = model
+    resp = _http_post(url, json=body, headers=headers, timeout=60)
+    if not resp.ok:
+        raise Exception(f"Embedding error {resp.status_code}: {resp.text}")
+    data = resp.json()
+    # Standard OpenAI format: {"data": [{"embedding": [...]}]}
+    if "data" in data and data["data"]:
         return data["data"][0]["embedding"]
-
-    elif provider == "huggingface":
-        # HuggingFace Text Embeddings Inference (TEI) — supports BGE, E5, etc.
-        url = (cfg.get("embeddingUrl") or "http://localhost:8080").rstrip("/")
-        headers = {"Content-Type": "application/json"}
-        if cfg.get("embeddingApiKey"):
-            headers["Authorization"] = f"Bearer {cfg['embeddingApiKey']}"
-        emb_username = cfg.get("embeddingUsername", "")
-        emb_auth = (emb_username, cfg.get("embeddingPassword", "")) if emb_username else None
-        resp = _http_post(
-            f"{url}/embed",
-            json={"inputs": text},
-            headers=headers,
-            auth=emb_auth,
-            timeout=60,
-        )
-        if not resp.ok:
-            raise Exception(f"HuggingFace TEI embedding error: {resp.status_code} {resp.text}")
-        result = resp.json()
-        # TEI returns [[...]] — list of embeddings for batch
-        if isinstance(result, list) and result and isinstance(result[0], list):
-            return result[0]
-        return result
-
-    else:
-        raise Exception(f"Unknown embedding provider: {provider}")
+    # Ollama legacy format: {"embedding": [...]}
+    if "embedding" in data:
+        return data["embedding"]
+    raise Exception(f"Unexpected embedding response format: {list(data.keys())}")
 
 
 # ---------------------------------------------------------------------------
@@ -749,41 +707,24 @@ def test_elasticsearch():
 
 @app.route("/api/rag/embedding-models", methods=["POST"])
 def get_embedding_models():
+    """List models available at the embedding endpoint via /v1/models."""
     data = request.get_json()
-    provider = data.get("embeddingProvider", "ollama")
-    emb_username = data.get("embeddingUsername", "")
-    emb_auth = (emb_username, data.get("embeddingPassword", "")) if emb_username else None
+    raw_url = (data.get("embeddingUrl") or "http://localhost:11434/v1/embeddings").strip()
+    # Derive base URL: strip /v1/embeddings (or /api/embeddings) suffix to reach /v1/models
+    base_url = raw_url
+    for suffix in ("/v1/embeddings", "/api/embeddings", "/embeddings"):
+        if base_url.endswith(suffix):
+            base_url = base_url[: -len(suffix)]
+            break
+    headers = {}
+    if data.get("embeddingApiKey"):
+        headers["Authorization"] = f"Bearer {data['embeddingApiKey']}"
     try:
-        if provider == "ollama":
-            url = (data.get("embeddingUrl") or "http://localhost:11434").rstrip("/")
-            resp = _http_get(f"{url}/api/tags", timeout=10)
-            if not resp.ok:
-                raise Exception(f"Ollama error: {resp.status_code}")
-            models = [m["name"] for m in resp.json().get("models", [])]
-            return jsonify({"models": models})
-        elif provider == "http":
-            url = (data.get("embeddingUrl") or "http://localhost:1234").rstrip("/")
-            headers = {}
-            if data.get("embeddingApiKey"):
-                headers["Authorization"] = f"Bearer {data['embeddingApiKey']}"
-            resp = _http_get(f"{url}/v1/models", headers=headers, auth=emb_auth, timeout=10)
-            if not resp.ok:
-                return jsonify({"models": []})
-            models = [m.get("id") or m.get("name", "") for m in resp.json().get("data", [])]
-            return jsonify({"models": [m for m in models if m]})
-        elif provider == "huggingface":
-            # TEI exposes a single model; retrieve its name via /info
-            url = (data.get("embeddingUrl") or "http://localhost:8080").rstrip("/")
-            headers = {}
-            if data.get("embeddingApiKey"):
-                headers["Authorization"] = f"Bearer {data['embeddingApiKey']}"
-            resp = _http_get(f"{url}/info", headers=headers, auth=emb_auth, timeout=10)
-            if resp.ok:
-                info = resp.json()
-                model_id = info.get("model_id") or info.get("model_type", "")
-                return jsonify({"models": [model_id] if model_id else []})
+        resp = _http_get(f"{base_url}/v1/models", headers=headers, timeout=10)
+        if not resp.ok:
             return jsonify({"models": []})
-        return jsonify({"models": []})
+        models = [m.get("id") or m.get("name", "") for m in resp.json().get("data", [])]
+        return jsonify({"models": [m for m in models if m]})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
@@ -1686,6 +1627,59 @@ Return ONLY a JSON object:
     except Exception as exc:
         print(f"Profile insights error: {exc}")
         return jsonify({"error": str(exc)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Config export / import
+# ---------------------------------------------------------------------------
+@app.route("/api/config/export", methods=["GET"])
+def export_config():
+    """Export all configuration and data as a single JSON file."""
+    db = read_db()
+    payload = {
+        "version": 1,
+        "clickhouseConfig": clickhouse_config,
+        "llmConfig": llm_config,
+        "ragConfig": rag_config,
+        "knowledge_folders": db.get("knowledge_folders", []),
+        "table_mappings": db.get("table_mappings", []),
+        "table_metadata": db.get("table_metadata", []),
+        "saved_queries": db.get("saved_queries", []),
+    }
+    return app.response_class(
+        json.dumps(payload, indent=2, ensure_ascii=False),
+        mimetype="application/json",
+        headers={"Content-Disposition": "attachment; filename=clicksense-config.json"},
+    )
+
+
+@app.route("/api/config/import", methods=["POST"])
+def import_config():
+    """Import configuration and data from a previously exported JSON file."""
+    global clickhouse_config, llm_config, rag_config
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Empty payload"}), 400
+
+    if "clickhouseConfig" in data:
+        clickhouse_config.update(data["clickhouseConfig"])
+    if "llmConfig" in data:
+        llm_config.update(data["llmConfig"])
+    if "ragConfig" in data:
+        rag_config.update(data["ragConfig"])
+
+    db = read_db()
+    if "knowledge_folders" in data:
+        db["knowledge_folders"] = data["knowledge_folders"]
+    if "table_mappings" in data:
+        db["table_mappings"] = data["table_mappings"]
+    if "table_metadata" in data:
+        db["table_metadata"] = data["table_metadata"]
+    if "saved_queries" in data:
+        db["saved_queries"] = data["saved_queries"]
+    write_db(db)
+
+    return jsonify({"success": True})
 
 
 # ---------------------------------------------------------------------------

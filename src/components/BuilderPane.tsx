@@ -40,7 +40,7 @@ import clsx from 'clsx';
 // Constants
 // ---------------------------------------------------------------------------
 const CHART_COLORS = ['#10b981', '#3b82f6', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4', '#84cc16'];
-const MAX_ROWS = 1000;
+const MAX_ROWS = 100;
 
 const AGG_OPTIONS = [
   { value: 'count',        label: 'COUNT' },

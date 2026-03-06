@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react';
-import { Save, Database, Cpu, CheckCircle2, RefreshCw, Search, AlertCircle, Layers } from 'lucide-react';
+import { useState, useEffect, useRef } from 'react';
+import { Save, Database, Cpu, CheckCircle2, RefreshCw, Search, AlertCircle, Layers, Download, Upload } from 'lucide-react';
 import { useAppStore } from '../store';
 
 export function SettingsPane() {
@@ -26,11 +26,8 @@ export function SettingsPane() {
   const [ragSaved, setRagSaved] = useState(false);
   const [embeddingModels, setEmbeddingModels] = useState<string[]>([]);
   const [isLoadingEmbeddingModels, setIsLoadingEmbeddingModels] = useState(false);
-  const [localRag, setLocalRag] = useState({
-    embeddingUsername: '',
-    embeddingPassword: '',
-    ...ragConfig,
-  });
+  const [localRag, setLocalRag] = useState({ ...ragConfig });
+  const importFileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     fetch('/api/config')
@@ -209,6 +206,44 @@ export function SettingsPane() {
     }
   };
 
+  const handleExport = async () => {
+    try {
+      const res = await fetch('/api/config/export');
+      if (!res.ok) throw new Error('Export failed');
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `clicksense-config-${new Date().toISOString().slice(0, 10)}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e: any) {
+      alert(`Export failed: ${e.message}`);
+    }
+  };
+
+  const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const payload = JSON.parse(text);
+      const res = await fetch('/api/config/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      alert('Configuration imported successfully. Reloading...');
+      window.location.reload();
+    } catch (e: any) {
+      alert(`Import failed: ${e.message}`);
+    } finally {
+      if (importFileRef.current) importFileRef.current.value = '';
+    }
+  };
+
   const testBtnClass = (result: 'idle' | 'success' | 'error') =>
     `px-4 py-2 rounded-lg text-sm font-medium transition-colors border flex items-center gap-2 ${result === 'success' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : result === 'error' ? 'bg-red-50 text-red-700 border-red-200' : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'}`;
 
@@ -217,9 +252,20 @@ export function SettingsPane() {
 
   return (
     <div className="p-8 max-w-4xl mx-auto space-y-8">
-      <div>
-        <h2 className="text-2xl font-bold text-slate-900 tracking-tight">Configuration</h2>
-        <p className="text-slate-500 mt-1">Manage your database connections, AI models and RAG settings.</p>
+      <div className="flex items-start justify-between">
+        <div>
+          <h2 className="text-2xl font-bold text-slate-900 tracking-tight">Configuration</h2>
+          <p className="text-slate-500 mt-1">Manage your database connections, AI models and RAG settings.</p>
+        </div>
+        <div className="flex items-center gap-2">
+          <input ref={importFileRef} type="file" accept=".json" className="hidden" onChange={handleImport} />
+          <button onClick={() => importFileRef.current?.click()} className="flex items-center gap-2 bg-white hover:bg-slate-50 text-slate-700 px-4 py-2.5 rounded-xl font-medium text-sm transition-all shadow-sm border border-slate-200">
+            <Upload size={16} /> Import
+          </button>
+          <button onClick={handleExport} className="flex items-center gap-2 bg-white hover:bg-slate-50 text-slate-700 px-4 py-2.5 rounded-xl font-medium text-sm transition-all shadow-sm border border-slate-200">
+            <Download size={16} /> Export
+          </button>
+        </div>
       </div>
 
       {/* ClickHouse */}
@@ -354,14 +400,14 @@ export function SettingsPane() {
         </div>
       </div>
 
-      {/* Embedding Model */}
+      {/* Embedding / Vectorisation */}
       <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
         <div className="p-6 border-b border-slate-100 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="bg-indigo-100 p-2 rounded-lg text-indigo-600"><Layers size={20} /></div>
             <div>
-              <h3 className="text-lg font-semibold text-slate-800">Embedding Model</h3>
-              <p className="text-xs text-slate-500 mt-0.5">Model used to vectorise documents and queries</p>
+              <h3 className="text-lg font-semibold text-slate-800">Embedding Endpoint</h3>
+              <p className="text-xs text-slate-500 mt-0.5">OpenAI-compatible HTTP endpoint used to vectorise documents and queries (e.g. Ollama, LM Studio, LocalAI)</p>
             </div>
           </div>
           <div className="flex items-center gap-2">
@@ -377,46 +423,23 @@ export function SettingsPane() {
           </div>
         </div>
         <div className="p-6 grid grid-cols-2 gap-6">
-          <div className="space-y-2">
-            <label className={labelClass}>Provider</label>
-            <select value={localRag.embeddingProvider} onChange={e => setLocalRag({ ...localRag, embeddingProvider: e.target.value as 'ollama' | 'http' | 'huggingface' })} className={inputClass}>
-              <option value="ollama">Ollama (Local)</option>
-              <option value="http">Custom HTTP (OpenAI Compatible)</option>
-              <option value="huggingface">HuggingFace TEI (BGE, E5…)</option>
-            </select>
-          </div>
-          <div className="space-y-2">
-            <label className={labelClass}>Server URL</label>
+          <div className="space-y-2 col-span-2">
+            <label className={labelClass}>Endpoint URL</label>
             <input
               type="text"
               value={localRag.embeddingUrl}
               onChange={e => setLocalRag({ ...localRag, embeddingUrl: e.target.value })}
               className={inputClass}
-              placeholder={
-                localRag.embeddingProvider === 'ollama'
-                  ? 'http://localhost:11434'
-                  : localRag.embeddingProvider === 'huggingface'
-                    ? 'http://localhost:8080'
-                    : 'http://localhost:1234'
-              }
+              placeholder="http://localhost:11434/v1/embeddings"
             />
+            <p className="text-xs text-slate-400">Full URL to the embeddings endpoint (OpenAI-compatible). Examples: <code>http://localhost:11434/v1/embeddings</code> (Ollama), <code>http://localhost:1234/v1/embeddings</code> (LM Studio)</p>
           </div>
           <div className="space-y-2">
-            <label className={labelClass}>Username</label>
-            <input type="text" value={localRag.embeddingUsername} onChange={e => setLocalRag({ ...localRag, embeddingUsername: e.target.value })} className={inputClass} placeholder="(optional)" />
+            <label className={labelClass}>API Key <span className="text-slate-400 font-normal">(optional)</span></label>
+            <input type="password" value={localRag.embeddingApiKey} onChange={e => setLocalRag({ ...localRag, embeddingApiKey: e.target.value })} className={inputClass} placeholder="sk-..." />
           </div>
           <div className="space-y-2">
-            <label className={labelClass}>Password</label>
-            <input type="password" value={localRag.embeddingPassword} onChange={e => setLocalRag({ ...localRag, embeddingPassword: e.target.value })} className={inputClass} placeholder="••••••••" />
-          </div>
-          {(localRag.embeddingProvider === 'http' || localRag.embeddingProvider === 'huggingface') && (
-            <div className="space-y-2 col-span-2">
-              <label className={labelClass}>API Key (optional)</label>
-              <input type="password" value={localRag.embeddingApiKey} onChange={e => setLocalRag({ ...localRag, embeddingApiKey: e.target.value })} className={inputClass} placeholder="sk-..." />
-            </div>
-          )}
-          <div className="space-y-2 col-span-2">
-            <label className={labelClass}>Embedding Model</label>
+            <label className={labelClass}>Model Name</label>
             <div className="flex gap-2">
               <input
                 list="emb-model-list"
@@ -424,24 +447,14 @@ export function SettingsPane() {
                 value={localRag.embeddingModel}
                 onChange={e => setLocalRag({ ...localRag, embeddingModel: e.target.value })}
                 className={inputClass}
-                placeholder={
-                  localRag.embeddingProvider === 'ollama'
-                    ? 'bge-m3, nomic-embed-text, mxbai-embed-large'
-                    : localRag.embeddingProvider === 'huggingface'
-                      ? 'BAAI/bge-m3, BAAI/bge-large-en-v1.5'
-                      : 'text-embedding-ada-002'
-                }
+                placeholder="nomic-embed-text, bge-m3, llama3…"
               />
               <datalist id="emb-model-list">{embeddingModels.map(m => <option key={m} value={m} />)}</datalist>
               <button onClick={fetchEmbeddingModels} disabled={isLoadingEmbeddingModels} className="shrink-0 flex items-center gap-2 bg-slate-100 hover:bg-slate-200 text-slate-700 px-4 py-2.5 rounded-lg text-sm font-medium transition-colors border border-slate-200">
                 <RefreshCw size={16} className={isLoadingEmbeddingModels ? "animate-spin" : ""} /> Refresh
               </button>
             </div>
-            <p className="text-xs text-slate-400">
-              {localRag.embeddingProvider === 'huggingface'
-                ? 'BGE via HuggingFace TEI: BAAI/bge-m3, BAAI/bge-large-en-v1.5, BAAI/bge-small-en-v1.5'
-                : 'Recommended: bge-m3, nomic-embed-text, mxbai-embed-large, all-minilm'}
-            </p>
+            <p className="text-xs text-slate-400">Any model served by the endpoint that supports the <code>/v1/embeddings</code> API</p>
           </div>
         </div>
         <div className="px-6 pb-6 flex justify-end">

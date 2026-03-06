@@ -18,11 +18,8 @@ export interface RagConfig {
   esIndex: string;
   esUsername: string;
   esPassword: string;
-  embeddingProvider: 'ollama' | 'http' | 'huggingface';
-  embeddingModel: string;
   embeddingUrl: string;
-  embeddingUsername: string;
-  embeddingPassword: string;
+  embeddingModel: string;
   embeddingApiKey: string;
   topK: number;
   chunkSize: number;
@@ -151,11 +148,8 @@ export const useAppStore = create<AppState>((set) => ({
     esIndex: 'clicksense_rag',
     esUsername: '',
     esPassword: '',
-    embeddingProvider: 'ollama',
-    embeddingModel: 'nomic-embed-text',
-    embeddingUrl: 'http://localhost:11434',
-    embeddingUsername: '',
-    embeddingPassword: '',
+    embeddingUrl: 'http://localhost:11434/v1/embeddings',
+    embeddingModel: '',
     embeddingApiKey: '',
     topK: 5,
     chunkSize: 500,
