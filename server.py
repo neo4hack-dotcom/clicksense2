@@ -286,6 +286,47 @@ def _ensure_es_index(cfg: dict, dims: int):
 # ---------------------------------------------------------------------------
 # LLM call helper (shared)
 # ---------------------------------------------------------------------------
+def _strip_llm_markdown(text: str) -> str:
+    """Remove markdown code fences that LLMs sometimes wrap around JSON."""
+    text = text.strip()
+    # Remove ```json ... ``` or ``` ... ``` blocks
+    for fence in ("```json", "```JSON", "```"):
+        if text.startswith(fence):
+            text = text[len(fence):]
+            break
+    if text.endswith("```"):
+        text = text[:-3]
+    return text.strip()
+
+
+def _parse_llm_json(content: str) -> dict:
+    """Parse JSON from LLM output, handling markdown fences and extra surrounding text."""
+    import re
+
+    if not content or not content.strip():
+        raise ValueError("LLM returned an empty response")
+
+    cleaned = _strip_llm_markdown(content)
+
+    # Fast path: try the cleaned content directly
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback: find the first JSON object or array in the text
+    match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", cleaned)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+
+    raise ValueError(
+        f"LLM response is not valid JSON. Raw content (first 500 chars): {content[:500]!r}"
+    )
+
+
 def _call_llm(system_prompt: str, messages: list, temperature: float = 0.7) -> str:
     """Call the configured LLM and return the content string."""
     if llm_config["provider"] == "http":
@@ -311,7 +352,7 @@ def _call_llm(system_prompt: str, messages: list, temperature: float = 0.7) -> s
             or resp_data.get("content")
             or ""
         )
-        return content.replace("```json", "").replace("```JSON", "").replace("```", "").strip()
+        return _strip_llm_markdown(content)
 
     elif llm_config["provider"] == "ollama":
         resp = _http_post(
@@ -324,8 +365,11 @@ def _call_llm(system_prompt: str, messages: list, temperature: float = 0.7) -> s
             },
             timeout=120,
         )
+        if not resp.ok:
+            raise Exception(f"Ollama LLM Error: {resp.status_code} - {resp.text}")
         resp_data = resp.json()
-        return resp_data["message"]["content"]
+        content = resp_data.get("message", {}).get("content", "")
+        return _strip_llm_markdown(content)
 
     else:
         raise Exception("Invalid LLM provider")
@@ -1032,9 +1076,7 @@ Do not include markdown formatting. Just the raw JSON.
 
     try:
         content = _call_llm(system_prompt, formatted_messages, temperature=0.3)
-        if not content:
-            raise Exception("LLM returned empty response.")
-        return jsonify(json.loads(content))
+        return jsonify(_parse_llm_json(content))
 
     except Exception as exc:
         print(f"Chat error: {exc}")
@@ -1074,7 +1116,7 @@ Return ONLY a JSON object (no markdown) with:
 
     try:
         content = _call_llm(system_prompt, [{"role": "user", "content": user_message}], temperature=0.3)
-        return jsonify(json.loads(content))
+        return jsonify(_parse_llm_json(content))
     except Exception as exc:
         print(f"Analyze error: {exc}")
         return jsonify({"error": str(exc)}), 500
