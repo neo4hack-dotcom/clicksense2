@@ -116,9 +116,7 @@ rag_config = {
     "esIndex": os.environ.get("ES_INDEX", "clicksense_rag"),
     "esUsername": os.environ.get("ES_USER", ""),
     "esPassword": os.environ.get("ES_PASSWORD", ""),
-    "embeddingUrl": "http://localhost:11434/v1/embeddings",
     "embeddingModel": "",
-    "embeddingApiKey": "",
     "topK": 5,
     "chunkSize": 500,
 }
@@ -171,29 +169,72 @@ def _rows_to_dicts(result) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Embedding helper
+# Embedding helper — uses the configured local LLM connection
 # ---------------------------------------------------------------------------
-def _get_embedding(text: str, cfg: dict) -> list:
-    """Compute embedding via any OpenAI-compatible /v1/embeddings endpoint."""
-    url = (cfg.get("embeddingUrl") or "http://localhost:11434/v1/embeddings").strip()
-    model = cfg.get("embeddingModel", "") or None
+def _get_embedding(text: str) -> list:
+    """Compute embedding via the configured local LLM endpoint (Ollama or local_http).
+
+    Uses the same provider/baseUrl as the LLM config so no separate embedding
+    endpoint configuration is required. The embedding model is taken from
+    rag_config['embeddingModel'] (can differ from the chat model).
+    """
+    provider = llm_config.get("provider", "ollama")
+    base_url = (llm_config.get("baseUrl") or "").rstrip("/")
+    model = (rag_config.get("embeddingModel") or "").strip() or llm_config.get("model") or "llama3"
     headers = {"Content-Type": "application/json"}
-    if cfg.get("embeddingApiKey"):
-        headers["Authorization"] = f"Bearer {cfg['embeddingApiKey']}"
-    body = {"input": text}
-    if model:
-        body["model"] = model
-    resp = _http_post(url, json=body, headers=headers, timeout=60)
-    if not resp.ok:
-        raise Exception(f"Embedding error {resp.status_code}: {resp.text}")
-    data = resp.json()
-    # Standard OpenAI format: {"data": [{"embedding": [...]}]}
-    if "data" in data and data["data"]:
-        return data["data"][0]["embedding"]
-    # Ollama legacy format: {"embedding": [...]}
-    if "embedding" in data:
-        return data["embedding"]
-    raise Exception(f"Unexpected embedding response format: {list(data.keys())}")
+
+    if provider == "ollama":
+        ollama_url = base_url or "http://localhost:11434"
+        # Ollama /api/embed (v0.3+) — supports batch; use single input as list
+        resp = _http_post(
+            f"{ollama_url}/api/embed",
+            json={"model": model, "input": text},
+            headers=headers,
+            timeout=120,
+        )
+        if resp.ok:
+            data = resp.json()
+            # /api/embed returns {"embeddings": [[...], ...]}
+            if "embeddings" in data and data["embeddings"]:
+                return data["embeddings"][0]
+        # Fallback: legacy /api/embeddings endpoint
+        resp2 = _http_post(
+            f"{ollama_url}/api/embeddings",
+            json={"model": model, "prompt": text},
+            headers=headers,
+            timeout=120,
+        )
+        if not resp2.ok:
+            raise Exception(f"Ollama embedding error {resp2.status_code}: {resp2.text}")
+        data2 = resp2.json()
+        if "embedding" in data2:
+            return data2["embedding"]
+        raise Exception(f"Unexpected Ollama embedding response: {list(data2.keys())}")
+
+    elif provider == "local_http":
+        # OpenAI-compatible /v1/embeddings endpoint derived from the LLM base URL
+        endpoint = base_url or "http://localhost:8000"
+        if "/v1/embeddings" not in endpoint:
+            endpoint = endpoint.rstrip("/") + "/v1/embeddings"
+        if llm_config.get("apiKey"):
+            headers["Authorization"] = f"Bearer {llm_config['apiKey']}"
+        resp = _http_post(
+            endpoint,
+            json={"model": model, "input": text},
+            headers=headers,
+            timeout=120,
+        )
+        if not resp.ok:
+            raise Exception(f"Embedding error {resp.status_code}: {resp.text}")
+        data = resp.json()
+        if "data" in data and data["data"]:
+            return data["data"][0]["embedding"]
+        raise Exception(f"Unexpected embedding response: {list(data.keys())}")
+
+    else:
+        raise Exception(
+            f"Embedding not supported for provider '{provider}'. Use 'ollama' or 'local_http'."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -685,6 +726,9 @@ def get_rag_config():
 def update_rag_config():
     global rag_config
     data = request.get_json()
+    # Drop legacy fields that were replaced by the LLM connection
+    for legacy in ("embeddingUrl", "embeddingApiKey"):
+        data.pop(legacy, None)
     rag_config.update(data)
     return jsonify({"success": True})
 
@@ -707,24 +751,28 @@ def test_elasticsearch():
 
 @app.route("/api/rag/embedding-models", methods=["POST"])
 def get_embedding_models():
-    """List models available at the embedding endpoint via /v1/models."""
-    data = request.get_json()
-    raw_url = (data.get("embeddingUrl") or "http://localhost:11434/v1/embeddings").strip()
-    # Derive base URL: strip /v1/embeddings (or /api/embeddings) suffix to reach /v1/models
-    base_url = raw_url
-    for suffix in ("/v1/embeddings", "/api/embeddings", "/embeddings"):
-        if base_url.endswith(suffix):
-            base_url = base_url[: -len(suffix)]
-            break
-    headers = {}
-    if data.get("embeddingApiKey"):
-        headers["Authorization"] = f"Bearer {data['embeddingApiKey']}"
+    """List models available at the LLM local endpoint for use as embedding models."""
+    provider = llm_config.get("provider", "ollama")
+    base_url = (llm_config.get("baseUrl") or "").rstrip("/")
+    headers = {"Content-Type": "application/json"}
+    if llm_config.get("apiKey"):
+        headers["Authorization"] = f"Bearer {llm_config['apiKey']}"
     try:
-        resp = _http_get(f"{base_url}/v1/models", headers=headers, timeout=10)
-        if not resp.ok:
-            return jsonify({"models": []})
-        models = [m.get("id") or m.get("name", "") for m in resp.json().get("data", [])]
-        return jsonify({"models": [m for m in models if m]})
+        if provider == "ollama":
+            ollama_url = base_url or "http://localhost:11434"
+            resp = _http_get(f"{ollama_url}/api/tags", headers=headers, timeout=10)
+            if not resp.ok:
+                return jsonify({"models": []})
+            models = [m.get("name", "") for m in resp.json().get("models", [])]
+            return jsonify({"models": [m for m in models if m]})
+        elif provider == "local_http":
+            endpoint = base_url or "http://localhost:8000"
+            resp = _http_get(f"{endpoint}/v1/models", headers=headers, timeout=10)
+            if not resp.ok:
+                return jsonify({"models": []})
+            models = [m.get("id") or m.get("name", "") for m in resp.json().get("data", [])]
+            return jsonify({"models": [m for m in models if m]})
+        return jsonify({"models": []})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
@@ -733,7 +781,7 @@ def get_embedding_models():
 def test_embedding():
     data = request.get_json()
     try:
-        embedding = _get_embedding("test", data)
+        embedding = _get_embedding("test")
         return jsonify({"success": True, "dims": len(embedding)})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
@@ -752,7 +800,7 @@ def index_knowledge_to_es():
 
     try:
         # Determine embedding dimension by running one test embedding
-        test_vec = _get_embedding("test", cfg)
+        test_vec = _get_embedding("test")
         dims = len(test_vec)
         _ensure_es_index(cfg, dims)
 
@@ -782,7 +830,7 @@ def index_knowledge_to_es():
 
             chunks = _chunk_text(content, chunk_size)
             for chunk_idx, chunk in enumerate(chunks):
-                embedding = _get_embedding(f"{title}\n\n{chunk}", cfg)
+                embedding = _get_embedding(f"{title}\n\n{chunk}")
                 doc = {
                     "folder_id": folder_id,
                     "title": title,
@@ -823,7 +871,7 @@ def rag_chat():
 
     try:
         # 1. Embed the user query
-        query_embedding = _get_embedding(query, cfg)
+        query_embedding = _get_embedding(query)
 
         # 2. kNN search in Elasticsearch
         host = cfg.get("esHost", "http://localhost:9200").rstrip("/")
@@ -1626,6 +1674,229 @@ Return ONLY a JSON object:
         return jsonify(_parse_llm_json(content))
     except Exception as exc:
         print(f"Profile insights error: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Data Quality Analysis
+# ---------------------------------------------------------------------------
+
+def _dq_column_stats(client, table: str, column: str, col_type: str, sample_size: int) -> dict:
+    """Collect a statistical profile for one column using ClickHouse queries."""
+    import re as _re
+    stats: dict = {"column": column, "type": col_type}
+    safe_table = _re.sub(r"[^\w.]", "", table)
+    safe_col = _re.sub(r"[^\w]", "", column)
+    limit_clause = f"LIMIT {int(sample_size)}"
+
+    try:
+        # ── Basic counts ──────────────────────────────────────────────────────
+        r = client.query(
+            f"SELECT COUNT(*) as total, countIf({safe_col} IS NULL) as nulls,"
+            f" uniqExact({safe_col}) as distinct_count"
+            f" FROM {safe_table} {limit_clause}"
+        )
+        row = r.result_rows[0]
+        total = int(row[0])
+        null_count = int(row[1])
+        distinct_count = int(row[2])
+        stats.update({
+            "total": total,
+            "null_count": null_count,
+            "null_pct": round(100 * null_count / max(total, 1), 2),
+            "distinct_count": distinct_count,
+            "distinct_pct": round(100 * distinct_count / max(total, 1), 2),
+        })
+
+        # ── Type-specific stats ───────────────────────────────────────────────
+        ct_upper = col_type.upper()
+        is_numeric = any(t in ct_upper for t in ("INT", "FLOAT", "DECIMAL", "DOUBLE", "NUMBER"))
+        is_string = any(t in ct_upper for t in ("STRING", "VARCHAR", "FIXEDSTRING", "TEXT"))
+        is_date = any(t in ct_upper for t in ("DATE", "DATETIME"))
+
+        if is_numeric:
+            r2 = client.query(
+                f"SELECT min({safe_col}), max({safe_col}), avg({safe_col}),"
+                f" stddevPop({safe_col}),"
+                f" quantile(0.25)({safe_col}), quantile(0.5)({safe_col}), quantile(0.75)({safe_col}),"
+                f" countIf({safe_col} < 0)"
+                f" FROM {safe_table} WHERE {safe_col} IS NOT NULL {limit_clause}"
+            )
+            rr = r2.result_rows[0]
+            def _f(v):
+                return round(float(v), 6) if v is not None else None
+            stats.update({
+                "min": _f(rr[0]), "max": _f(rr[1]),
+                "avg": _f(rr[2]), "stddev": _f(rr[3]),
+                "p25": _f(rr[4]), "p50": _f(rr[5]), "p75": _f(rr[6]),
+                "negative_count": int(rr[7]) if rr[7] is not None else 0,
+            })
+            # Outlier detection via IQR
+            if stats["p25"] is not None and stats["p75"] is not None:
+                iqr = stats["p75"] - stats["p25"]
+                lower = stats["p25"] - 1.5 * iqr
+                upper = stats["p75"] + 1.5 * iqr
+                r3 = client.query(
+                    f"SELECT countIf({safe_col} < {lower} OR {safe_col} > {upper})"
+                    f" FROM {safe_table} WHERE {safe_col} IS NOT NULL {limit_clause}"
+                )
+                stats["outlier_count"] = int(r3.result_rows[0][0])
+                stats["outlier_pct"] = round(100 * stats["outlier_count"] / max(total - null_count, 1), 2)
+
+        elif is_string:
+            r2 = client.query(
+                f"SELECT countIf({safe_col} = ''), min(length({safe_col})),"
+                f" max(length({safe_col})), avg(length({safe_col})),"
+                f" countIf(length({safe_col}) > 1000)"
+                f" FROM {safe_table} WHERE {safe_col} IS NOT NULL {limit_clause}"
+            )
+            rr = r2.result_rows[0]
+            empty_count = int(rr[0]) if rr[0] is not None else 0
+            stats.update({
+                "empty_count": empty_count,
+                "empty_pct": round(100 * empty_count / max(total, 1), 2),
+                "min_length": int(rr[1]) if rr[1] is not None else 0,
+                "max_length": int(rr[2]) if rr[2] is not None else 0,
+                "avg_length": round(float(rr[3]), 2) if rr[3] is not None else 0,
+                "very_long_count": int(rr[4]) if rr[4] is not None else 0,
+            })
+            # Detect common sentinel/garbage values
+            sentinels_q = (
+                f"SELECT countIf(lower(toString({safe_col})) IN"
+                f" ('null','none','n/a','na','#na','#n/a','unknown','undefined','nan','nil','-','0'))"
+                f" FROM {safe_table} WHERE {safe_col} IS NOT NULL {limit_clause}"
+            )
+            r3 = client.query(sentinels_q)
+            stats["sentinel_count"] = int(r3.result_rows[0][0])
+
+        elif is_date:
+            r2 = client.query(
+                f"SELECT min({safe_col}), max({safe_col}),"
+                f" countIf({safe_col} > now())"
+                f" FROM {safe_table} WHERE {safe_col} IS NOT NULL {limit_clause}"
+            )
+            rr = r2.result_rows[0]
+            stats.update({
+                "min_date": str(rr[0]) if rr[0] is not None else None,
+                "max_date": str(rr[1]) if rr[1] is not None else None,
+                "future_count": int(rr[2]) if rr[2] is not None else 0,
+            })
+
+        # ── Top 10 most frequent values ───────────────────────────────────────
+        r_top = client.query(
+            f"SELECT toString({safe_col}) as val, COUNT(*) as cnt"
+            f" FROM {safe_table} WHERE {safe_col} IS NOT NULL"
+            f" GROUP BY {safe_col} ORDER BY cnt DESC LIMIT 10"
+        )
+        stats["top_values"] = [
+            {"value": str(row[0]), "count": int(row[1])} for row in r_top.result_rows
+        ]
+
+    except Exception as e:
+        stats["query_error"] = str(e)
+
+    return stats
+
+
+@app.route("/api/data-quality/analyze", methods=["POST"])
+def analyze_data_quality():
+    """Run AI-powered data quality analysis on selected table columns."""
+    import re as _re
+    data = request.get_json()
+    table = (data.get("table") or "").strip()
+    columns = data.get("columns", [])
+    sample_size = min(int(data.get("sample_size", 50000)), 500000)
+
+    if not table:
+        return jsonify({"error": "Table name is required"}), 400
+    if not columns:
+        return jsonify({"error": "At least one column is required"}), 400
+    # Basic name validation to prevent SQL injection
+    if not _re.match(r"^[\w.]+$", table):
+        return jsonify({"error": "Invalid table name"}), 400
+    for col in columns:
+        if not _re.match(r"^\w+$", col):
+            return jsonify({"error": f"Invalid column name: {col}"}), 400
+
+    try:
+        client = get_clickhouse_client()
+
+        # Get column types from DESCRIBE TABLE
+        desc = client.query(f"DESCRIBE TABLE {table}")
+        col_types = {row[0]: row[1] for row in desc.result_rows}
+
+        # Collect per-column stats
+        column_stats = []
+        for col in columns:
+            col_type = col_types.get(col, "String")
+            cs = _dq_column_stats(client, table, col, col_type, sample_size)
+            column_stats.append(cs)
+
+        # ── LLM analysis ─────────────────────────────────────────────────────
+        stats_json = json.dumps(column_stats, indent=2, default=str)
+
+        system_prompt = """You are an expert data quality analyst specializing in database analytics and anomaly detection.
+Analyze the statistical profiles of the provided columns and identify all data quality issues.
+
+Evaluate each column for:
+1. **Null/Empty anomalies**: High null rates, sentinel values used as nulls (0, -1, 'N/A', 'null', 'none'…)
+2. **Format anomalies**: Inconsistent patterns, unexpected length distributions, mixed formats
+3. **Content anomalies**: Impossible values, values outside expected business domain
+4. **Cardinality anomalies**: Suspiciously low distinct counts (near-constant column), or unexpectedly high cardinality
+5. **Distribution anomalies**: Extreme skew, statistical outliers (IQR method), highly unbalanced categories
+6. **Temporal anomalies**: Future dates, epoch sentinel dates (1970-01-01), implausible date ranges
+
+Return ONLY valid JSON with this exact structure:
+{
+  "summary": "<2-3 sentence overall data quality assessment>",
+  "quality_score": <integer 0-100>,
+  "columns": [
+    {
+      "column": "<column_name>",
+      "quality_score": <integer 0-100>,
+      "issues": [
+        {
+          "severity": "critical|warning|info",
+          "category": "nulls|format|content|cardinality|distribution|temporal",
+          "title": "<short issue title>",
+          "description": "<detailed description with specific numbers>",
+          "affected_rows": <number or null>,
+          "recommendation": "<concrete actionable fix>"
+        }
+      ],
+      "insights": "<what looks good or any useful context about this column>"
+    }
+  ],
+  "recommendations": ["<global recommendation 1>", "<global recommendation 2>"]
+}"""
+
+        user_msg = (
+            f"Analyze data quality for table `{table}` (sample of {sample_size:,} rows).\n\n"
+            f"Column Statistics:\n{stats_json}\n\n"
+            "Provide a thorough analysis identifying all data quality issues with specific numbers."
+        )
+
+        llm_response = _call_llm(system_prompt, [{"role": "user", "content": user_msg}], temperature=0.1)
+
+        try:
+            analysis = _parse_llm_json(llm_response)
+        except Exception:
+            analysis = {
+                "summary": llm_response,
+                "quality_score": None,
+                "columns": [],
+                "recommendations": [],
+            }
+
+        return jsonify({
+            "table": table,
+            "sample_size": sample_size,
+            "column_stats": column_stats,
+            "analysis": analysis,
+        })
+
+    except Exception as exc:
+        print(f"Data quality error: {exc}")
         return jsonify({"error": str(exc)}), 500
 
 

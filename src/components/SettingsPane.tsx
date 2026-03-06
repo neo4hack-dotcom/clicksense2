@@ -26,7 +26,7 @@ export function SettingsPane() {
   const [ragSaved, setRagSaved] = useState(false);
   const [embeddingModels, setEmbeddingModels] = useState<string[]>([]);
   const [isLoadingEmbeddingModels, setIsLoadingEmbeddingModels] = useState(false);
-  const [localRag, setLocalRag] = useState({ ...ragConfig });
+  const [localRag, setLocalRag] = useState({ embeddingModel: ragConfig.embeddingModel, esHost: ragConfig.esHost, esIndex: ragConfig.esIndex, esUsername: ragConfig.esUsername, esPassword: ragConfig.esPassword, topK: ragConfig.topK, chunkSize: ragConfig.chunkSize });
   const importFileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -400,46 +400,32 @@ export function SettingsPane() {
         </div>
       </div>
 
-      {/* Embedding / Vectorisation */}
+      {/* Embedding Model (uses LLM connection) */}
       <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
         <div className="p-6 border-b border-slate-100 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="bg-indigo-100 p-2 rounded-lg text-indigo-600"><Layers size={20} /></div>
             <div>
-              <h3 className="text-lg font-semibold text-slate-800">Embedding Endpoint</h3>
-              <p className="text-xs text-slate-500 mt-0.5">OpenAI-compatible HTTP endpoint used to vectorise documents and queries (e.g. Ollama, LM Studio, LocalAI)</p>
+              <h3 className="text-lg font-semibold text-slate-800">Embedding Model</h3>
+              <p className="text-xs text-slate-500 mt-0.5">
+                Uses the LLM local connection above — no separate endpoint needed.
+                Choose a model optimized for embeddings (e.g. <code>nomic-embed-text</code>, <code>bge-m3</code>).
+              </p>
             </div>
           </div>
-          <div className="flex items-center gap-2">
-            <button onClick={testEmbedding} disabled={isTestingEmbedding} className={testBtnClass(embeddingTestResult)}>
-              {isTestingEmbedding
-                ? <><RefreshCw size={16} className="animate-spin" /> Testing...</>
-                : embeddingTestResult === 'success'
-                  ? <><CheckCircle2 size={16} /> Connected{embeddingTestDims ? ` (${embeddingTestDims}d)` : ''}</>
-                  : embeddingTestResult === 'error'
-                    ? <><AlertCircle size={16} /> Failed</>
-                    : 'Test Embedding'}
-            </button>
-          </div>
+          <button onClick={testEmbedding} disabled={isTestingEmbedding} className={testBtnClass(embeddingTestResult)}>
+            {isTestingEmbedding
+              ? <><RefreshCw size={16} className="animate-spin" /> Testing...</>
+              : embeddingTestResult === 'success'
+                ? <><CheckCircle2 size={16} /> OK{embeddingTestDims ? ` (${embeddingTestDims}d)` : ''}</>
+                : embeddingTestResult === 'error'
+                  ? <><AlertCircle size={16} /> Failed</>
+                  : 'Test Embedding'}
+          </button>
         </div>
-        <div className="p-6 grid grid-cols-2 gap-6">
-          <div className="space-y-2 col-span-2">
-            <label className={labelClass}>Endpoint URL</label>
-            <input
-              type="text"
-              value={localRag.embeddingUrl}
-              onChange={e => setLocalRag({ ...localRag, embeddingUrl: e.target.value })}
-              className={inputClass}
-              placeholder="http://localhost:11434/v1/embeddings"
-            />
-            <p className="text-xs text-slate-400">Full URL to the embeddings endpoint (OpenAI-compatible). Examples: <code>http://localhost:11434/v1/embeddings</code> (Ollama), <code>http://localhost:1234/v1/embeddings</code> (LM Studio)</p>
-          </div>
+        <div className="p-6">
           <div className="space-y-2">
-            <label className={labelClass}>API Key <span className="text-slate-400 font-normal">(optional)</span></label>
-            <input type="password" value={localRag.embeddingApiKey} onChange={e => setLocalRag({ ...localRag, embeddingApiKey: e.target.value })} className={inputClass} placeholder="sk-..." />
-          </div>
-          <div className="space-y-2">
-            <label className={labelClass}>Model Name</label>
+            <label className={labelClass}>Embedding Model Name</label>
             <div className="flex gap-2">
               <input
                 list="emb-model-list"
@@ -454,7 +440,9 @@ export function SettingsPane() {
                 <RefreshCw size={16} className={isLoadingEmbeddingModels ? "animate-spin" : ""} /> Refresh
               </button>
             </div>
-            <p className="text-xs text-slate-400">Any model served by the endpoint that supports the <code>/v1/embeddings</code> API</p>
+            <p className="text-xs text-slate-400">
+              Leave blank to reuse the LLM model. Embedding calls go to the same Ollama/local_http server as the LLM.
+            </p>
           </div>
         </div>
         <div className="px-6 pb-6 flex justify-end">

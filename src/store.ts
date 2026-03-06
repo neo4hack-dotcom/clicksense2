@@ -18,9 +18,7 @@ export interface RagConfig {
   esIndex: string;
   esUsername: string;
   esPassword: string;
-  embeddingUrl: string;
   embeddingModel: string;
-  embeddingApiKey: string;
   topK: number;
   chunkSize: number;
 }
@@ -51,8 +49,8 @@ interface AppState {
   };
   setQueryConfig: (config: any) => void;
 
-  activeTab: 'chat' | 'builder' | 'dashboard' | 'settings' | 'knowledge' | 'rag';
-  setActiveTab: (tab: 'chat' | 'builder' | 'dashboard' | 'settings' | 'knowledge' | 'rag') => void;
+  activeTab: 'chat' | 'builder' | 'dashboard' | 'settings' | 'knowledge' | 'rag' | 'data-quality';
+  setActiveTab: (tab: 'chat' | 'builder' | 'dashboard' | 'settings' | 'knowledge' | 'rag' | 'data-quality') => void;
 
   chatHistory: {
     role: 'user' | 'assistant';
@@ -148,9 +146,7 @@ export const useAppStore = create<AppState>((set) => ({
     esIndex: 'clicksense_rag',
     esUsername: '',
     esPassword: '',
-    embeddingUrl: 'http://localhost:11434/v1/embeddings',
     embeddingModel: '',
-    embeddingApiKey: '',
     topK: 5,
     chunkSize: 500,
   },

@@ -6,6 +6,7 @@ import { SettingsPane } from './components/SettingsPane';
 import { KnowledgeBasePane } from './components/KnowledgeBasePane';
 import { DashboardPane } from './components/DashboardPane';
 import { RagPane } from './components/RagPane';
+import { DataQualityPane } from './components/DataQualityPane';
 import { useAppStore } from './store';
 import { MessageSquare } from 'lucide-react';
 
@@ -84,6 +85,11 @@ export default function App() {
         {activeTab === 'rag' && (
           <div className="flex-1 h-full bg-slate-50 overflow-y-auto">
             <RagPane />
+          </div>
+        )}
+        {activeTab === 'data-quality' && (
+          <div className="flex-1 h-full bg-slate-50 overflow-hidden">
+            <DataQualityPane />
           </div>
         )}
       </div>

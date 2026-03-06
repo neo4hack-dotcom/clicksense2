@@ -1,4 +1,4 @@
-import { MessageSquare, LayoutDashboard, Settings, BookOpen, Database, Grid, Layers } from 'lucide-react';
+import { MessageSquare, LayoutDashboard, Settings, BookOpen, Database, Grid, Layers, ShieldCheck } from 'lucide-react';
 import { useAppStore } from '../store';
 import clsx from 'clsx';
 
@@ -11,6 +11,7 @@ export function Sidebar() {
     { id: 'dashboard', icon: Grid, label: 'My Dashboard' },
     { id: 'knowledge', icon: BookOpen, label: 'Knowledge Base' },
     { id: 'rag', icon: Layers, label: 'RAG' },
+    { id: 'data-quality', icon: ShieldCheck, label: 'AI Data Quality' },
     { id: 'settings', icon: Settings, label: 'Settings' },
   ] as const;
 
