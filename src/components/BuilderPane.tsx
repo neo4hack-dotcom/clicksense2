@@ -840,7 +840,7 @@ export function BuilderPane() {
 
       case 'bar':
         return (
-          <div className="overflow-auto min-h-0 flex-1">
+          <div className="overflow-x-auto overflow-y-hidden min-h-0 flex-1 min-w-0">
             <div style={{ minWidth: Math.max(600, processedData.length * 40) }}>
               <ResponsiveContainer width="100%" height={400}>
                 <BarChart data={processedData}>
@@ -860,7 +860,7 @@ export function BuilderPane() {
 
       case 'line':
         return (
-          <div className="overflow-auto min-h-0 flex-1">
+          <div className="overflow-x-auto overflow-y-hidden min-h-0 flex-1 min-w-0">
             <div style={{ minWidth: Math.max(600, processedData.length * 40) }}>
               <ResponsiveContainer width="100%" height={400}>
                 <RechartsLineChart data={processedData}>
@@ -880,7 +880,7 @@ export function BuilderPane() {
 
       case 'area':
         return (
-          <div className="overflow-auto min-h-0 flex-1">
+          <div className="overflow-x-auto overflow-y-hidden min-h-0 flex-1 min-w-0">
             <div style={{ minWidth: Math.max(600, processedData.length * 40) }}>
               <ResponsiveContainer width="100%" height={400}>
                 <RechartsAreaChart data={processedData}>
@@ -1502,8 +1502,8 @@ export function BuilderPane() {
           </div>
         )}
 
-        {/* Results Area — overflow-auto so content is reachable on small screens */}
-        <div className="flex-1 p-6 overflow-auto bg-slate-50/50 flex flex-col gap-4 min-w-0">
+        {/* Results Area — overflow-y-auto so content is reachable on small screens, overflow-x-hidden prevents chart width from pushing buttons off-screen */}
+        <div className="flex-1 p-6 overflow-y-auto overflow-x-hidden bg-slate-50/50 flex flex-col gap-4 min-w-0">
           {suggestedVisual && suggestedVisual !== visualType && (
             <div className="bg-blue-50 border border-blue-100 rounded-xl p-3 flex items-center justify-between shadow-sm">
               <div className="flex items-center gap-2 text-blue-700 text-sm">
@@ -1527,7 +1527,7 @@ export function BuilderPane() {
                 "bg-white border border-slate-200 shadow-sm overflow-hidden flex flex-col",
                 isFullscreen
                   ? "fixed inset-0 z-[200] shadow-2xl rounded-none"
-                  : "flex-1 rounded-2xl"
+                  : "flex-1 rounded-2xl min-w-0"
               )}>
                 <div className="p-4 border-b border-slate-100 flex items-center justify-between bg-white shrink-0">
                   <h3 className="text-sm font-semibold text-slate-800">Results</h3>
@@ -1605,7 +1605,7 @@ export function BuilderPane() {
                     </button>
                   </div>
                 </div>
-                <div className="p-4 flex-1 flex flex-col overflow-auto min-h-0">
+                <div className="p-4 flex-1 flex flex-col overflow-auto min-h-0 min-w-0">
                   {renderVisual()}
                 </div>
               </div>
