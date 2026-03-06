@@ -68,6 +68,7 @@ DEFAULT_DB = {
     "query_history": [],
     "table_metadata": [],
     "knowledge_folders": [],
+    "table_mappings": [],
 }
 
 
@@ -816,6 +817,49 @@ def delete_knowledge_folder(folder_id):
 
 
 # ---------------------------------------------------------------------------
+# Table Mappings (friendly names for ClickHouse tables)
+# ---------------------------------------------------------------------------
+@app.route("/api/table-mappings", methods=["GET"])
+def get_table_mappings():
+    db = read_db()
+    return jsonify(db.get("table_mappings", []))
+
+
+@app.route("/api/table-mappings", methods=["POST"])
+def upsert_table_mapping():
+    data = request.get_json()
+    table_name = data.get("table_name", "").strip()
+    mapping_name = data.get("mapping_name", "").strip()
+    if not table_name:
+        return jsonify({"error": "table_name is required"}), 400
+
+    db = read_db()
+    mappings = db.get("table_mappings", [])
+    idx = next((i for i, m in enumerate(mappings) if m["table_name"] == table_name), None)
+    if mapping_name:
+        if idx is not None:
+            mappings[idx]["mapping_name"] = mapping_name
+        else:
+            mappings.append({"table_name": table_name, "mapping_name": mapping_name})
+    else:
+        # Empty mapping_name removes the entry
+        if idx is not None:
+            mappings.pop(idx)
+
+    db["table_mappings"] = mappings
+    write_db(db)
+    return jsonify({"success": True})
+
+
+@app.route("/api/table-mappings/<path:table_name>", methods=["DELETE"])
+def delete_table_mapping(table_name):
+    db = read_db()
+    db["table_mappings"] = [m for m in db.get("table_mappings", []) if m["table_name"] != table_name]
+    write_db(db)
+    return jsonify({"success": True})
+
+
+# ---------------------------------------------------------------------------
 # Query history
 # ---------------------------------------------------------------------------
 @app.route("/api/history", methods=["POST"])
@@ -910,6 +954,8 @@ def chat():
     messages = data["messages"]
     schema = data.get("schema", {})
     table_metadata = data.get("tableMetadata", {})
+    # tableMappingFilter: list of technical table names to restrict the schema to
+    table_mapping_filter = data.get("tableMappingFilter", [])
 
     # Build knowledge context from folders
     db = read_db()
@@ -917,6 +963,24 @@ def chat():
     knowledge_context = "\n\n".join(
         f"[{f['title']}]\n{f['content']}" for f in folders if f.get("content")
     ) or knowledge_base
+
+    # Build a map of technical name -> friendly mapping name
+    all_mappings = {m["table_name"]: m["mapping_name"] for m in db.get("table_mappings", [])}
+
+    # If a filter is active, restrict the schema to selected tables only
+    if table_mapping_filter:
+        schema = {t: cols for t, cols in schema.items() if t in table_mapping_filter}
+        table_metadata = {t: v for t, v in table_metadata.items() if t in table_mapping_filter}
+
+    # Build a mapping note for the system prompt
+    mapping_lines = []
+    for tbl in schema:
+        if tbl in all_mappings:
+            mapping_lines.append(f"  - {tbl}  →  \"{all_mappings[tbl]}\"")
+    mapping_note = (
+        "The following tables have friendly business names. When communicating with the user use the friendly name, but always use the technical name in SQL:\n"
+        + "\n".join(mapping_lines)
+    ) if mapping_lines else ""
 
     system_prompt = f"""You are an expert ClickHouse data analyst.
 Your goal is to help the user query their database.
@@ -926,6 +990,8 @@ Here is the database schema:
 
 Here is the table metadata (functional descriptions):
 {json.dumps(table_metadata, indent=2)}
+
+{mapping_note}
 
 Here is the functional knowledge base:
 {knowledge_context}

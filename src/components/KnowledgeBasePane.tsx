@@ -1,10 +1,13 @@
 import { useState, useEffect } from 'react';
-import { BookOpen, Plus, Save, Trash2, Edit3, CheckCircle2, FolderOpen, X, ChevronDown, ChevronRight } from 'lucide-react';
+import { BookOpen, Plus, Save, Trash2, Edit3, CheckCircle2, FolderOpen, X, ChevronDown, ChevronRight, Table2, Search } from 'lucide-react';
 import { useAppStore, KnowledgeFolder } from '../store';
 import { motion, AnimatePresence } from 'motion/react';
 
 export function KnowledgeBasePane() {
-  const { knowledgeFolders, setKnowledgeFolders } = useAppStore();
+  const { knowledgeFolders, setKnowledgeFolders, schema, tableMappings, setTableMappings } = useAppStore();
+  const [activeSubTab, setActiveSubTab] = useState<'folders' | 'table-mapping'>('folders');
+
+  // Folders state
   const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set());
   const [editingFolder, setEditingFolder] = useState<KnowledgeFolder | null>(null);
   const [isCreating, setIsCreating] = useState(false);
@@ -12,10 +15,19 @@ export function KnowledgeBasePane() {
   const [savingId, setSavingId] = useState<number | null>(null);
   const [savedId, setSavedId] = useState<number | null>(null);
 
+  // Table mapping state
+  const [tableSearch, setTableSearch] = useState('');
+  const [editingMappings, setEditingMappings] = useState<Record<string, string>>({});
+  const [savingTable, setSavingTable] = useState<string | null>(null);
+  const [savedTable, setSavedTable] = useState<string | null>(null);
+
   useEffect(() => {
     fetch('/api/knowledge/folders')
       .then(res => res.json())
       .then(data => setKnowledgeFolders(data));
+    fetch('/api/table-mappings')
+      .then(res => res.json())
+      .then((data: { table_name: string; mapping_name: string }[]) => setTableMappings(data));
   }, []);
 
   const toggleExpand = (id: number) => {
@@ -71,13 +83,97 @@ export function KnowledgeBasePane() {
     setExpandedIds(prev => { const n = new Set(prev); n.delete(id); return n; });
   };
 
+  // Table mapping helpers
+  const getMappingName = (tableName: string) => {
+    const saved = tableMappings.find(m => m.table_name === tableName);
+    return saved?.mapping_name ?? '';
+  };
+
+  const getEditingValue = (tableName: string) => {
+    if (tableName in editingMappings) return editingMappings[tableName];
+    return getMappingName(tableName);
+  };
+
+  const handleSaveMapping = async (tableName: string) => {
+    const mappingName = (editingMappings[tableName] ?? getMappingName(tableName)).trim();
+    setSavingTable(tableName);
+    try {
+      await fetch('/api/table-mappings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ table_name: tableName, mapping_name: mappingName }),
+      });
+      if (mappingName) {
+        const updated = tableMappings.filter(m => m.table_name !== tableName);
+        setTableMappings([...updated, { table_name: tableName, mapping_name: mappingName }]);
+      } else {
+        setTableMappings(tableMappings.filter(m => m.table_name !== tableName));
+      }
+      setEditingMappings(prev => { const n = { ...prev }; delete n[tableName]; return n; });
+      setSavedTable(tableName);
+      setTimeout(() => setSavedTable(null), 2000);
+    } catch {
+      alert('Failed to save mapping');
+    } finally {
+      setSavingTable(null);
+    }
+  };
+
+  const allTableNames = Object.keys(schema).sort();
+  const filteredTables = tableSearch.trim()
+    ? allTableNames.filter(t =>
+        t.toLowerCase().includes(tableSearch.toLowerCase()) ||
+        getMappingName(t).toLowerCase().includes(tableSearch.toLowerCase())
+      )
+    : allTableNames;
+
   return (
     <div className="p-8 max-w-4xl mx-auto">
-      <div className="mb-8 flex items-start justify-between">
+      <div className="mb-6">
+        <h2 className="text-2xl font-bold text-slate-900 tracking-tight">Knowledge Base</h2>
+        <p className="text-slate-500 mt-1 max-w-2xl">
+          Organize business context and define friendly names for your ClickHouse tables.
+        </p>
+      </div>
+
+      {/* Sub-tab switcher */}
+      <div className="flex gap-1 mb-6 bg-slate-100 rounded-xl p-1 w-fit">
+        <button
+          onClick={() => setActiveSubTab('folders')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+            activeSubTab === 'folders'
+              ? 'bg-white text-slate-800 shadow-sm'
+              : 'text-slate-500 hover:text-slate-700'
+          }`}
+        >
+          <BookOpen size={15} />
+          Folders
+        </button>
+        <button
+          onClick={() => setActiveSubTab('table-mapping')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+            activeSubTab === 'table-mapping'
+              ? 'bg-white text-slate-800 shadow-sm'
+              : 'text-slate-500 hover:text-slate-700'
+          }`}
+        >
+          <Table2 size={15} />
+          Table Mapping
+          {tableMappings.length > 0 && (
+            <span className="bg-emerald-100 text-emerald-700 text-xs px-1.5 py-0.5 rounded-full font-semibold">
+              {tableMappings.length}
+            </span>
+          )}
+        </button>
+      </div>
+
+      {/* ── Folders sub-tab ── */}
+      {activeSubTab === 'folders' && (
+      <div>
+      <div className="mb-6 flex items-start justify-between">
         <div>
-          <h2 className="text-2xl font-bold text-slate-900 tracking-tight">Knowledge Base</h2>
-          <p className="text-slate-500 mt-1 max-w-2xl">
-            Organize business context into titled folders. Each folder's title is used for similarity matching during AI queries — allowing fast, precise retrieval without reading full content.
+          <p className="text-slate-500 text-sm max-w-2xl">
+            Each folder's title is used for similarity matching during AI queries — allowing fast, precise retrieval without reading full content.
           </p>
         </div>
         <button
@@ -266,6 +362,97 @@ export function KnowledgeBasePane() {
               </div>
             );
           })}
+        </div>
+      )}
+      </div>
+      )}
+
+      {/* ── Table Mapping sub-tab ── */}
+      {activeSubTab === 'table-mapping' && (
+        <div>
+          <div className="mb-4 flex items-center gap-3">
+            <div className="relative flex-1 max-w-sm">
+              <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+              <input
+                type="text"
+                value={tableSearch}
+                onChange={e => setTableSearch(e.target.value)}
+                placeholder="Search tables or mapping names..."
+                className="w-full pl-9 pr-3 py-2 bg-white border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all"
+              />
+            </div>
+            <p className="text-sm text-slate-500">
+              {filteredTables.length} table{filteredTables.length !== 1 ? 's' : ''}
+              {tableMappings.length > 0 && (
+                <span className="ml-2 text-emerald-600 font-medium">· {tableMappings.length} mapped</span>
+              )}
+            </p>
+          </div>
+
+          {allTableNames.length === 0 ? (
+            <div className="flex flex-col items-center justify-center h-48 text-slate-400 bg-white rounded-2xl border border-dashed border-slate-200">
+              <Table2 size={36} className="mb-3 opacity-20" />
+              <p className="text-sm">No tables found. Make sure your ClickHouse connection is configured.</p>
+            </div>
+          ) : (
+            <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+              <div className="grid grid-cols-[1fr_1fr_auto] gap-0 text-xs font-semibold text-slate-500 uppercase tracking-wide px-4 py-2.5 bg-slate-50 border-b border-slate-100">
+                <span>Technical Name</span>
+                <span>Friendly Mapping Name</span>
+                <span></span>
+              </div>
+              <div className="divide-y divide-slate-100">
+                {filteredTables.map(tableName => {
+                  const currentSavedName = getMappingName(tableName);
+                  const currentEditValue = getEditingValue(tableName);
+                  const isDirty = currentEditValue !== currentSavedName;
+                  const isSaving = savingTable === tableName;
+                  const isSaved = savedTable === tableName;
+
+                  return (
+                    <div key={tableName} className="grid grid-cols-[1fr_1fr_auto] gap-3 items-center px-4 py-2.5 hover:bg-slate-50 transition-colors">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <div className="w-1.5 h-1.5 rounded-full bg-blue-400 shrink-0" />
+                        <span className="font-mono text-sm text-slate-700 truncate" title={tableName}>{tableName}</span>
+                      </div>
+                      <input
+                        type="text"
+                        value={currentEditValue}
+                        onChange={e => setEditingMappings(prev => ({ ...prev, [tableName]: e.target.value }))}
+                        onKeyDown={e => { if (e.key === 'Enter') handleSaveMapping(tableName); }}
+                        placeholder="Ex: Ventes des produits Maison"
+                        className="w-full bg-slate-50 border border-slate-200 rounded-lg px-3 py-1.5 text-sm focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all"
+                      />
+                      <div className="flex items-center gap-1.5 shrink-0 w-20 justify-end">
+                        {isSaved && !isDirty ? (
+                          <CheckCircle2 size={16} className="text-emerald-500" />
+                        ) : isDirty ? (
+                          <button
+                            onClick={() => handleSaveMapping(tableName)}
+                            disabled={isSaving}
+                            className="flex items-center gap-1 bg-emerald-500 hover:bg-emerald-600 disabled:opacity-50 text-white px-2.5 py-1 rounded-lg text-xs font-medium transition-colors"
+                          >
+                            <Save size={11} />
+                            {isSaving ? '...' : 'Save'}
+                          </button>
+                        ) : currentSavedName ? (
+                          <button
+                            onClick={() => {
+                              setEditingMappings(prev => ({ ...prev, [tableName]: '' }));
+                            }}
+                            className="p-1 text-slate-300 hover:text-red-400 hover:bg-red-50 rounded-lg transition-colors"
+                            title="Remove mapping"
+                          >
+                            <X size={14} />
+                          </button>
+                        ) : null}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>
