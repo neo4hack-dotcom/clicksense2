@@ -1,7 +1,8 @@
 import { useState, useRef, useEffect } from 'react';
 import {
   Send, Bot, Loader2, Sparkles, Play, Save, History, Trash2,
-  Maximize2, Minimize2, Minus, CheckSquare, Filter, X
+  Maximize2, Minimize2, Minus, CheckSquare, Filter, X,
+  Brain, ChevronDown, ChevronRight, CheckCircle2, XCircle, Database,
 } from 'lucide-react';
 import { useAppStore } from '../store';
 import clsx from 'clsx';
@@ -19,6 +20,8 @@ export function ChatPane() {
 
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [isAgentLoading, setIsAgentLoading] = useState(false);
+  const [expandedSteps, setExpandedSteps] = useState<Record<number, boolean>>({});
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const scrollToBottom = () => {
@@ -79,6 +82,45 @@ export function ChatPane() {
       addChatMessage({ role: 'assistant', content: `Failed to connect to AI: ${error.message}` });
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const handleAgentSend = async () => {
+    const text = input.trim();
+    if (!text) return;
+
+    setInput('');
+    addChatMessage({ role: 'user', content: text });
+    setIsAgentLoading(true);
+
+    try {
+      const res = await fetch('/api/agent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          question: text,
+          schema,
+          tableMetadata,
+          tableMappingFilter: selectedTableMappings,
+        }),
+      });
+
+      const data = await res.json();
+
+      if (data.error) {
+        addChatMessage({ role: 'assistant', content: `Agent error: ${data.error}` });
+      } else {
+        addChatMessage({
+          role: 'assistant',
+          content: data.final_answer || 'Analysis complete.',
+          is_agent: true,
+          agent_steps: data.steps || [],
+        });
+      }
+    } catch (error: any) {
+      addChatMessage({ role: 'assistant', content: `Failed to run agent: ${error.message}` });
+    } finally {
+      setIsAgentLoading(false);
     }
   };
 
@@ -318,16 +360,33 @@ export function ChatPane() {
             >
               <div className={clsx(
                 "w-7 h-7 rounded-full flex items-center justify-center shrink-0 text-xs font-bold",
-                msg.role === 'user' ? "bg-blue-500 text-white" : "bg-emerald-500 text-white"
+                msg.role === 'user'
+                  ? "bg-blue-500 text-white"
+                  : msg.is_agent
+                    ? "bg-indigo-500 text-white"
+                    : "bg-emerald-500 text-white"
               )}>
-                {msg.role === 'user' ? 'U' : <Bot size={14} />}
+                {msg.role === 'user' ? 'U' : msg.is_agent ? <Brain size={14} /> : <Bot size={14} />}
               </div>
               <div className={clsx(
                 "max-w-[85%] rounded-2xl p-3 shadow-sm",
                 msg.role === 'user'
                   ? "bg-blue-500 text-white rounded-tr-none"
-                  : "bg-white border border-slate-200 text-slate-800 rounded-tl-none"
+                  : msg.is_agent
+                    ? "bg-white border border-indigo-200 text-slate-800 rounded-tl-none"
+                    : "bg-white border border-slate-200 text-slate-800 rounded-tl-none"
               )}>
+                {msg.is_agent && (
+                  <div className="flex items-center gap-1.5 mb-2">
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-700 text-[10px] font-semibold uppercase tracking-wide">
+                      <Brain size={9} />
+                      Analyse Agent
+                    </span>
+                    {msg.agent_steps && (
+                      <span className="text-[10px] text-indigo-400">{msg.agent_steps.length} étape{msg.agent_steps.length > 1 ? 's' : ''}</span>
+                    )}
+                  </div>
+                )}
                 <p className="text-sm leading-relaxed whitespace-pre-wrap">{msg.content}</p>
 
                 {/* Clarification options */}
@@ -378,6 +437,63 @@ export function ChatPane() {
                     </pre>
                   </div>
                 )}
+
+                {/* Agent analysis steps */}
+                {msg.is_agent && msg.agent_steps && msg.agent_steps.length > 0 && (
+                  <div className="mt-3 border border-indigo-200 rounded-xl overflow-hidden bg-indigo-50/40">
+                    <div className="px-3 py-2 bg-indigo-100/60 border-b border-indigo-200 flex items-center gap-2">
+                      <Brain size={13} className="text-indigo-600" />
+                      <span className="text-xs font-semibold text-indigo-700">
+                        Agent — {msg.agent_steps.length} analyse{msg.agent_steps.length > 1 ? 's' : ''} effectuée{msg.agent_steps.length > 1 ? 's' : ''}
+                      </span>
+                    </div>
+                    <div className="divide-y divide-indigo-100">
+                      {msg.agent_steps.map((step, si) => {
+                        const key = i * 100 + si;
+                        const open = expandedSteps[key];
+                        return (
+                          <div key={si} className="text-xs">
+                            <button
+                              onClick={() => setExpandedSteps(prev => ({ ...prev, [key]: !prev[key] }))}
+                              className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-indigo-100/50 transition-colors"
+                            >
+                              {step.ok
+                                ? <CheckCircle2 size={12} className="text-emerald-500 shrink-0" />
+                                : <XCircle size={12} className="text-red-400 shrink-0" />
+                              }
+                              <span className="font-medium text-indigo-800">Étape {step.step}</span>
+                              <span className="text-indigo-500 truncate flex-1">{step.reasoning}</span>
+                              <span className="text-indigo-400 shrink-0 flex items-center gap-1">
+                                <Database size={10} />
+                                {step.row_count} ligne{step.row_count !== 1 ? 's' : ''}
+                              </span>
+                              {open
+                                ? <ChevronDown size={12} className="text-indigo-400 shrink-0" />
+                                : <ChevronRight size={12} className="text-indigo-400 shrink-0" />
+                              }
+                            </button>
+                            {open && (
+                              <div className="px-3 pb-3 space-y-2">
+                                <div className="bg-slate-900 rounded-lg overflow-hidden">
+                                  <div className="px-2 py-1 bg-slate-800/50 border-b border-slate-700">
+                                    <span className="text-[10px] font-mono text-slate-400">SQL exécuté</span>
+                                  </div>
+                                  <pre className="p-2 text-[10px] font-mono text-emerald-400 overflow-x-auto whitespace-pre-wrap">
+                                    {step.sql}
+                                  </pre>
+                                </div>
+                                <div className="bg-white border border-indigo-100 rounded-lg p-2">
+                                  <p className="text-[10px] font-semibold text-slate-500 mb-1">Résultat</p>
+                                  <pre className="text-[10px] text-slate-600 whitespace-pre-wrap">{step.result_summary}</pre>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
               </div>
             </motion.div>
           ))
@@ -393,28 +509,61 @@ export function ChatPane() {
             </div>
           </div>
         )}
+        {isAgentLoading && (
+          <div className="flex gap-3">
+            <div className="w-7 h-7 rounded-full bg-indigo-500 text-white flex items-center justify-center shrink-0">
+              <Brain size={14} />
+            </div>
+            <div className="bg-indigo-50 border border-indigo-200 rounded-2xl rounded-tl-none p-3 shadow-sm">
+              <div className="flex items-center gap-2 mb-1">
+                <Loader2 className="animate-spin text-indigo-500" size={14} />
+                <span className="text-xs font-medium text-indigo-700">Agent en cours d'analyse…</span>
+              </div>
+              <p className="text-[11px] text-indigo-500">
+                L'agent mène des requêtes itératives sur vos données ClickHouse (jusqu'à 10 étapes).
+              </p>
+            </div>
+          </div>
+        )}
         <div ref={messagesEndRef} />
       </div>
 
       {/* Input */}
-      <div className="p-3 bg-white border-t border-slate-200 shrink-0">
+      <div className="p-3 bg-white border-t border-slate-200 shrink-0 space-y-2">
         <div className="relative flex items-center">
           <input
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleSend()}
+            onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleSend()}
             placeholder="Ask a question about your data..."
             className="w-full bg-slate-50 border border-slate-200 rounded-full pl-5 pr-12 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all shadow-sm"
           />
           <button
             onClick={() => handleSend()}
-            disabled={!input.trim() || isLoading}
+            disabled={!input.trim() || isLoading || isAgentLoading}
             className="absolute right-2 p-2 bg-emerald-500 text-white rounded-full hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-sm"
+            title="Envoyer (chat rapide)"
           >
             <Send size={16} />
           </button>
         </div>
+        <button
+          onClick={handleAgentSend}
+          disabled={!input.trim() || isLoading || isAgentLoading}
+          className={clsx(
+            "w-full flex items-center justify-center gap-2 py-2 px-4 rounded-full text-sm font-medium transition-all shadow-sm border",
+            "bg-indigo-600 hover:bg-indigo-700 text-white border-indigo-600",
+            "disabled:opacity-40 disabled:cursor-not-allowed"
+          )}
+          title="Analyse approfondie multi-étapes par l'agent IA (jusqu'à 10 requêtes)"
+        >
+          {isAgentLoading
+            ? <Loader2 size={15} className="animate-spin" />
+            : <Brain size={15} />
+          }
+          {isAgentLoading ? 'Agent en cours…' : 'Analyser avec l\'Agent'}
+        </button>
       </div>
     </div>
   );
