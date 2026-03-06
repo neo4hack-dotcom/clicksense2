@@ -25,7 +25,8 @@ import {
   GripVertical, X, Table, BarChart2, PieChart, LineChart, Play, Sparkles, Star, RefreshCw,
   Maximize2, Minimize2, Palette, ArrowUp, ArrowDown, Filter, RotateCcw, Search, Plus,
   History, Brain, AlertTriangle, Lightbulb, TrendingUp, Grid3X3, AreaChart, ScatterChart,
-  ChevronRight, Clock, LayoutGrid, Activity
+  ChevronRight, Clock, LayoutGrid, Activity, Telescope, ChevronDown, CheckCircle2,
+  Database, Hash, Type, Calendar, ToggleLeft, Percent, Layers
 } from 'lucide-react';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Legend, ResponsiveContainer,
@@ -219,6 +220,41 @@ interface HistoryEntry {
   created_at: string;
 }
 
+interface ColumnStat {
+  name: string;
+  type: string;
+  notnull: number;
+  null_count: number;
+  null_pct: number;
+  distinct: number;
+  distinct_pct: number;
+  top_values: { value: string; count: number }[];
+}
+
+interface ProfileStats {
+  table: string;
+  total_rows: number;
+  total_columns: number;
+  columns: ColumnStat[];
+}
+
+interface AIInsights {
+  summary: string;
+  quality_issues: string[];
+  key_insights: string[];
+  recommendations: string[];
+}
+
+interface AIExploreState {
+  visible: boolean;
+  targetTable: string;
+  loading: boolean;
+  stats: ProfileStats | null;
+  insights: AIInsights | null;
+  insightsLoading: boolean;
+  error: string | null;
+}
+
 export function BuilderPane() {
   const { schema, queryResult, queryConfig, setQueryConfig, setQueryResult, currentUser, savedQueries, setSavedQueries, tableMetadata, setTableMetadata, selectedTable, setSelectedTable } = useAppStore();
   const [visualType, setVisualType] = useState<VisualType>('table');
@@ -244,6 +280,17 @@ export function BuilderPane() {
   const [aiAnalysis, setAiAnalysis] = useState<AiAnalysisState>({
     visible: false, loading: false, alerts: [], suggestions: [], projections: [],
     optimized_sql: '', risk_level: 'low', error: null, sql: ''
+  });
+
+  // AI Explore / Profiling state
+  const [aiExplore, setAiExplore] = useState<AIExploreState>({
+    visible: false,
+    targetTable: '',
+    loading: false,
+    stats: null,
+    insights: null,
+    insightsLoading: false,
+    error: null,
   });
 
   // Row/Column dimension split
@@ -450,14 +497,14 @@ export function BuilderPane() {
     setAddMeasureFor(null);
   };
 
-  // Fetch query history
+  // Fetch query history (use currentUser.id or default to 1)
   const fetchHistory = async () => {
-    if (!currentUser) return;
     setLoadingHistory(true);
     try {
-      const res = await fetch(`/api/history/${currentUser.id}`);
+      const userId = currentUser?.id ?? 1;
+      const res = await fetch(`/api/history/${userId}`);
       const data = await res.json();
-      setHistoryEntries(data);
+      setHistoryEntries(Array.isArray(data) ? data : []);
     } catch (e) {
       console.error(e);
     } finally {
@@ -490,15 +537,45 @@ export function BuilderPane() {
     }
   };
 
-  // Drill-through: run SELECT * with dimension filters
+  // Drill-through: run SELECT * — works with or without dimensions
   const handleDrillThrough = async (row: Record<string, unknown>) => {
-    if (!selectedTable) return;
     const allDims = [...rowDims, ...colDims];
-    if (allDims.length === 0) return;
-    const dimFilters = allDims.map(d => ({ column: d.name, value: row[d.name] }));
-    const where = buildWhereClause(dimFilters);
-    const drillSql = `SELECT * FROM ${selectedTable}${where} LIMIT ${MAX_ROWS}`;
-    const title = allDims.map(d => `${d.name}=${row[d.name]}`).join(', ');
+
+    // No table context at all: just display row data directly
+    if (!selectedTable && allDims.length === 0) {
+      setDrillThrough({ visible: true, sql: '', data: [row], loading: false, error: null, title: 'Row Details' });
+      return;
+    }
+
+    let drillSql: string;
+    let title: string;
+
+    if (allDims.length > 0) {
+      // Builder mode with dimensions: filter by dim values (existing behavior)
+      const dimFilters = allDims.map(d => ({ column: d.name, value: row[d.name] }));
+      const where = buildWhereClause(dimFilters);
+      drillSql = `SELECT * FROM \`${selectedTable}\`${where} LIMIT ${MAX_ROWS}`;
+      title = allDims.map(d => `${d.name}=${row[d.name]}`).join(', ');
+    } else {
+      // No dims (AI chat result or plain table view): use up to 5 row values as filters
+      const conditions: string[] = [];
+      let filtersAdded = 0;
+      for (const [col, val] of Object.entries(row)) {
+        if (filtersAdded >= 5) break;
+        if (val === null || val === undefined) {
+          conditions.push(`\`${col}\` IS NULL`);
+        } else {
+          const isNum = !isNaN(Number(val)) && val !== '';
+          const escaped = isNum ? String(val) : `'${String(val).replace(/'/g, "''")}'`;
+          conditions.push(`\`${col}\` = ${escaped}`);
+        }
+        filtersAdded++;
+      }
+      const where = conditions.length > 0 ? ` WHERE ${conditions.join(' AND ')}` : '';
+      drillSql = `SELECT * FROM \`${selectedTable}\`${where} LIMIT ${MAX_ROWS}`;
+      title = Object.entries(row).slice(0, 3).map(([k, v]) => `${k}=${v}`).join(', ');
+    }
+
     setDrillThrough({ visible: true, sql: drillSql, data: [], loading: true, error: null, title });
     try {
       const res = await fetch('/api/query', {
@@ -687,6 +764,47 @@ export function BuilderPane() {
   };
 
   // ---------------------------------------------------------------------------
+  // AI Explore handlers
+  // ---------------------------------------------------------------------------
+  const openAIExplore = () => {
+    setAiExplore(prev => ({
+      ...prev,
+      visible: true,
+      targetTable: selectedTable || (tables.length > 0 ? tables[0] : ''),
+      stats: null,
+      insights: null,
+      error: null,
+      loading: false,
+      insightsLoading: false,
+    }));
+  };
+
+  const runProfileTable = async (tableName: string) => {
+    if (!tableName) return;
+    setAiExplore(prev => ({ ...prev, loading: true, stats: null, insights: null, error: null, insightsLoading: false }));
+    try {
+      const res = await fetch(`/api/profile/${encodeURIComponent(tableName)}`);
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      setAiExplore(prev => ({ ...prev, loading: false, stats: data, insightsLoading: true }));
+      // Now fetch LLM insights
+      const insRes = await fetch(`/api/profile/${encodeURIComponent(tableName)}/insights`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ stats: data }),
+      });
+      const insData = await insRes.json();
+      setAiExplore(prev => ({
+        ...prev,
+        insightsLoading: false,
+        insights: insData.error ? null : insData,
+      }));
+    } catch (err: any) {
+      setAiExplore(prev => ({ ...prev, loading: false, insightsLoading: false, error: err.message }));
+    }
+  };
+
+  // ---------------------------------------------------------------------------
   // Matrix (pivot) renderer
   // ---------------------------------------------------------------------------
   const renderMatrix = () => {
@@ -711,10 +829,11 @@ export function BuilderPane() {
       lookup[rk][ck] = row;
     });
     return (
-      <div className="flex-1 overflow-auto border border-slate-200 rounded-lg bg-white shadow-sm min-h-0" style={{ maxHeight: '100%' }}>
+      <div className="flex-1 border border-slate-200 rounded-lg bg-white shadow-sm min-h-0" style={{ overflowX: 'scroll', overflowY: 'auto', maxHeight: '100%' }}>
         <table className="text-sm text-left" style={{ borderCollapse: 'separate', borderSpacing: 0 }}>
           <thead className="bg-slate-50 sticky top-0 z-10">
             <tr>
+              <th className="w-7 px-2 py-3 border-b border-r border-slate-200 bg-slate-100" />
               {rowDims.map(d => (
                 <th key={d.name} className="px-4 py-3 text-xs font-bold uppercase tracking-wider border-b border-r border-slate-200 text-slate-600 bg-slate-100">{d.name}</th>
               ))}
@@ -726,6 +845,7 @@ export function BuilderPane() {
             </tr>
             {measureKeys.length > 1 && (
               <tr className="bg-slate-50">
+                <th className="w-7 border-b border-r border-slate-100" />
                 {rowDims.map(d => <th key={d.name} className="border-b border-r border-slate-100" />)}
                 {uniqueColValues.flatMap(cv =>
                   measureKeys.map(mk => (
@@ -736,17 +856,26 @@ export function BuilderPane() {
             )}
           </thead>
           <tbody className="divide-y divide-slate-200">
-            {uniqueRowValues.map((rv, ri) => (
+            {uniqueRowValues.map((rv, _ri) => (
               <tr
                 key={rv}
-                className="hover:bg-slate-50 cursor-context-menu"
+                className="hover:bg-slate-50 cursor-context-menu group"
                 onContextMenu={(e) => {
                   e.preventDefault();
                   const rowData = lookup[rv]?.[uniqueColValues[0]] || {};
                   handleDrillThrough(rowData);
                 }}
-                title="Right-click for drill-through"
+                title="Right-click or click → for drill-through"
               >
+                <td className="px-2 py-2.5 border-r border-slate-100 w-7">
+                  <button
+                    onClick={() => { const rowData = lookup[rv]?.[uniqueColValues[0]] || {}; handleDrillThrough(rowData); }}
+                    className="opacity-0 group-hover:opacity-100 transition-opacity p-0.5 rounded hover:bg-emerald-100 text-emerald-500"
+                    title="Go to detail"
+                  >
+                    <ChevronRight size={14} />
+                  </button>
+                </td>
                 {rowDims.map(d => {
                   const val = queryResult.find(r => rowKey(r) === rv)?.[d.name];
                   return <td key={d.name} className="px-4 py-2.5 font-medium text-slate-700 border-r border-slate-100 whitespace-nowrap">{formatCellValue(val)}</td>;
@@ -1034,11 +1163,12 @@ export function BuilderPane() {
               onDragStart={handleDragStart}
               onDragEnd={(e) => handleDragEnd(e, 'columns')}
             >
-              {/* Custom Table */}
-              <div className="flex-1 overflow-auto border border-slate-200 rounded-lg bg-white shadow-sm min-h-0" style={{ maxHeight: '100%' }}>
+              {/* Custom Table — overflow-x: scroll ensures scrollbar is always visible at the bottom */}
+              <div className="flex-1 border border-slate-200 rounded-lg bg-white shadow-sm min-h-0" style={{ overflowX: 'scroll', overflowY: 'auto', maxHeight: '100%' }}>
                 <table className="min-w-max text-sm text-left" style={{ borderCollapse: 'separate', borderSpacing: 0 }}>
                   <thead className="bg-slate-50 sticky top-0 z-20 shadow-sm">
                     <tr>
+                      <th className="w-7 px-2 py-3 border-b border-r border-slate-200 bg-slate-50" />
                       <SortableContext items={keys} strategy={horizontalListSortingStrategy}>
                         {keys.map(key => (
                           <SortableHeader
@@ -1057,6 +1187,7 @@ export function BuilderPane() {
                     {/* Inline filter row — avoids floating popup positioning bugs */}
                     {showFilterRow && (
                       <tr className="bg-white border-b border-slate-100">
+                        <th className="w-7 px-2" />
                         {keys.map(key => (
                           <th key={key} className="px-2 py-1.5">
                             <input
@@ -1077,13 +1208,20 @@ export function BuilderPane() {
                       processedData.map((row, i) => (
                         <tr
                           key={i}
-                          className="hover:bg-slate-50 transition-colors cursor-context-menu"
-                          onContextMenu={(e) => {
-                            e.preventDefault();
-                            if ([...rowDims, ...colDims].length > 0) handleDrillThrough(row);
-                          }}
-                          title={[...rowDims, ...colDims].length > 0 ? "Right-click for drill-through" : undefined}
+                          className="hover:bg-slate-50 transition-colors cursor-context-menu group"
+                          onContextMenu={(e) => { e.preventDefault(); handleDrillThrough(row); }}
+                          title="Right-click or click → for row details"
                         >
+                          {/* Drill-through icon — visible on hover */}
+                          <td className="px-2 py-2.5 border-r border-slate-100 w-7 shrink-0">
+                            <button
+                              onClick={() => handleDrillThrough(row)}
+                              className="opacity-0 group-hover:opacity-100 transition-opacity p-0.5 rounded hover:bg-emerald-100 text-emerald-500"
+                              title="Go to detail"
+                            >
+                              <ChevronRight size={14} />
+                            </button>
+                          </td>
                           {keys.map(key => {
                             const col = columnColors[key];
                             const style = col ? {
@@ -1100,7 +1238,7 @@ export function BuilderPane() {
                       ))
                     ) : (
                       <tr>
-                        <td colSpan={keys.length} className="px-4 py-8 text-center text-slate-500 italic">
+                        <td colSpan={keys.length + 1} className="px-4 py-8 text-center text-slate-500 italic">
                           No results match the current filters.
                         </td>
                       </tr>
@@ -1147,29 +1285,42 @@ export function BuilderPane() {
     <div className="flex flex-col h-full bg-slate-50">
       {/* Top Configuration Bar — shrink-0 prevents it from being squashed by the results area */}
       <div className="bg-white border-b border-slate-200 p-4 space-y-3 shrink-0">
-        <div className="flex items-center justify-between">
-          <h2 className="text-lg font-semibold text-slate-800">Visual Builder</h2>
-          <div className="flex items-center gap-2">
+        <div className="flex items-center justify-between gap-4">
+          {/* Left: title + utility buttons */}
+          <div className="flex items-center gap-2 flex-wrap">
+            <h2 className="text-lg font-semibold text-slate-800 shrink-0">Visual Builder</h2>
+            <div className="w-px h-5 bg-slate-200 shrink-0" />
             <button
               onClick={handleClear}
               disabled={queryConfig.dimensions.length === 0 && queryConfig.measures.length === 0 && (!queryResult || queryResult.length === 0)}
-              className="flex items-center gap-2 bg-white border border-slate-200 hover:bg-red-50 hover:border-red-200 hover:text-red-600 text-slate-500 px-3 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed shadow-sm"
+              className="flex items-center gap-1.5 bg-white border border-slate-200 hover:bg-red-50 hover:border-red-200 hover:text-red-600 text-slate-500 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed shadow-sm"
               title="Clear all"
             >
-              <RotateCcw size={15} />
+              <RotateCcw size={14} />
               Clear
             </button>
             <button
               onClick={handleShowHistory}
               className={clsx(
-                "flex items-center gap-2 border px-3 py-2 rounded-lg text-sm font-medium transition-colors shadow-sm",
+                "flex items-center gap-1.5 border px-3 py-1.5 rounded-lg text-sm font-medium transition-colors shadow-sm",
                 showHistory ? "bg-slate-800 border-slate-700 text-white" : "bg-white border-slate-200 text-slate-600 hover:bg-slate-50"
               )}
               title="Query History"
             >
-              <History size={15} />
+              <History size={14} />
               History
             </button>
+            <button
+              onClick={openAIExplore}
+              className="flex items-center gap-1.5 bg-gradient-to-r from-indigo-500 to-purple-600 hover:from-indigo-600 hover:to-purple-700 text-white px-3 py-1.5 rounded-lg text-sm font-medium transition-all shadow-sm"
+              title="AI Explore — profile a table with AI"
+            >
+              <Telescope size={14} />
+              AI Explore
+            </button>
+          </div>
+          {/* Right: run buttons */}
+          <div className="flex items-center gap-2 shrink-0">
             <button
               onClick={handleRunAI}
               disabled={[...rowDims, ...colDims].length === 0 && queryConfig.measures.length === 0}
@@ -1502,8 +1653,8 @@ export function BuilderPane() {
           </div>
         )}
 
-        {/* Results Area — overflow-y-auto so content is reachable on small screens, overflow-x-hidden prevents chart width from pushing buttons off-screen */}
-        <div className="flex-1 p-6 overflow-y-auto overflow-x-hidden bg-slate-50/50 flex flex-col gap-4 min-w-0">
+        {/* Results Area */}
+        <div className="flex-1 p-6 overflow-y-auto overflow-x-auto bg-slate-50/50 flex flex-col gap-4 min-w-0">
           {suggestedVisual && suggestedVisual !== visualType && (
             <div className="bg-blue-50 border border-blue-100 rounded-xl p-3 flex items-center justify-between shadow-sm">
               <div className="flex items-center gap-2 text-blue-700 text-sm">
@@ -1605,7 +1756,7 @@ export function BuilderPane() {
                     </button>
                   </div>
                 </div>
-                <div className="p-4 flex-1 flex flex-col overflow-auto min-h-0 min-w-0">
+                <div className="p-4 flex-1 flex flex-col min-h-0 min-w-0 overflow-hidden">
                   {renderVisual()}
                 </div>
               </div>
@@ -1665,6 +1816,313 @@ export function BuilderPane() {
             </div>
             <div className="p-3 border-t border-slate-100 bg-slate-50 text-xs text-slate-400 shrink-0 font-mono">
               SELECT * FROM {selectedTable} … — {drillThrough.data.length} rows
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {/* ------------------------------------------------------------------ */}
+      {/* AI Explore / Profiling Modal                                         */}
+      {/* ------------------------------------------------------------------ */}
+      {aiExplore.visible && createPortal(
+        <div className="fixed inset-0 z-[400] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-6xl max-h-[92vh] flex flex-col overflow-hidden">
+            {/* Header */}
+            <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between shrink-0 bg-gradient-to-r from-indigo-600 to-purple-700">
+              <div className="flex items-center gap-3">
+                <div className="p-2 bg-white/20 rounded-lg">
+                  <Telescope size={20} className="text-white" />
+                </div>
+                <div>
+                  <h2 className="text-base font-bold text-white">AI Explore</h2>
+                  <p className="text-xs text-indigo-200">Profiling IA de vos tables</p>
+                </div>
+              </div>
+              <div className="flex items-center gap-3">
+                <select
+                  value={aiExplore.targetTable}
+                  onChange={e => setAiExplore(prev => ({ ...prev, targetTable: e.target.value }))}
+                  className="text-sm bg-white/20 text-white border border-white/30 rounded-lg px-3 py-1.5 outline-none focus:ring-2 focus:ring-white/50 cursor-pointer"
+                >
+                  {tables.map(t => <option key={t} value={t} className="text-slate-800 bg-white">{t}</option>)}
+                </select>
+                <button
+                  onClick={() => runProfileTable(aiExplore.targetTable)}
+                  disabled={aiExplore.loading || !aiExplore.targetTable}
+                  className="flex items-center gap-2 bg-white text-indigo-700 hover:bg-indigo-50 px-4 py-1.5 rounded-lg text-sm font-semibold transition-colors disabled:opacity-50 shadow"
+                >
+                  {aiExplore.loading ? (
+                    <><span className="animate-spin inline-block w-3 h-3 border-2 border-indigo-400 border-t-transparent rounded-full" /> Profiling…</>
+                  ) : (
+                    <><Telescope size={14} /> Analyser</>
+                  )}
+                </button>
+                <button onClick={() => setAiExplore(prev => ({ ...prev, visible: false }))} className="text-white/70 hover:text-white p-1.5 hover:bg-white/20 rounded-lg">
+                  <X size={18} />
+                </button>
+              </div>
+            </div>
+
+            {/* Body */}
+            <div className="flex-1 overflow-y-auto bg-slate-50">
+              {aiExplore.error && (
+                <div className="m-6 p-4 bg-red-50 border border-red-200 rounded-xl text-red-700 text-sm flex items-start gap-2">
+                  <AlertTriangle size={16} className="shrink-0 mt-0.5" />
+                  {aiExplore.error}
+                </div>
+              )}
+
+              {!aiExplore.stats && !aiExplore.loading && !aiExplore.error && (
+                <div className="flex flex-col items-center justify-center h-64 text-slate-400 gap-3">
+                  <Telescope size={48} className="opacity-20" />
+                  <p className="text-sm">Sélectionnez une table et cliquez sur <strong>Analyser</strong></p>
+                </div>
+              )}
+
+              {aiExplore.loading && (
+                <div className="flex flex-col items-center justify-center h-64 gap-4">
+                  <div className="relative w-16 h-16">
+                    <div className="absolute inset-0 rounded-full border-4 border-indigo-100" />
+                    <div className="absolute inset-0 rounded-full border-4 border-indigo-500 border-t-transparent animate-spin" />
+                    <Telescope size={20} className="absolute inset-0 m-auto text-indigo-500" />
+                  </div>
+                  <div className="text-center">
+                    <p className="text-sm font-semibold text-slate-700">Analyse en cours…</p>
+                    <p className="text-xs text-slate-400 mt-1">Calcul des statistiques et profiling IA</p>
+                  </div>
+                </div>
+              )}
+
+              {aiExplore.stats && (() => {
+                const s = aiExplore.stats!;
+                const nullyColumns = s.columns.filter(c => c.null_pct > 10);
+                const highCardColumns = s.columns.filter(c => c.distinct_pct > 80);
+                const qualityScore = Math.round((1 - nullyColumns.length / Math.max(s.columns.length, 1)) * 100);
+
+                // Type grouping
+                const typeGroups: Record<string, number> = {};
+                s.columns.forEach(c => {
+                  const baseType = c.type.replace(/\(.*\)/, '').replace(/Nullable\(/, '').replace(/\)$/, '').split(' ')[0];
+                  typeGroups[baseType] = (typeGroups[baseType] || 0) + 1;
+                });
+                const typePieData = Object.entries(typeGroups).map(([name, value]) => ({ name, value }));
+
+                // Null rate bar chart data (top 15 worst)
+                const nullBarData = [...s.columns]
+                  .sort((a, b) => b.null_pct - a.null_pct)
+                  .slice(0, 15)
+                  .map(c => ({ name: c.name.length > 14 ? c.name.slice(0, 12) + '…' : c.name, null_pct: c.null_pct, fullName: c.name }));
+
+                // Distinct count bar chart (top 12)
+                const distinctBarData = [...s.columns]
+                  .sort((a, b) => b.distinct - a.distinct)
+                  .slice(0, 12)
+                  .map(c => ({ name: c.name.length > 14 ? c.name.slice(0, 12) + '…' : c.name, distinct: c.distinct, distinct_pct: c.distinct_pct }));
+
+                const TYPE_PIE_COLORS = ['#6366f1', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4', '#ec4899', '#84cc16'];
+
+                return (
+                  <div className="p-6 space-y-6">
+                    {/* Metric cards */}
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                      {[
+                        { label: 'Lignes totales', value: s.total_rows.toLocaleString(), icon: Database, color: 'from-blue-500 to-blue-600' },
+                        { label: 'Colonnes', value: s.total_columns, icon: Layers, color: 'from-emerald-500 to-emerald-600' },
+                        { label: 'Score qualité', value: `${qualityScore}%`, icon: CheckCircle2, color: qualityScore >= 80 ? 'from-green-500 to-green-600' : qualityScore >= 60 ? 'from-amber-500 to-amber-600' : 'from-red-500 to-red-600' },
+                        { label: 'Colonnes >10% null', value: nullyColumns.length, icon: AlertTriangle, color: nullyColumns.length === 0 ? 'from-slate-400 to-slate-500' : 'from-orange-500 to-red-500' },
+                      ].map((m, i) => (
+                        <div key={i} className={`bg-gradient-to-br ${m.color} rounded-2xl p-4 text-white shadow-lg`}>
+                          <div className="flex items-center justify-between mb-2">
+                            <span className="text-xs font-medium opacity-80">{m.label}</span>
+                            <m.icon size={18} className="opacity-80" />
+                          </div>
+                          <div className="text-2xl font-bold">{m.value}</div>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* AI Summary */}
+                    {(aiExplore.insightsLoading || aiExplore.insights) && (
+                      <div className="bg-gradient-to-r from-indigo-50 to-purple-50 border border-indigo-100 rounded-2xl p-5">
+                        <div className="flex items-center gap-2 mb-3">
+                          <Brain size={16} className="text-indigo-600" />
+                          <span className="text-sm font-bold text-indigo-700">Analyse IA</span>
+                          {aiExplore.insightsLoading && <span className="animate-pulse text-xs text-indigo-400">En cours…</span>}
+                        </div>
+                        {aiExplore.insightsLoading ? (
+                          <div className="space-y-2">
+                            {[80, 65, 90].map((w, i) => <div key={i} className="h-3 bg-indigo-200/60 rounded animate-pulse" style={{ width: `${w}%` }} />)}
+                          </div>
+                        ) : aiExplore.insights && (
+                          <div className="space-y-4">
+                            <p className="text-sm text-indigo-900 leading-relaxed">{aiExplore.insights.summary}</p>
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                              {aiExplore.insights.quality_issues?.length > 0 && (
+                                <div className="bg-red-50 border border-red-100 rounded-xl p-3">
+                                  <div className="flex items-center gap-1.5 mb-2 text-red-700 text-xs font-bold uppercase tracking-wider">
+                                    <AlertTriangle size={12} /> Problèmes qualité
+                                  </div>
+                                  <ul className="space-y-1">
+                                    {aiExplore.insights.quality_issues.map((q, i) => <li key={i} className="text-xs text-red-800">• {q}</li>)}
+                                  </ul>
+                                </div>
+                              )}
+                              {aiExplore.insights.key_insights?.length > 0 && (
+                                <div className="bg-amber-50 border border-amber-100 rounded-xl p-3">
+                                  <div className="flex items-center gap-1.5 mb-2 text-amber-700 text-xs font-bold uppercase tracking-wider">
+                                    <Lightbulb size={12} /> Insights clés
+                                  </div>
+                                  <ul className="space-y-1">
+                                    {aiExplore.insights.key_insights.map((q, i) => <li key={i} className="text-xs text-amber-800">• {q}</li>)}
+                                  </ul>
+                                </div>
+                              )}
+                              {aiExplore.insights.recommendations?.length > 0 && (
+                                <div className="bg-emerald-50 border border-emerald-100 rounded-xl p-3">
+                                  <div className="flex items-center gap-1.5 mb-2 text-emerald-700 text-xs font-bold uppercase tracking-wider">
+                                    <CheckCircle2 size={12} /> Recommandations
+                                  </div>
+                                  <ul className="space-y-1">
+                                    {aiExplore.insights.recommendations.map((q, i) => <li key={i} className="text-xs text-emerald-800">• {q}</li>)}
+                                  </ul>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Charts row */}
+                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                      {/* Type distribution pie */}
+                      <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-sm">
+                        <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3 flex items-center gap-1.5">
+                          <Type size={12} /> Distribution des types
+                        </h3>
+                        <ResponsiveContainer width="100%" height={200}>
+                          <RechartsPieChart>
+                            <Pie data={typePieData} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={70} innerRadius={30} paddingAngle={3} label={({ name, percent }) => `${name} ${(percent * 100).toFixed(0)}%`} labelLine={false} fontSize={10}>
+                              {typePieData.map((_, i) => <Cell key={i} fill={TYPE_PIE_COLORS[i % TYPE_PIE_COLORS.length]} />)}
+                            </Pie>
+                            <RechartsTooltip contentStyle={{ fontSize: 11, borderRadius: 8 }} />
+                          </RechartsPieChart>
+                        </ResponsiveContainer>
+                      </div>
+
+                      {/* Null rate bar chart */}
+                      <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-sm">
+                        <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3 flex items-center gap-1.5">
+                          <Percent size={12} /> Taux de null par colonne (top 15)
+                        </h3>
+                        <ResponsiveContainer width="100%" height={200}>
+                          <BarChart data={nullBarData} layout="vertical" margin={{ left: 0, right: 8 }}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" horizontal={false} />
+                            <XAxis type="number" domain={[0, 100]} tickFormatter={v => `${v}%`} tick={{ fontSize: 9, fill: '#94a3b8' }} axisLine={false} tickLine={false} />
+                            <YAxis type="category" dataKey="name" tick={{ fontSize: 9, fill: '#64748b' }} width={75} axisLine={false} tickLine={false} />
+                            <RechartsTooltip formatter={(v: any) => [`${v}%`, 'Null']} contentStyle={{ fontSize: 11, borderRadius: 8 }} />
+                            <Bar dataKey="null_pct" radius={[0, 4, 4, 0]}>
+                              {nullBarData.map((entry, i) => (
+                                <Cell key={i} fill={entry.null_pct > 50 ? '#ef4444' : entry.null_pct > 20 ? '#f59e0b' : '#10b981'} />
+                              ))}
+                            </Bar>
+                          </BarChart>
+                        </ResponsiveContainer>
+                      </div>
+
+                      {/* Distinct count chart */}
+                      <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-sm">
+                        <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3 flex items-center gap-1.5">
+                          <Hash size={12} /> Valeurs distinctes (top 12)
+                        </h3>
+                        <ResponsiveContainer width="100%" height={200}>
+                          <BarChart data={distinctBarData} margin={{ left: 0, right: 8 }}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
+                            <XAxis dataKey="name" tick={{ fontSize: 9, fill: '#64748b' }} axisLine={false} tickLine={false} />
+                            <YAxis tick={{ fontSize: 9, fill: '#94a3b8' }} axisLine={false} tickLine={false} />
+                            <RechartsTooltip contentStyle={{ fontSize: 11, borderRadius: 8 }} />
+                            <Bar dataKey="distinct" fill="#6366f1" radius={[4, 4, 0, 0]} />
+                          </BarChart>
+                        </ResponsiveContainer>
+                      </div>
+                    </div>
+
+                    {/* Column cards grid */}
+                    <div>
+                      <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3 flex items-center gap-1.5">
+                        <Layers size={12} /> Détail des colonnes ({s.total_columns})
+                      </h3>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
+                        {s.columns.map(col => {
+                          const baseType = col.type.replace(/Nullable\(/, '').replace(/\)$/, '').replace(/\(.*\)/, '');
+                          const isNum = baseType.match(/Int|Float|Decimal|Double/i);
+                          const isDate = baseType.match(/Date|Time/i);
+                          const isStr = baseType.match(/String|FixedString/i);
+                          const TypeIcon = isNum ? Hash : isDate ? Calendar : isStr ? Type : ToggleLeft;
+                          const typeColor = isNum ? 'text-blue-600 bg-blue-50' : isDate ? 'text-purple-600 bg-purple-50' : isStr ? 'text-emerald-600 bg-emerald-50' : 'text-slate-600 bg-slate-50';
+
+                          return (
+                            <div key={col.name} className="bg-white border border-slate-200 rounded-xl p-3 shadow-sm hover:shadow-md hover:border-indigo-200 transition-all">
+                              <div className="flex items-start justify-between mb-2 gap-1">
+                                <span className="text-xs font-semibold text-slate-800 truncate flex-1" title={col.name}>{col.name}</span>
+                                <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full shrink-0 flex items-center gap-0.5 ${typeColor}`}>
+                                  <TypeIcon size={8} /> {baseType.slice(0, 8)}
+                                </span>
+                              </div>
+
+                              {/* Null rate bar */}
+                              <div className="mb-2">
+                                <div className="flex justify-between text-[10px] text-slate-400 mb-0.5">
+                                  <span>Null</span>
+                                  <span className={col.null_pct > 20 ? 'text-red-500 font-medium' : 'text-slate-400'}>{col.null_pct}%</span>
+                                </div>
+                                <div className="h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                                  <div
+                                    className={`h-full rounded-full transition-all ${col.null_pct > 50 ? 'bg-red-400' : col.null_pct > 20 ? 'bg-amber-400' : 'bg-emerald-400'}`}
+                                    style={{ width: `${Math.min(col.null_pct, 100)}%` }}
+                                  />
+                                </div>
+                              </div>
+
+                              {/* Distinct count */}
+                              <div className="flex items-center justify-between text-[10px]">
+                                <span className="text-slate-400">Distinct</span>
+                                <span className="font-semibold text-slate-700">{col.distinct.toLocaleString()}</span>
+                              </div>
+                              <div className="h-1.5 bg-slate-100 rounded-full overflow-hidden mt-0.5 mb-2">
+                                <div className="h-full bg-indigo-400 rounded-full" style={{ width: `${Math.min(col.distinct_pct, 100)}%` }} />
+                              </div>
+
+                              {/* Top values mini bars */}
+                              {col.top_values.length > 0 && (
+                                <div className="mt-2 pt-2 border-t border-slate-100">
+                                  <p className="text-[9px] text-slate-400 uppercase tracking-wider mb-1">Top valeurs</p>
+                                  <div className="space-y-1">
+                                    {col.top_values.slice(0, 4).map((tv, i) => {
+                                      const maxCount = col.top_values[0]?.count || 1;
+                                      const pct = Math.round((tv.count / maxCount) * 100);
+                                      return (
+                                        <div key={i} className="flex items-center gap-1.5">
+                                          <div className="h-1 bg-indigo-200 rounded-full flex-1 overflow-hidden">
+                                            <div className="h-full bg-indigo-500 rounded-full" style={{ width: `${pct}%` }} />
+                                          </div>
+                                          <span className="text-[9px] text-slate-500 truncate max-w-[60px]" title={tv.value}>{tv.value || '(vide)'}</span>
+                                          <span className="text-[9px] text-slate-400 shrink-0">{tv.count.toLocaleString()}</span>
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
           </div>
         </div>,

@@ -1560,6 +1560,135 @@ Return ONLY a JSON object (no markdown) with:
 
 
 # ---------------------------------------------------------------------------
+# Table Profiling
+# ---------------------------------------------------------------------------
+@app.route("/api/profile/<table_name>", methods=["GET"])
+def profile_table(table_name):
+    try:
+        client = get_clickhouse_client()
+
+        # 1. Column types
+        desc_result = client.query(f"DESCRIBE TABLE `{table_name}`")
+        columns = [{"name": r[0], "type": r[1]} for r in desc_result.result_rows]
+
+        if not columns:
+            return jsonify({"error": "Table not found or empty schema"}), 404
+
+        # 2. Total rows
+        count_result = client.query(f"SELECT count() FROM `{table_name}`")
+        total_rows = int(count_result.result_rows[0][0]) if count_result.result_rows else 0
+
+        # 3. Single stats query: notnull count + distinct per column
+        # Use SAMPLE for large tables to keep it fast
+        sample_clause = " SAMPLE 0.1" if total_rows > 500_000 else ""
+        select_parts = []
+        for col in columns:
+            cn = col["name"].replace("`", "``")
+            select_parts.append(f"countIf(`{cn}` IS NOT NULL) AS `{cn}__notnull`")
+            select_parts.append(f"uniqExact(`{cn}`) AS `{cn}__distinct`")
+
+        stats_row = {}
+        if select_parts:
+            stats_sql = f"SELECT {', '.join(select_parts)} FROM `{table_name}`{sample_clause}"
+            try:
+                sr = client.query(stats_sql)
+                if sr.result_rows:
+                    stats_row = dict(zip(sr.column_names, sr.result_rows[0]))
+            except Exception as e:
+                print(f"Stats query warning: {e}")
+
+        # 4. Build per-column stats
+        col_stats = []
+        for col in columns:
+            cn = col["name"]
+            notnull = int(stats_row.get(f"{cn}__notnull", 0))
+            distinct = int(stats_row.get(f"{cn}__distinct", 0))
+            sample_factor = 10 if sample_clause else 1
+            estimated_rows = total_rows
+            null_count = max(0, estimated_rows - notnull * sample_factor)
+            null_pct = round(null_count / estimated_rows * 100, 1) if estimated_rows > 0 else 0.0
+            distinct_pct = round(distinct / estimated_rows * 100, 1) if estimated_rows > 0 else 0.0
+            col_stats.append({
+                "name": cn,
+                "type": col["type"],
+                "notnull": notnull,
+                "null_count": null_count,
+                "null_pct": null_pct,
+                "distinct": distinct,
+                "distinct_pct": distinct_pct,
+                "top_values": [],
+            })
+
+        # 5. Top values for low-cardinality columns (distinct <= 30)
+        for cs in col_stats:
+            if 0 < cs["distinct"] <= 30:
+                try:
+                    tv = client.query(
+                        f"SELECT toString(`{cs['name'].replace('`','``')}`) AS val, "
+                        f"count() AS cnt FROM `{table_name}` "
+                        f"GROUP BY val ORDER BY cnt DESC LIMIT 8"
+                    )
+                    cs["top_values"] = [
+                        {"value": str(r[0]), "count": int(r[1])}
+                        for r in tv.result_rows
+                    ]
+                except Exception:
+                    pass
+
+        return jsonify({
+            "table": table_name,
+            "total_rows": total_rows,
+            "total_columns": len(columns),
+            "columns": col_stats,
+        })
+    except Exception as exc:
+        print(f"Profile error: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/profile/<table_name>/insights", methods=["POST"])
+def profile_insights(table_name):
+    data = request.get_json() or {}
+    stats = data.get("stats", {})
+
+    # Compact stats for LLM — metadata only, no raw rows
+    compact = {
+        "table": stats.get("table"),
+        "total_rows": stats.get("total_rows"),
+        "total_columns": stats.get("total_columns"),
+        "columns": [
+            {
+                "name": c["name"],
+                "type": c["type"],
+                "null_pct": c["null_pct"],
+                "distinct": c["distinct"],
+                "top_values": c.get("top_values", [])[:3],
+            }
+            for c in stats.get("columns", [])
+        ],
+    }
+
+    system_prompt = """You are a senior data analyst. Given a table profile (metadata only, no raw data),
+identify data quality issues, patterns, and recommendations.
+
+Return ONLY a JSON object:
+{
+  "summary": "2-3 sentence overview of the table and its likely purpose",
+  "quality_issues": ["issue 1", "issue 2"],
+  "key_insights": ["insight 1", "insight 2", "insight 3"],
+  "recommendations": ["recommendation 1", "recommendation 2"]
+}"""
+
+    user_msg = f"Profile data:\n{json.dumps(compact)}"
+    try:
+        content = _call_llm(system_prompt, [{"role": "user", "content": user_msg}], temperature=0.4)
+        return jsonify(_parse_llm_json(content))
+    except Exception as exc:
+        print(f"Profile insights error: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+
+# ---------------------------------------------------------------------------
 # Serve built frontend
 # ---------------------------------------------------------------------------
 @app.route("/", defaults={"path": ""})
