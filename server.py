@@ -120,6 +120,8 @@ rag_config = {
     "embeddingProvider": "ollama",
     "embeddingModel": "nomic-embed-text",
     "embeddingUrl": "http://localhost:11434",
+    "embeddingUsername": "",
+    "embeddingPassword": "",
     "embeddingApiKey": "",
     "topK": 5,
     "chunkSize": 500,
@@ -196,16 +198,42 @@ def _get_embedding(text: str, cfg: dict) -> list:
         headers = {"Content-Type": "application/json"}
         if cfg.get("embeddingApiKey"):
             headers["Authorization"] = f"Bearer {cfg['embeddingApiKey']}"
+        emb_username = cfg.get("embeddingUsername", "")
+        emb_auth = (emb_username, cfg.get("embeddingPassword", "")) if emb_username else None
         resp = _http_post(
             f"{url}/v1/embeddings",
             json={"model": model, "input": text},
             headers=headers,
+            auth=emb_auth,
             timeout=60,
         )
         if not resp.ok:
             raise Exception(f"HTTP embedding error: {resp.status_code} {resp.text}")
         data = resp.json()
         return data["data"][0]["embedding"]
+
+    elif provider == "huggingface":
+        # HuggingFace Text Embeddings Inference (TEI) — supports BGE, E5, etc.
+        url = (cfg.get("embeddingUrl") or "http://localhost:8080").rstrip("/")
+        headers = {"Content-Type": "application/json"}
+        if cfg.get("embeddingApiKey"):
+            headers["Authorization"] = f"Bearer {cfg['embeddingApiKey']}"
+        emb_username = cfg.get("embeddingUsername", "")
+        emb_auth = (emb_username, cfg.get("embeddingPassword", "")) if emb_username else None
+        resp = _http_post(
+            f"{url}/embed",
+            json={"inputs": text},
+            headers=headers,
+            auth=emb_auth,
+            timeout=60,
+        )
+        if not resp.ok:
+            raise Exception(f"HuggingFace TEI embedding error: {resp.status_code} {resp.text}")
+        result = resp.json()
+        # TEI returns [[...]] — list of embeddings for batch
+        if isinstance(result, list) and result and isinstance(result[0], list):
+            return result[0]
+        return result
 
     else:
         raise Exception(f"Unknown embedding provider: {provider}")
@@ -474,6 +502,8 @@ def test_elasticsearch():
 def get_embedding_models():
     data = request.get_json()
     provider = data.get("embeddingProvider", "ollama")
+    emb_username = data.get("embeddingUsername", "")
+    emb_auth = (emb_username, data.get("embeddingPassword", "")) if emb_username else None
     try:
         if provider == "ollama":
             url = (data.get("embeddingUrl") or "http://localhost:11434").rstrip("/")
@@ -487,12 +517,34 @@ def get_embedding_models():
             headers = {}
             if data.get("embeddingApiKey"):
                 headers["Authorization"] = f"Bearer {data['embeddingApiKey']}"
-            resp = _http_get(f"{url}/v1/models", headers=headers, timeout=10)
+            resp = _http_get(f"{url}/v1/models", headers=headers, auth=emb_auth, timeout=10)
             if not resp.ok:
                 return jsonify({"models": []})
             models = [m.get("id") or m.get("name", "") for m in resp.json().get("data", [])]
             return jsonify({"models": [m for m in models if m]})
+        elif provider == "huggingface":
+            # TEI exposes a single model; retrieve its name via /info
+            url = (data.get("embeddingUrl") or "http://localhost:8080").rstrip("/")
+            headers = {}
+            if data.get("embeddingApiKey"):
+                headers["Authorization"] = f"Bearer {data['embeddingApiKey']}"
+            resp = _http_get(f"{url}/info", headers=headers, auth=emb_auth, timeout=10)
+            if resp.ok:
+                info = resp.json()
+                model_id = info.get("model_id") or info.get("model_type", "")
+                return jsonify({"models": [model_id] if model_id else []})
+            return jsonify({"models": []})
         return jsonify({"models": []})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/rag/test-embedding", methods=["POST"])
+def test_embedding():
+    data = request.get_json()
+    try:
+        embedding = _get_embedding("test", data)
+        return jsonify({"success": True, "dims": len(embedding)})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 

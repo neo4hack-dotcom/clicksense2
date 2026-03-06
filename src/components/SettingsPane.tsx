@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Save, Database, Cpu, CheckCircle2, RefreshCw, Search, AlertCircle } from 'lucide-react';
+import { Save, Database, Cpu, CheckCircle2, RefreshCw, Search, AlertCircle, Layers } from 'lucide-react';
 import { useAppStore } from '../store';
 
 export function SettingsPane() {
@@ -19,11 +19,18 @@ export function SettingsPane() {
   const [llmTestResult, setLlmTestResult] = useState<'idle' | 'success' | 'error'>('idle');
   const [isTestingEs, setIsTestingEs] = useState(false);
   const [esTestResult, setEsTestResult] = useState<'idle' | 'success' | 'error'>('idle');
+  const [isTestingEmbedding, setIsTestingEmbedding] = useState(false);
+  const [embeddingTestResult, setEmbeddingTestResult] = useState<'idle' | 'success' | 'error'>('idle');
+  const [embeddingTestDims, setEmbeddingTestDims] = useState<number | null>(null);
   const [isSavingRag, setIsSavingRag] = useState(false);
   const [ragSaved, setRagSaved] = useState(false);
   const [embeddingModels, setEmbeddingModels] = useState<string[]>([]);
   const [isLoadingEmbeddingModels, setIsLoadingEmbeddingModels] = useState(false);
-  const [localRag, setLocalRag] = useState({ ...ragConfig });
+  const [localRag, setLocalRag] = useState({
+    embeddingUsername: '',
+    embeddingPassword: '',
+    ...ragConfig,
+  });
 
   useEffect(() => {
     fetch('/api/config')
@@ -137,6 +144,28 @@ export function SettingsPane() {
       alert(`Elasticsearch connection failed: ${e.message}`);
     } finally {
       setIsTestingEs(false);
+    }
+  };
+
+  const testEmbedding = async () => {
+    setIsTestingEmbedding(true);
+    setEmbeddingTestResult('idle');
+    setEmbeddingTestDims(null);
+    try {
+      const res = await fetch('/api/rag/test-embedding', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(localRag),
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      setEmbeddingTestResult('success');
+      setEmbeddingTestDims(data.dims ?? null);
+    } catch (e: any) {
+      setEmbeddingTestResult('error');
+      alert(`Embedding model connection failed: ${e.message}`);
+    } finally {
+      setIsTestingEmbedding(false);
     }
   };
 
@@ -274,13 +303,13 @@ export function SettingsPane() {
         </div>
       </div>
 
-      {/* Elasticsearch RAG */}
+      {/* Elasticsearch Connection */}
       <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
         <div className="p-6 border-b border-slate-100 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="bg-purple-100 p-2 rounded-lg text-purple-600"><Search size={20} /></div>
             <div>
-              <h3 className="text-lg font-semibold text-slate-800">Elasticsearch — RAG Configuration</h3>
+              <h3 className="text-lg font-semibold text-slate-800">Elasticsearch Connection</h3>
               <p className="text-xs text-slate-500 mt-0.5">Used for vector similarity search in the RAG module</p>
             </div>
           </div>
@@ -288,72 +317,128 @@ export function SettingsPane() {
             {isTestingEs ? <><RefreshCw size={16} className="animate-spin" /> Testing...</> : esTestResult === 'success' ? <><CheckCircle2 size={16} /> Connected</> : esTestResult === 'error' ? <><AlertCircle size={16} /> Failed</> : 'Test Connection'}
           </button>
         </div>
-        <div className="p-6 space-y-6">
-          <div className="grid grid-cols-2 gap-6">
-            <div className="space-y-2">
-              <label className={labelClass}>Elasticsearch Host</label>
-              <input type="text" value={localRag.esHost} onChange={e => setLocalRag({ ...localRag, esHost: e.target.value })} className={inputClass} placeholder="http://localhost:9200" />
-            </div>
-            <div className="space-y-2">
-              <label className={labelClass}>Index Name</label>
-              <input type="text" value={localRag.esIndex} onChange={e => setLocalRag({ ...localRag, esIndex: e.target.value })} className={inputClass} placeholder="clicksense_rag" />
-            </div>
-            <div className="space-y-2">
-              <label className={labelClass}>Username (optional)</label>
-              <input type="text" value={localRag.esUsername} onChange={e => setLocalRag({ ...localRag, esUsername: e.target.value })} className={inputClass} placeholder="elastic" />
-            </div>
-            <div className="space-y-2">
-              <label className={labelClass}>Password (optional)</label>
-              <input type="password" value={localRag.esPassword} onChange={e => setLocalRag({ ...localRag, esPassword: e.target.value })} className={inputClass} placeholder="••••••••" />
-            </div>
-            <div className="space-y-2">
-              <label className={labelClass}>Top-K Results</label>
-              <input type="number" min={1} max={20} value={localRag.topK} onChange={e => setLocalRag({ ...localRag, topK: Number(e.target.value) })} className={inputClass} />
-              <p className="text-xs text-slate-400">Number of knowledge fragments returned per query</p>
-            </div>
-            <div className="space-y-2">
-              <label className={labelClass}>Chunk Size (chars)</label>
-              <input type="number" min={100} max={2000} value={localRag.chunkSize} onChange={e => setLocalRag({ ...localRag, chunkSize: Number(e.target.value) })} className={inputClass} />
-              <p className="text-xs text-slate-400">Size of text chunks when indexing folder content</p>
+        <div className="p-6 grid grid-cols-2 gap-6">
+          <div className="space-y-2">
+            <label className={labelClass}>Host URL</label>
+            <input type="text" value={localRag.esHost} onChange={e => setLocalRag({ ...localRag, esHost: e.target.value })} className={inputClass} placeholder="http://localhost:9200" />
+          </div>
+          <div className="space-y-2">
+            <label className={labelClass}>Index Name</label>
+            <input type="text" value={localRag.esIndex} onChange={e => setLocalRag({ ...localRag, esIndex: e.target.value })} className={inputClass} placeholder="clicksense_rag" />
+          </div>
+          <div className="space-y-2">
+            <label className={labelClass}>Username</label>
+            <input type="text" value={localRag.esUsername} onChange={e => setLocalRag({ ...localRag, esUsername: e.target.value })} className={inputClass} placeholder="elastic" />
+          </div>
+          <div className="space-y-2">
+            <label className={labelClass}>Password</label>
+            <input type="password" value={localRag.esPassword} onChange={e => setLocalRag({ ...localRag, esPassword: e.target.value })} className={inputClass} placeholder="••••••••" />
+          </div>
+          <div className="space-y-2">
+            <label className={labelClass}>Top-K Results</label>
+            <input type="number" min={1} max={20} value={localRag.topK} onChange={e => setLocalRag({ ...localRag, topK: Number(e.target.value) })} className={inputClass} />
+            <p className="text-xs text-slate-400">Number of knowledge fragments returned per query</p>
+          </div>
+          <div className="space-y-2">
+            <label className={labelClass}>Chunk Size (chars)</label>
+            <input type="number" min={100} max={2000} value={localRag.chunkSize} onChange={e => setLocalRag({ ...localRag, chunkSize: Number(e.target.value) })} className={inputClass} />
+            <p className="text-xs text-slate-400">Size of text chunks when indexing folder content</p>
+          </div>
+        </div>
+      </div>
+
+      {/* Embedding Model */}
+      <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+        <div className="p-6 border-b border-slate-100 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="bg-indigo-100 p-2 rounded-lg text-indigo-600"><Layers size={20} /></div>
+            <div>
+              <h3 className="text-lg font-semibold text-slate-800">Embedding Model</h3>
+              <p className="text-xs text-slate-500 mt-0.5">Model used to vectorise documents and queries</p>
             </div>
           </div>
-
-          <div className="border-t border-slate-100 pt-6 space-y-4">
-            <h4 className="font-semibold text-slate-700 text-sm">Embedding Model</h4>
-            <div className="grid grid-cols-2 gap-6">
-              <div className="space-y-2">
-                <label className={labelClass}>Embedding Provider</label>
-                <select value={localRag.embeddingProvider} onChange={e => setLocalRag({ ...localRag, embeddingProvider: e.target.value as 'ollama' | 'http' })} className={inputClass}>
-                  <option value="ollama">Ollama (Local)</option>
-                  <option value="http">Custom HTTP (OpenAI Compatible)</option>
-                </select>
-              </div>
-              <div className="space-y-2">
-                <label className={labelClass}>Embedding URL</label>
-                <input type="text" value={localRag.embeddingUrl} onChange={e => setLocalRag({ ...localRag, embeddingUrl: e.target.value })} className={inputClass} placeholder={localRag.embeddingProvider === 'ollama' ? 'http://localhost:11434' : 'http://localhost:1234'} />
-              </div>
-              {localRag.embeddingProvider === 'http' && (
-                <div className="space-y-2">
-                  <label className={labelClass}>Embedding API Key</label>
-                  <input type="password" value={localRag.embeddingApiKey} onChange={e => setLocalRag({ ...localRag, embeddingApiKey: e.target.value })} className={inputClass} placeholder="sk-..." />
-                </div>
-              )}
-              <div className="space-y-2">
-                <label className={labelClass}>Embedding Model</label>
-                <div className="flex gap-2">
-                  <input list="emb-model-list" type="text" value={localRag.embeddingModel} onChange={e => setLocalRag({ ...localRag, embeddingModel: e.target.value })} className={inputClass} placeholder="nomic-embed-text" />
-                  <datalist id="emb-model-list">{embeddingModels.map(m => <option key={m} value={m} />)}</datalist>
-                  <button onClick={fetchEmbeddingModels} disabled={isLoadingEmbeddingModels} className="shrink-0 flex items-center gap-2 bg-slate-100 hover:bg-slate-200 text-slate-700 px-4 py-2.5 rounded-lg text-sm font-medium transition-colors border border-slate-200">
-                    <RefreshCw size={16} className={isLoadingEmbeddingModels ? "animate-spin" : ""} /> Refresh
-                  </button>
-                </div>
-                <p className="text-xs text-slate-400">Recommended: nomic-embed-text, all-minilm, mxbai-embed-large</p>
-              </div>
+          <div className="flex items-center gap-2">
+            <button onClick={testEmbedding} disabled={isTestingEmbedding} className={testBtnClass(embeddingTestResult)}>
+              {isTestingEmbedding
+                ? <><RefreshCw size={16} className="animate-spin" /> Testing...</>
+                : embeddingTestResult === 'success'
+                  ? <><CheckCircle2 size={16} /> Connected{embeddingTestDims ? ` (${embeddingTestDims}d)` : ''}</>
+                  : embeddingTestResult === 'error'
+                    ? <><AlertCircle size={16} /> Failed</>
+                    : 'Test Embedding'}
+            </button>
+          </div>
+        </div>
+        <div className="p-6 grid grid-cols-2 gap-6">
+          <div className="space-y-2">
+            <label className={labelClass}>Provider</label>
+            <select value={localRag.embeddingProvider} onChange={e => setLocalRag({ ...localRag, embeddingProvider: e.target.value as 'ollama' | 'http' | 'huggingface' })} className={inputClass}>
+              <option value="ollama">Ollama (Local)</option>
+              <option value="http">Custom HTTP (OpenAI Compatible)</option>
+              <option value="huggingface">HuggingFace TEI (BGE, E5…)</option>
+            </select>
+          </div>
+          <div className="space-y-2">
+            <label className={labelClass}>Server URL</label>
+            <input
+              type="text"
+              value={localRag.embeddingUrl}
+              onChange={e => setLocalRag({ ...localRag, embeddingUrl: e.target.value })}
+              className={inputClass}
+              placeholder={
+                localRag.embeddingProvider === 'ollama'
+                  ? 'http://localhost:11434'
+                  : localRag.embeddingProvider === 'huggingface'
+                    ? 'http://localhost:8080'
+                    : 'http://localhost:1234'
+              }
+            />
+          </div>
+          <div className="space-y-2">
+            <label className={labelClass}>Username</label>
+            <input type="text" value={localRag.embeddingUsername} onChange={e => setLocalRag({ ...localRag, embeddingUsername: e.target.value })} className={inputClass} placeholder="(optional)" />
+          </div>
+          <div className="space-y-2">
+            <label className={labelClass}>Password</label>
+            <input type="password" value={localRag.embeddingPassword} onChange={e => setLocalRag({ ...localRag, embeddingPassword: e.target.value })} className={inputClass} placeholder="••••••••" />
+          </div>
+          {(localRag.embeddingProvider === 'http' || localRag.embeddingProvider === 'huggingface') && (
+            <div className="space-y-2 col-span-2">
+              <label className={labelClass}>API Key (optional)</label>
+              <input type="password" value={localRag.embeddingApiKey} onChange={e => setLocalRag({ ...localRag, embeddingApiKey: e.target.value })} className={inputClass} placeholder="sk-..." />
             </div>
+          )}
+          <div className="space-y-2 col-span-2">
+            <label className={labelClass}>Embedding Model</label>
+            <div className="flex gap-2">
+              <input
+                list="emb-model-list"
+                type="text"
+                value={localRag.embeddingModel}
+                onChange={e => setLocalRag({ ...localRag, embeddingModel: e.target.value })}
+                className={inputClass}
+                placeholder={
+                  localRag.embeddingProvider === 'ollama'
+                    ? 'bge-m3, nomic-embed-text, mxbai-embed-large'
+                    : localRag.embeddingProvider === 'huggingface'
+                      ? 'BAAI/bge-m3, BAAI/bge-large-en-v1.5'
+                      : 'text-embedding-ada-002'
+                }
+              />
+              <datalist id="emb-model-list">{embeddingModels.map(m => <option key={m} value={m} />)}</datalist>
+              <button onClick={fetchEmbeddingModels} disabled={isLoadingEmbeddingModels} className="shrink-0 flex items-center gap-2 bg-slate-100 hover:bg-slate-200 text-slate-700 px-4 py-2.5 rounded-lg text-sm font-medium transition-colors border border-slate-200">
+                <RefreshCw size={16} className={isLoadingEmbeddingModels ? "animate-spin" : ""} /> Refresh
+              </button>
+            </div>
+            <p className="text-xs text-slate-400">
+              {localRag.embeddingProvider === 'huggingface'
+                ? 'BGE via HuggingFace TEI: BAAI/bge-m3, BAAI/bge-large-en-v1.5, BAAI/bge-small-en-v1.5'
+                : 'Recommended: bge-m3, nomic-embed-text, mxbai-embed-large, all-minilm'}
+            </p>
           </div>
         </div>
         <div className="px-6 pb-6 flex justify-end">
-          <button onClick={handleSaveRag} disabled={isSavingRag} className="flex items-center gap-2 bg-purple-600 hover:bg-purple-700 text-white px-5 py-2.5 rounded-xl font-medium text-sm transition-all shadow-sm disabled:opacity-50">
+          <button onClick={handleSaveRag} disabled={isSavingRag} className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-5 py-2.5 rounded-xl font-medium text-sm transition-all shadow-sm disabled:opacity-50">
             {ragSaved ? <><CheckCircle2 size={16} className="text-white" /> Saved</> : <><Save size={16} /> Save RAG Config</>}
           </button>
         </div>
