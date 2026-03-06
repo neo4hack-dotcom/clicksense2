@@ -123,7 +123,7 @@ export function ChatPane() {
   const defaultSuggestions = [
     "Show me the list of all tables",
     "Show me the list of fields for the table [table_name]",
-    "Search for the value '[value]' in the table [table_name]"
+    "Search for the value '[value]' in the table [table_name]",
   ];
 
   const suggestions = queryHistory.length > 0
