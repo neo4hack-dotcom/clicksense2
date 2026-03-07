@@ -1918,13 +1918,25 @@ Return ONLY a JSON object:
 # Data Quality Analysis
 # ---------------------------------------------------------------------------
 
-def _dq_column_stats(client, table: str, column: str, col_type: str, sample_size: int) -> dict:
+def _dq_column_stats(
+    client,
+    table: str,
+    column: str,
+    col_type: str,
+    sample_size: int,
+    filter_col: str | None = None,
+    filter_op: str | None = None,
+    filter_val: str | None = None,
+) -> dict:
     """Collect a statistical profile for one column using ClickHouse queries.
 
     Uses a subquery with LIMIT to bound the number of rows processed — essential
     for tables with billions of rows.  A trailing LIMIT on an aggregate query only
     limits the *result* rows (always 1 for a single aggregate), NOT the rows read
     from the table, so we must wrap the table scan in a subquery.
+
+    If filter_col/filter_op/filter_val are provided, only rows matching that
+    condition are included in the analysis (applied inside the bounding subquery).
     """
     import re as _re
     stats: dict = {"column": column, "type": col_type}
@@ -1932,9 +1944,20 @@ def _dq_column_stats(client, table: str, column: str, col_type: str, sample_size
     safe_col = _re.sub(r"[^\w]", "", column)
     n = int(sample_size)
 
+    # Build optional WHERE filter clause (injected inside the bounding subquery)
+    where_clause = ""
+    if filter_col and filter_op and filter_val is not None:
+        safe_fcol = _re.sub(r"[^\w]", "", filter_col)
+        # Escape single quotes in the filter value
+        escaped_val = str(filter_val).replace("'", "''")
+        op_map = {"=": "=", "!=": "!=", "<": "<", ">": ">", "<=": "<=", ">=": ">=", "LIKE": "LIKE"}
+        op = op_map.get(filter_op, "=")
+        where_clause = f" WHERE `{safe_fcol}` {op} '{escaped_val}'"
+        stats["filter_applied"] = f"`{safe_fcol}` {op} '{escaped_val}'"
+
     # Subquery that limits input rows — this is the correct way to bound scans
     # on large tables in ClickHouse.  Every aggregate below queries this sub.
-    sub = f"(SELECT `{safe_col}` FROM {safe_table} LIMIT {n})"
+    sub = f"(SELECT `{safe_col}` FROM {safe_table}{where_clause} LIMIT {n})"
 
     try:
         # ── Basic counts ──────────────────────────────────────────────────────
@@ -1970,19 +1993,30 @@ def _dq_column_stats(client, table: str, column: str, col_type: str, sample_size
                 f" avg(`{safe_col}`), stddevPop(`{safe_col}`),"
                 f" quantile(0.25)(`{safe_col}`), quantile(0.5)(`{safe_col}`),"
                 f" quantile(0.75)(`{safe_col}`),"
-                f" countIf(`{safe_col}` < 0)"
+                f" countIf(`{safe_col}` < 0),"
+                f" countIf(`{safe_col}` = 0)"
                 f" FROM {sub}"
                 f" WHERE `{safe_col}` IS NOT NULL"
             )
             rr = r2.result_rows[0]
             def _f(v):
                 return round(float(v), 6) if v is not None else None
+            avg_val = _f(rr[2])
+            stddev_val = _f(rr[3])
+            p50_val = _f(rr[5])
             stats.update({
                 "min": _f(rr[0]), "max": _f(rr[1]),
-                "avg": _f(rr[2]), "stddev": _f(rr[3]),
-                "p25": _f(rr[4]), "p50": _f(rr[5]), "p75": _f(rr[6]),
+                "avg": avg_val, "stddev": stddev_val,
+                "p25": _f(rr[4]), "p50": p50_val, "p75": _f(rr[6]),
                 "negative_count": int(rr[7]) if rr[7] is not None else 0,
+                "zero_count": int(rr[8]) if rr[8] is not None else 0,
             })
+            # Coefficient of variation (stddev / avg) — indicates relative spread
+            if avg_val and avg_val != 0 and stddev_val is not None:
+                stats["coeff_variation"] = round(abs(stddev_val / avg_val), 4)
+            # Pearson skewness approximation: 3*(mean - median) / stddev
+            if avg_val is not None and p50_val is not None and stddev_val and stddev_val != 0:
+                stats["skewness_approx"] = round(3 * (avg_val - p50_val) / stddev_val, 4)
             # Outlier detection via IQR
             if stats["p25"] is not None and stats["p75"] is not None:
                 iqr = stats["p75"] - stats["p25"]
@@ -2002,7 +2036,11 @@ def _dq_column_stats(client, table: str, column: str, col_type: str, sample_size
                 f"SELECT countIf(`{safe_col}` = ''),"
                 f" min(length(`{safe_col}`)), max(length(`{safe_col}`)),"
                 f" avg(length(`{safe_col}`)),"
-                f" countIf(length(`{safe_col}`) > 1000)"
+                f" countIf(length(`{safe_col}`) > 1000),"
+                f" countIf(length(trimBoth(`{safe_col}`)) < length(`{safe_col}`)),"
+                f" countIf(upperUTF8(`{safe_col}`) = `{safe_col}` AND lowerUTF8(`{safe_col}`) != `{safe_col}`),"
+                f" countIf(match(`{safe_col}`, '^[0-9]+$')),"
+                f" countIf(match(`{safe_col}`, '^[^@\\\\s]+@[^@\\\\s]+\\\\.[^@\\\\s]+$'))"
                 f" FROM {sub}"
                 f" WHERE `{safe_col}` IS NOT NULL"
             )
@@ -2015,6 +2053,10 @@ def _dq_column_stats(client, table: str, column: str, col_type: str, sample_size
                 "max_length": int(rr[2]) if rr[2] is not None else 0,
                 "avg_length": round(float(rr[3]), 2) if rr[3] is not None else 0,
                 "very_long_count": int(rr[4]) if rr[4] is not None else 0,
+                "whitespace_padded_count": int(rr[5]) if rr[5] is not None else 0,
+                "all_caps_count": int(rr[6]) if rr[6] is not None else 0,
+                "numeric_string_count": int(rr[7]) if rr[7] is not None else 0,
+                "email_like_count": int(rr[8]) if rr[8] is not None else 0,
             })
             # Detect common sentinel/garbage values
             r3 = client.query(
@@ -2028,7 +2070,10 @@ def _dq_column_stats(client, table: str, column: str, col_type: str, sample_size
         elif is_date:
             r2 = client.query(
                 f"SELECT min(`{safe_col}`), max(`{safe_col}`),"
-                f" countIf(`{safe_col}` > now())"
+                f" countIf(`{safe_col}` > now()),"
+                f" countIf(toDate(`{safe_col}`) = '1970-01-01'),"
+                f" countIf(toDayOfWeek(`{safe_col}`) >= 6),"
+                f" countIf(toYear(`{safe_col}`) < 1900)"
                 f" FROM {sub}"
                 f" WHERE `{safe_col}` IS NOT NULL"
             )
@@ -2037,6 +2082,9 @@ def _dq_column_stats(client, table: str, column: str, col_type: str, sample_size
                 "min_date": str(rr[0]) if rr[0] is not None else None,
                 "max_date": str(rr[1]) if rr[1] is not None else None,
                 "future_count": int(rr[2]) if rr[2] is not None else 0,
+                "epoch_sentinel_count": int(rr[3]) if rr[3] is not None else 0,
+                "weekend_count": int(rr[4]) if rr[4] is not None else 0,
+                "pre_1900_count": int(rr[5]) if rr[5] is not None else 0,
             })
 
         # ── Top 10 most frequent values (from the same limited sample) ────────
@@ -2064,6 +2112,12 @@ def analyze_data_quality():
     table = (data.get("table") or "").strip()
     columns = data.get("columns", [])
     sample_size = min(int(data.get("sample_size", 50000)), 500000)
+    # Optional row filter
+    filter_col = (data.get("filter_column") or "").strip() or None
+    filter_op = (data.get("filter_operator") or "=").strip()
+    filter_val = data.get("filter_value")
+    if filter_val is not None:
+        filter_val = str(filter_val)
 
     if not table:
         return jsonify({"error": "Table name is required"}), 400
@@ -2075,6 +2129,11 @@ def analyze_data_quality():
     for col in columns:
         if not _re.match(r"^\w+$", col):
             return jsonify({"error": f"Invalid column name: {col}"}), 400
+    if filter_col and not _re.match(r"^\w+$", filter_col):
+        return jsonify({"error": "Invalid filter column name"}), 400
+    allowed_ops = {"=", "!=", "<", ">", "<=", ">=", "LIKE"}
+    if filter_op not in allowed_ops:
+        filter_op = "="
 
     try:
         client = get_clickhouse_client()
@@ -2087,11 +2146,18 @@ def analyze_data_quality():
         column_stats = []
         for col in columns:
             col_type = col_types.get(col, "String")
-            cs = _dq_column_stats(client, table, col, col_type, sample_size)
+            cs = _dq_column_stats(
+                client, table, col, col_type, sample_size,
+                filter_col=filter_col, filter_op=filter_op, filter_val=filter_val,
+            )
             column_stats.append(cs)
 
         # ── LLM analysis ─────────────────────────────────────────────────────
         stats_json = json.dumps(column_stats, indent=2, default=str)
+
+        filter_note = ""
+        if filter_col and filter_val is not None:
+            filter_note = f" (filtered to rows where `{filter_col}` {filter_op} '{filter_val}')"
 
         system_prompt = """You are an expert data quality analyst specializing in database analytics and anomaly detection.
 Analyze the statistical profiles of the provided columns and identify all data quality issues.
@@ -2101,8 +2167,10 @@ Evaluate each column for:
 2. **Format anomalies**: Inconsistent patterns, unexpected length distributions, mixed formats
 3. **Content anomalies**: Impossible values, values outside expected business domain
 4. **Cardinality anomalies**: Suspiciously low distinct counts (near-constant column), or unexpectedly high cardinality
-5. **Distribution anomalies**: Extreme skew, statistical outliers (IQR method), highly unbalanced categories
-6. **Temporal anomalies**: Future dates, epoch sentinel dates (1970-01-01), implausible date ranges
+5. **Distribution anomalies**: Extreme skew (use skewness_approx), statistical outliers (IQR method), zero inflation (zero_count), highly unbalanced categories
+6. **Temporal anomalies**: Future dates, epoch sentinel dates (1970-01-01, epoch_sentinel_count), implausible date ranges (pre_1900_count), weekend concentration (weekend_count)
+7. **String quality**: Whitespace padding (whitespace_padded_count), ALL-CAPS inconsistency (all_caps_count), numeric strings in text fields (numeric_string_count), unexpected email-like values (email_like_count)
+8. **Spread anomalies**: High coefficient of variation (coeff_variation > 1 indicates extreme spread), high skewness (|skewness_approx| > 2 indicates strong skew)
 
 Return ONLY valid JSON with this exact structure:
 {
@@ -2115,7 +2183,7 @@ Return ONLY valid JSON with this exact structure:
       "issues": [
         {
           "severity": "critical|warning|info",
-          "category": "nulls|format|content|cardinality|distribution|temporal",
+          "category": "nulls|format|content|cardinality|distribution|temporal|string_quality|spread",
           "title": "<short issue title>",
           "description": "<detailed description with specific numbers>",
           "affected_rows": <number or null>,
@@ -2129,7 +2197,7 @@ Return ONLY valid JSON with this exact structure:
 }"""
 
         user_msg = (
-            f"Analyze data quality for table `{table}` (sample of {sample_size:,} rows).\n\n"
+            f"Analyze data quality for table `{table}` (sample of {sample_size:,} rows{filter_note}).\n\n"
             f"Column Statistics:\n{stats_json}\n\n"
             "Provide a thorough analysis identifying all data quality issues with specific numbers."
         )
