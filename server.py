@@ -205,7 +205,18 @@ def _get_embedding(text: str) -> list:
             timeout=120,
         )
         if not resp2.ok:
-            raise Exception(f"Ollama embedding error {resp2.status_code}: {resp2.text}")
+            err_body = resp2.text
+            # Detect model-not-found or embedding-unsupported errors and give a
+            # clear, actionable message instead of the raw Ollama error.
+            is_model_error = resp2.status_code == 404 or "not found" in err_body.lower()
+            is_fallback_model = not (rag_config.get("embeddingModel") or "").strip()
+            if is_model_error and is_fallback_model:
+                raise Exception(
+                    f"The LLM model '{model}' does not support embeddings via Ollama. "
+                    f"Please configure a dedicated embedding model (e.g. nomic-embed-text, bge-m3, all-minilm) "
+                    f"in Settings > Embedding Model, then click 'Save RAG Config'."
+                )
+            raise Exception(f"Ollama embedding error {resp2.status_code}: {err_body}")
         data2 = resp2.json()
         if "embedding" in data2:
             return data2["embedding"]
