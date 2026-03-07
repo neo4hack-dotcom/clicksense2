@@ -1747,18 +1747,36 @@ def profile_table(table_name):
         count_result = client.query(f"SELECT count() FROM `{table_name}`")
         total_rows = int(count_result.result_rows[0][0]) if count_result.result_rows else 0
 
-        # 3. Single stats query: notnull count + distinct per column
-        # Use SAMPLE for large tables to keep it fast
-        sample_clause = " SAMPLE 0.1" if total_rows > 500_000 else ""
+        # 3. Single stats query against a row-limited subquery.
+        #
+        # KEY FIX: The previous approach used "FROM table SAMPLE 0.1" or a
+        # trailing LIMIT on the outer query.  Neither correctly limits the
+        # rows fed into aggregate functions:
+        #   • SAMPLE 0.1 requires a sampling key and fails silently on tables
+        #     that don't have one — stats_row stays {}, every column gets
+        #     notnull=0, which produces null_pct=100% for every column.
+        #   • A trailing LIMIT on a single-row aggregate result is a no-op for
+        #     the underlying scan.
+        #
+        # The correct pattern for large tables is to wrap the table in a
+        # subquery with LIMIT so ClickHouse stops reading after N rows:
+        #   SELECT agg(col) FROM (SELECT col FROM table LIMIT N)
+        #
+        # We also use uniq() (HyperLogLog, ~2% error) instead of uniqExact()
+        # to avoid materializing huge hash sets in memory.
+        profile_sample = 500_000 if total_rows > 500_000 else total_rows
+        col_names_quoted = ", ".join(f"`{c['name'].replace('`','``')}`" for c in columns)
+        sub = f"(SELECT {col_names_quoted} FROM `{table_name}` LIMIT {profile_sample})"
+
         select_parts = []
         for col in columns:
             cn = col["name"].replace("`", "``")
             select_parts.append(f"countIf(`{cn}` IS NOT NULL) AS `{cn}__notnull`")
-            select_parts.append(f"uniqExact(`{cn}`) AS `{cn}__distinct`")
+            select_parts.append(f"uniq(`{cn}`) AS `{cn}__distinct`")
 
         stats_row = {}
         if select_parts:
-            stats_sql = f"SELECT {', '.join(select_parts)} FROM `{table_name}`{sample_clause}"
+            stats_sql = f"SELECT {', '.join(select_parts)} FROM {sub}"
             try:
                 sr = client.query(stats_sql)
                 if sr.result_rows:
@@ -1767,20 +1785,40 @@ def profile_table(table_name):
                 print(f"Stats query warning: {e}")
 
         # 4. Build per-column stats
+        # Scale sampled counts back to total_rows estimate when a partial sample
+        # was used.  When stats_row is empty (query failed), mark as unknown
+        # rather than reporting a misleading 100% null rate.
+        scale = (total_rows / profile_sample) if profile_sample < total_rows and profile_sample > 0 else 1.0
         col_stats = []
         for col in columns:
             cn = col["name"]
-            notnull = int(stats_row.get(f"{cn}__notnull", 0))
-            distinct = int(stats_row.get(f"{cn}__distinct", 0))
-            sample_factor = 10 if sample_clause else 1
-            estimated_rows = total_rows
-            null_count = max(0, estimated_rows - notnull * sample_factor)
-            null_pct = round(null_count / estimated_rows * 100, 1) if estimated_rows > 0 else 0.0
-            distinct_pct = round(distinct / estimated_rows * 100, 1) if estimated_rows > 0 else 0.0
+            notnull_raw = stats_row.get(f"{cn}__notnull")
+            distinct_raw = stats_row.get(f"{cn}__distinct")
+
+            if notnull_raw is None:
+                # Stats query failed for this column — report unknown
+                col_stats.append({
+                    "name": cn,
+                    "type": col["type"],
+                    "notnull": None,
+                    "null_count": None,
+                    "null_pct": None,
+                    "distinct": None,
+                    "distinct_pct": None,
+                    "top_values": [],
+                })
+                continue
+
+            notnull = int(notnull_raw)
+            distinct = int(distinct_raw) if distinct_raw is not None else 0
+            estimated_notnull = round(notnull * scale)
+            null_count = max(0, total_rows - estimated_notnull)
+            null_pct = round(null_count / total_rows * 100, 1) if total_rows > 0 else 0.0
+            distinct_pct = round(distinct / profile_sample * 100, 1) if profile_sample > 0 else 0.0
             col_stats.append({
                 "name": cn,
                 "type": col["type"],
-                "notnull": notnull,
+                "notnull": estimated_notnull,
                 "null_count": null_count,
                 "null_pct": null_pct,
                 "distinct": distinct,
@@ -1789,13 +1827,15 @@ def profile_table(table_name):
             })
 
         # 5. Top values for low-cardinality columns (distinct <= 30)
+        # Use the same LIMIT-bounded subquery to avoid full-table scans.
         for cs in col_stats:
-            if 0 < cs["distinct"] <= 30:
+            if cs["distinct"] is not None and 0 < cs["distinct"] <= 30:
                 try:
+                    cn_q = cs['name'].replace('`', '``')
                     tv = client.query(
-                        f"SELECT toString(`{cs['name'].replace('`','``')}`) AS val, "
-                        f"count() AS cnt FROM `{table_name}` "
-                        f"GROUP BY val ORDER BY cnt DESC LIMIT 8"
+                        f"SELECT toString(`{cn_q}`) AS val, count() AS cnt"
+                        f" FROM (SELECT `{cn_q}` FROM `{table_name}` LIMIT {profile_sample})"
+                        f" GROUP BY val ORDER BY cnt DESC LIMIT 8"
                     )
                     cs["top_values"] = [
                         {"value": str(r[0]), "count": int(r[1])}
@@ -1862,19 +1902,32 @@ Return ONLY a JSON object:
 # ---------------------------------------------------------------------------
 
 def _dq_column_stats(client, table: str, column: str, col_type: str, sample_size: int) -> dict:
-    """Collect a statistical profile for one column using ClickHouse queries."""
+    """Collect a statistical profile for one column using ClickHouse queries.
+
+    Uses a subquery with LIMIT to bound the number of rows processed — essential
+    for tables with billions of rows.  A trailing LIMIT on an aggregate query only
+    limits the *result* rows (always 1 for a single aggregate), NOT the rows read
+    from the table, so we must wrap the table scan in a subquery.
+    """
     import re as _re
     stats: dict = {"column": column, "type": col_type}
     safe_table = _re.sub(r"[^\w.]", "", table)
     safe_col = _re.sub(r"[^\w]", "", column)
-    limit_clause = f"LIMIT {int(sample_size)}"
+    n = int(sample_size)
+
+    # Subquery that limits input rows — this is the correct way to bound scans
+    # on large tables in ClickHouse.  Every aggregate below queries this sub.
+    sub = f"(SELECT `{safe_col}` FROM {safe_table} LIMIT {n})"
 
     try:
         # ── Basic counts ──────────────────────────────────────────────────────
+        # uniq() is approximate (~2% error) but orders-of-magnitude faster than
+        # uniqExact() on large cardinality columns.
         r = client.query(
-            f"SELECT COUNT(*) as total, countIf({safe_col} IS NULL) as nulls,"
-            f" uniqExact({safe_col}) as distinct_count"
-            f" FROM {safe_table} {limit_clause}"
+            f"SELECT count() AS total,"
+            f" countIf(`{safe_col}` IS NULL) AS null_count,"
+            f" uniq(`{safe_col}`) AS approx_distinct"
+            f" FROM {sub}"
         )
         row = r.result_rows[0]
         total = int(row[0])
@@ -1896,11 +1949,13 @@ def _dq_column_stats(client, table: str, column: str, col_type: str, sample_size
 
         if is_numeric:
             r2 = client.query(
-                f"SELECT min({safe_col}), max({safe_col}), avg({safe_col}),"
-                f" stddevPop({safe_col}),"
-                f" quantile(0.25)({safe_col}), quantile(0.5)({safe_col}), quantile(0.75)({safe_col}),"
-                f" countIf({safe_col} < 0)"
-                f" FROM {safe_table} WHERE {safe_col} IS NOT NULL {limit_clause}"
+                f"SELECT min(`{safe_col}`), max(`{safe_col}`),"
+                f" avg(`{safe_col}`), stddevPop(`{safe_col}`),"
+                f" quantile(0.25)(`{safe_col}`), quantile(0.5)(`{safe_col}`),"
+                f" quantile(0.75)(`{safe_col}`),"
+                f" countIf(`{safe_col}` < 0)"
+                f" FROM {sub}"
+                f" WHERE `{safe_col}` IS NOT NULL"
             )
             rr = r2.result_rows[0]
             def _f(v):
@@ -1917,18 +1972,22 @@ def _dq_column_stats(client, table: str, column: str, col_type: str, sample_size
                 lower = stats["p25"] - 1.5 * iqr
                 upper = stats["p75"] + 1.5 * iqr
                 r3 = client.query(
-                    f"SELECT countIf({safe_col} < {lower} OR {safe_col} > {upper})"
-                    f" FROM {safe_table} WHERE {safe_col} IS NOT NULL {limit_clause}"
+                    f"SELECT countIf(`{safe_col}` < {lower} OR `{safe_col}` > {upper})"
+                    f" FROM {sub}"
+                    f" WHERE `{safe_col}` IS NOT NULL"
                 )
-                stats["outlier_count"] = int(r3.result_rows[0][0])
-                stats["outlier_pct"] = round(100 * stats["outlier_count"] / max(total - null_count, 1), 2)
+                oc = int(r3.result_rows[0][0])
+                stats["outlier_count"] = oc
+                stats["outlier_pct"] = round(100 * oc / max(total - null_count, 1), 2)
 
         elif is_string:
             r2 = client.query(
-                f"SELECT countIf({safe_col} = ''), min(length({safe_col})),"
-                f" max(length({safe_col})), avg(length({safe_col})),"
-                f" countIf(length({safe_col}) > 1000)"
-                f" FROM {safe_table} WHERE {safe_col} IS NOT NULL {limit_clause}"
+                f"SELECT countIf(`{safe_col}` = ''),"
+                f" min(length(`{safe_col}`)), max(length(`{safe_col}`)),"
+                f" avg(length(`{safe_col}`)),"
+                f" countIf(length(`{safe_col}`) > 1000)"
+                f" FROM {sub}"
+                f" WHERE `{safe_col}` IS NOT NULL"
             )
             rr = r2.result_rows[0]
             empty_count = int(rr[0]) if rr[0] is not None else 0
@@ -1941,19 +2000,20 @@ def _dq_column_stats(client, table: str, column: str, col_type: str, sample_size
                 "very_long_count": int(rr[4]) if rr[4] is not None else 0,
             })
             # Detect common sentinel/garbage values
-            sentinels_q = (
-                f"SELECT countIf(lower(toString({safe_col})) IN"
+            r3 = client.query(
+                f"SELECT countIf(lower(toString(`{safe_col}`)) IN"
                 f" ('null','none','n/a','na','#na','#n/a','unknown','undefined','nan','nil','-','0'))"
-                f" FROM {safe_table} WHERE {safe_col} IS NOT NULL {limit_clause}"
+                f" FROM {sub}"
+                f" WHERE `{safe_col}` IS NOT NULL"
             )
-            r3 = client.query(sentinels_q)
             stats["sentinel_count"] = int(r3.result_rows[0][0])
 
         elif is_date:
             r2 = client.query(
-                f"SELECT min({safe_col}), max({safe_col}),"
-                f" countIf({safe_col} > now())"
-                f" FROM {safe_table} WHERE {safe_col} IS NOT NULL {limit_clause}"
+                f"SELECT min(`{safe_col}`), max(`{safe_col}`),"
+                f" countIf(`{safe_col}` > now())"
+                f" FROM {sub}"
+                f" WHERE `{safe_col}` IS NOT NULL"
             )
             rr = r2.result_rows[0]
             stats.update({
@@ -1962,11 +2022,12 @@ def _dq_column_stats(client, table: str, column: str, col_type: str, sample_size
                 "future_count": int(rr[2]) if rr[2] is not None else 0,
             })
 
-        # ── Top 10 most frequent values ───────────────────────────────────────
+        # ── Top 10 most frequent values (from the same limited sample) ────────
         r_top = client.query(
-            f"SELECT toString({safe_col}) as val, COUNT(*) as cnt"
-            f" FROM {safe_table} WHERE {safe_col} IS NOT NULL"
-            f" GROUP BY {safe_col} ORDER BY cnt DESC LIMIT 10"
+            f"SELECT toString(`{safe_col}`) AS val, count() AS cnt"
+            f" FROM {sub}"
+            f" WHERE `{safe_col}` IS NOT NULL"
+            f" GROUP BY `{safe_col}` ORDER BY cnt DESC LIMIT 10"
         )
         stats["top_values"] = [
             {"value": str(row[0]), "count": int(row[1])} for row in r_top.result_rows
