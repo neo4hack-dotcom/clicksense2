@@ -2,7 +2,7 @@ import { useState } from 'react';
 import {
   ShieldCheck, ChevronDown, ChevronRight, AlertTriangle,
   Info, AlertCircle, Loader2, BarChart3, CheckCircle2,
-  Search, X, RefreshCw, Table2
+  Search, X, RefreshCw, Table2, Filter, FileDown
 } from 'lucide-react';
 import { useAppStore } from '../store';
 import { motion, AnimatePresence } from 'motion/react';
@@ -53,13 +53,24 @@ interface ColumnStat {
   outlier_count?: number;
   outlier_pct?: number;
   negative_count?: number;
+  zero_count?: number;
+  coeff_variation?: number;
+  skewness_approx?: number;
   min_length?: number;
   max_length?: number;
   avg_length?: number;
   sentinel_count?: number;
+  whitespace_padded_count?: number;
+  all_caps_count?: number;
+  numeric_string_count?: number;
+  email_like_count?: number;
   min_date?: string;
   max_date?: string;
   future_count?: number;
+  epoch_sentinel_count?: number;
+  weekend_count?: number;
+  pre_1900_count?: number;
+  filter_applied?: string;
   top_values?: { value: string; count: number }[];
   query_error?: string;
 }
@@ -119,6 +130,10 @@ function ColumnStatCard({ stat }: { stat: ColumnStat }) {
             <StatPill label="Avg len" value={stat.avg_length} />
             <StatPill label="Max len" value={stat.max_length} />
             {(stat.sentinel_count ?? 0) > 0 && <StatPill label="Sentinels" value={stat.sentinel_count} accent />}
+            {(stat.whitespace_padded_count ?? 0) > 0 && <StatPill label="Whitespace pad" value={stat.whitespace_padded_count} accent />}
+            {(stat.all_caps_count ?? 0) > 0 && <StatPill label="ALL CAPS" value={stat.all_caps_count} />}
+            {(stat.numeric_string_count ?? 0) > 0 && <StatPill label="Numeric str" value={stat.numeric_string_count} />}
+            {(stat.email_like_count ?? 0) > 0 && <StatPill label="Email-like" value={stat.email_like_count} />}
           </>
         )}
         {isNumeric && (
@@ -127,7 +142,12 @@ function ColumnStatCard({ stat }: { stat: ColumnStat }) {
             <StatPill label="Max" value={stat.max} />
             <StatPill label="Avg" value={stat.avg !== undefined ? Number(stat.avg).toFixed(2) : undefined} />
             <StatPill label="Stddev" value={stat.stddev !== undefined ? Number(stat.stddev).toFixed(2) : undefined} />
+            <StatPill label="Median" value={stat.p50 !== undefined ? Number(stat.p50).toFixed(2) : undefined} />
+            <StatPill label="Zeros" value={stat.zero_count} accent={(stat.zero_count ?? 0) > 0} />
+            <StatPill label="Negatives" value={stat.negative_count} accent={(stat.negative_count ?? 0) > 0} />
             <StatPill label="Outliers" value={stat.outlier_count !== undefined ? `${stat.outlier_count} (${stat.outlier_pct}%)` : undefined} accent={(stat.outlier_pct ?? 0) > 5} />
+            <StatPill label="CV" value={stat.coeff_variation !== undefined ? stat.coeff_variation.toFixed(2) : undefined} accent={(stat.coeff_variation ?? 0) > 1} />
+            <StatPill label="Skewness" value={stat.skewness_approx !== undefined ? stat.skewness_approx.toFixed(2) : undefined} accent={Math.abs(stat.skewness_approx ?? 0) > 2} />
           </>
         )}
         {isDate && (
@@ -135,6 +155,9 @@ function ColumnStatCard({ stat }: { stat: ColumnStat }) {
             <StatPill label="Min date" value={stat.min_date} />
             <StatPill label="Max date" value={stat.max_date} />
             <StatPill label="Future" value={stat.future_count} accent={(stat.future_count ?? 0) > 0} />
+            <StatPill label="Epoch (1970)" value={stat.epoch_sentinel_count} accent={(stat.epoch_sentinel_count ?? 0) > 0} />
+            <StatPill label="Weekend" value={stat.weekend_count} />
+            <StatPill label="Pre-1900" value={stat.pre_1900_count} accent={(stat.pre_1900_count ?? 0) > 0} />
           </>
         )}
       </div>
@@ -175,6 +198,12 @@ export function DataQualityPane() {
   const [error, setError] = useState<string | null>(null);
   const [expandedColumns, setExpandedColumns] = useState<Set<string>>(new Set());
 
+  // Row filter state
+  const [filterEnabled, setFilterEnabled] = useState(false);
+  const [filterColumn, setFilterColumn] = useState('');
+  const [filterOperator, setFilterOperator] = useState('=');
+  const [filterValue, setFilterValue] = useState('');
+
   const allTables = Object.keys(schema).sort();
   const filteredTables = tableSearch.trim()
     ? allTables.filter(t => t.toLowerCase().includes(tableSearch.toLowerCase()))
@@ -207,11 +236,22 @@ export function DataQualityPane() {
     setResult(null);
     setExpandedColumns(new Set());
 
+    const body: Record<string, unknown> = {
+      table: selectedTable,
+      columns: selectedColumns,
+      sample_size: sampleSize,
+    };
+    if (filterEnabled && filterColumn && filterValue !== '') {
+      body.filter_column = filterColumn;
+      body.filter_operator = filterOperator;
+      body.filter_value = filterValue;
+    }
+
     try {
       const res = await fetch('/api/data-quality/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ table: selectedTable, columns: selectedColumns, sample_size: sampleSize }),
+        body: JSON.stringify(body),
       });
       const data = await res.json();
       if (data.error) throw new Error(data.error);
@@ -235,6 +275,116 @@ export function DataQualityPane() {
   const criticalCount = result?.analysis?.columns?.reduce(
     (acc, c) => acc + c.issues.filter(i => i.severity === 'critical').length, 0
   ) ?? 0;
+
+  const handleExportPDF = () => {
+    if (!result) return;
+    const severityIcon = (s: string) => s === 'critical' ? '🔴' : s === 'warning' ? '🟡' : '🔵';
+    const scoreColor = (score: number | null) => {
+      if (score === null) return '#64748b';
+      return score >= 80 ? '#059669' : score >= 60 ? '#d97706' : '#dc2626';
+    };
+
+    const colsHtml = result.column_stats.map(stat => {
+      const cr = colResultMap[stat.column];
+      const issues = cr?.issues ?? [];
+      const issuesHtml = issues.map(iss => `
+        <div style="border-left:3px solid ${iss.severity === 'critical' ? '#dc2626' : iss.severity === 'warning' ? '#d97706' : '#3b82f6'};padding:8px 12px;margin:6px 0;background:#f8fafc;border-radius:4px;">
+          <div style="font-weight:600;font-size:12px;">${severityIcon(iss.severity)} ${iss.title} <span style="font-size:10px;color:#64748b;font-weight:400;">[${iss.category}]${iss.affected_rows != null ? ` · ${iss.affected_rows.toLocaleString()} rows` : ''}</span></div>
+          <div style="font-size:11px;color:#374151;margin:3px 0;">${iss.description}</div>
+          ${iss.recommendation ? `<div style="font-size:11px;color:#6b7280;font-style:italic;">→ ${iss.recommendation}</div>` : ''}
+        </div>`).join('');
+
+      const topVals = stat.top_values?.slice(0, 6).map(tv =>
+        `<span style="background:#f1f5f9;border:1px solid #e2e8f0;border-radius:4px;padding:2px 6px;font-size:10px;font-family:monospace;margin:2px;">${tv.value || '(empty)'} ×${tv.count.toLocaleString()}</span>`
+      ).join('') ?? '';
+
+      const statPills: string[] = [];
+      if (stat.total != null) statPills.push(`Total: ${stat.total.toLocaleString()}`);
+      if (stat.null_pct != null) statPills.push(`Nulls: ${stat.null_pct}%`);
+      if (stat.distinct_count != null) statPills.push(`Distinct: ${stat.distinct_count.toLocaleString()}`);
+      if (stat.avg != null) statPills.push(`Avg: ${Number(stat.avg).toFixed(2)}`);
+      if (stat.stddev != null) statPills.push(`Stddev: ${Number(stat.stddev).toFixed(2)}`);
+      if (stat.min != null) statPills.push(`Min: ${stat.min}`);
+      if (stat.max != null) statPills.push(`Max: ${stat.max}`);
+      if (stat.zero_count != null && stat.zero_count > 0) statPills.push(`Zeros: ${stat.zero_count}`);
+      if (stat.skewness_approx != null) statPills.push(`Skewness: ${stat.skewness_approx.toFixed(2)}`);
+      if (stat.coeff_variation != null) statPills.push(`CV: ${stat.coeff_variation.toFixed(2)}`);
+      if (stat.outlier_count != null) statPills.push(`Outliers: ${stat.outlier_count} (${stat.outlier_pct}%)`);
+      if (stat.empty_pct != null) statPills.push(`Empty: ${stat.empty_pct}%`);
+      if (stat.avg_length != null) statPills.push(`Avg len: ${stat.avg_length}`);
+      if (stat.sentinel_count != null && stat.sentinel_count > 0) statPills.push(`Sentinels: ${stat.sentinel_count}`);
+      if (stat.whitespace_padded_count != null && stat.whitespace_padded_count > 0) statPills.push(`Whitespace pad: ${stat.whitespace_padded_count}`);
+      if (stat.min_date) statPills.push(`Min date: ${stat.min_date}`);
+      if (stat.max_date) statPills.push(`Max date: ${stat.max_date}`);
+      if (stat.future_count != null && stat.future_count > 0) statPills.push(`Future: ${stat.future_count}`);
+      if (stat.epoch_sentinel_count != null && stat.epoch_sentinel_count > 0) statPills.push(`Epoch 1970: ${stat.epoch_sentinel_count}`);
+
+      return `
+      <div style="border:1px solid #e2e8f0;border-radius:8px;padding:16px;margin-bottom:16px;break-inside:avoid;">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px;flex-wrap:wrap;">
+          <span style="font-family:monospace;font-weight:700;font-size:14px;color:#1e293b;">${stat.column}</span>
+          <span style="background:#f1f5f9;border:1px solid #e2e8f0;border-radius:4px;padding:2px 6px;font-size:10px;font-family:monospace;color:#64748b;">${stat.type}</span>
+          ${cr ? `<span style="color:${scoreColor(cr.quality_score)};font-weight:700;font-size:12px;border:1px solid;border-radius:20px;padding:2px 8px;">${cr.quality_score}/100</span>` : ''}
+          ${issues.length > 0 ? `<span style="font-size:11px;color:#64748b;">${issues.length} issue${issues.length > 1 ? 's' : ''}</span>` : '<span style="color:#059669;font-size:11px;">✓ No issues</span>'}
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px;">
+          ${statPills.map(p => `<span style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:3px 8px;font-size:11px;color:#374151;">${p}</span>`).join('')}
+        </div>
+        ${topVals ? `<div style="margin-bottom:10px;"><div style="font-size:10px;font-weight:600;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px;">Top values</div><div style="display:flex;flex-wrap:wrap;gap:4px;">${topVals}</div></div>` : ''}
+        ${cr?.insights ? `<div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:6px;padding:8px 10px;font-size:11px;color:#1d4ed8;margin-bottom:8px;"><strong>Observations:</strong> ${cr.insights}</div>` : ''}
+        ${issuesHtml}
+      </div>`;
+    }).join('');
+
+    const recs = result.analysis.recommendations?.map(r =>
+      `<li style="margin:4px 0;font-size:12px;color:#4c1d95;">✓ ${r}</li>`
+    ).join('') ?? '';
+
+    const filterNote = result.column_stats[0]?.filter_applied
+      ? `<div style="background:#f5f3ff;border:1px solid #ddd6fe;border-radius:6px;padding:6px 12px;font-size:11px;font-family:monospace;color:#7c3aed;margin-bottom:12px;">WHERE ${result.column_stats[0].filter_applied}</div>`
+      : '';
+
+    const html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Data Quality Report — ${result.table}</title>
+  <style>
+    @media print { body { margin: 0; } }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; color: #1e293b; margin: 0; padding: 32px; background: white; }
+    h1 { font-size: 22px; margin: 0 0 4px; }
+    h2 { font-size: 15px; margin: 20px 0 10px; color: #374151; }
+  </style>
+</head>
+<body>
+  <div style="border-bottom:2px solid #7c3aed;padding-bottom:16px;margin-bottom:20px;">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+      <h1>Data Quality Report — <span style="color:#7c3aed;font-family:monospace;">${result.table}</span></h1>
+      ${result.analysis.quality_score != null ? `<span style="color:${scoreColor(result.analysis.quality_score)};font-weight:700;font-size:16px;border:1px solid;border-radius:20px;padding:3px 12px;">${result.analysis.quality_score}/100</span>` : ''}
+    </div>
+    <p style="font-size:13px;color:#475569;margin:0 0 12px;">${result.analysis.summary}</p>
+    ${filterNote}
+    <div style="display:flex;gap:16px;flex-wrap:wrap;">
+      <span style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:6px 14px;font-size:12px;"><strong>${result.sample_size.toLocaleString()}</strong> rows sampled</span>
+      <span style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:6px 14px;font-size:12px;"><strong>${result.column_stats.length}</strong> columns</span>
+      ${criticalCount > 0 ? `<span style="background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:6px 14px;font-size:12px;color:#dc2626;"><strong>${criticalCount}</strong> critical issues</span>` : ''}
+      ${issueCount > 0 ? `<span style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:6px 14px;font-size:12px;color:#d97706;"><strong>${issueCount}</strong> total issues</span>` : ''}
+    </div>
+  </div>
+  ${recs ? `<div style="background:#f5f3ff;border:1px solid #ddd6fe;border-radius:8px;padding:14px 16px;margin-bottom:20px;"><h2 style="margin:0 0 8px;color:#6d28d9;font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Global Recommendations</h2><ul style="margin:0;padding-left:16px;">${recs}</ul></div>` : ''}
+  <h2>Column Results</h2>
+  ${colsHtml}
+  <p style="font-size:10px;color:#94a3b8;text-align:right;margin-top:20px;border-top:1px solid #e2e8f0;padding-top:8px;">Generated by ClickSense AI Data Quality · ${new Date().toLocaleString()}</p>
+</body>
+</html>`;
+
+    const win = window.open('', '_blank', 'width=900,height=700');
+    if (!win) return;
+    win.document.write(html);
+    win.document.close();
+    win.focus();
+    setTimeout(() => win.print(), 400);
+  };
 
   return (
     <div className="flex h-full overflow-hidden">
@@ -275,7 +425,7 @@ export function DataQualityPane() {
                 filteredTables.map(t => (
                   <button
                     key={t}
-                    onClick={() => { setSelectedTable(t); setSelectedColumns([]); setResult(null); }}
+                    onClick={() => { setSelectedTable(t); setSelectedColumns([]); setResult(null); setFilterColumn(''); setFilterValue(''); }}
                     className={clsx(
                       'w-full text-left flex items-center gap-2 px-3 py-2 text-xs transition-colors',
                       selectedTable === t
@@ -347,6 +497,68 @@ export function DataQualityPane() {
                 <p className="text-[10px] text-amber-600 bg-amber-50 border border-amber-200 rounded-lg px-2 py-1">
                   Full scan reads every row — may be slow on large tables.
                 </p>
+              )}
+            </div>
+          )}
+
+          {/* Row filter (optional) */}
+          {selectedTable && (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <label className="text-xs font-semibold text-slate-600 uppercase tracking-wide flex items-center gap-1.5">
+                  <Filter size={11} />
+                  Row Filter
+                  <span className="text-[10px] font-normal text-slate-400 normal-case">(optional)</span>
+                </label>
+                <button
+                  onClick={() => setFilterEnabled(p => !p)}
+                  className={clsx(
+                    'relative inline-flex h-4 w-7 shrink-0 rounded-full border-2 border-transparent transition-colors focus:outline-none',
+                    filterEnabled ? 'bg-violet-500' : 'bg-slate-200'
+                  )}
+                >
+                  <span className={clsx(
+                    'inline-block h-3 w-3 transform rounded-full bg-white shadow transition-transform',
+                    filterEnabled ? 'translate-x-3' : 'translate-x-0'
+                  )} />
+                </button>
+              </div>
+              {filterEnabled && (
+                <div className="space-y-1.5">
+                  <select
+                    value={filterColumn}
+                    onChange={e => setFilterColumn(e.target.value)}
+                    className="w-full text-xs bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 focus:ring-2 focus:ring-violet-500/20 focus:border-violet-500 transition-all font-mono"
+                  >
+                    <option value="">— select column —</option>
+                    {tableColumns.map(col => (
+                      <option key={col.name} value={col.name}>{col.name}</option>
+                    ))}
+                  </select>
+                  <div className="flex gap-1.5">
+                    <select
+                      value={filterOperator}
+                      onChange={e => setFilterOperator(e.target.value)}
+                      className="w-20 shrink-0 text-xs bg-slate-50 border border-slate-200 rounded-lg px-2 py-2 focus:ring-2 focus:ring-violet-500/20 focus:border-violet-500 transition-all"
+                    >
+                      {['=', '!=', '<', '>', '<=', '>=', 'LIKE'].map(op => (
+                        <option key={op} value={op}>{op}</option>
+                      ))}
+                    </select>
+                    <input
+                      type="text"
+                      value={filterValue}
+                      onChange={e => setFilterValue(e.target.value)}
+                      placeholder="value…"
+                      className="flex-1 text-xs bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 focus:ring-2 focus:ring-violet-500/20 focus:border-violet-500 transition-all font-mono"
+                    />
+                  </div>
+                  {filterColumn && filterValue && (
+                    <p className="text-[10px] text-violet-600 bg-violet-50 border border-violet-200 rounded-lg px-2 py-1 font-mono">
+                      WHERE {filterColumn} {filterOperator} '{filterValue}'
+                    </p>
+                  )}
+                </div>
               )}
             </div>
           )}
@@ -448,13 +660,32 @@ export function DataQualityPane() {
                   </div>
                   <p className="text-sm text-slate-600 leading-relaxed">{result.analysis.summary}</p>
                 </div>
-                <button
-                  onClick={handleAnalyze}
-                  className="shrink-0 flex items-center gap-1.5 text-xs text-slate-500 hover:text-violet-600 border border-slate-200 hover:border-violet-300 px-3 py-1.5 rounded-lg transition-colors"
-                >
-                  <RefreshCw size={12} /> Re-analyze
-                </button>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    onClick={handleExportPDF}
+                    className="flex items-center gap-1.5 text-xs text-slate-500 hover:text-violet-600 border border-slate-200 hover:border-violet-300 px-3 py-1.5 rounded-lg transition-colors"
+                    title="Export report as PDF"
+                  >
+                    <FileDown size={12} /> Export PDF
+                  </button>
+                  <button
+                    onClick={handleAnalyze}
+                    className="flex items-center gap-1.5 text-xs text-slate-500 hover:text-violet-600 border border-slate-200 hover:border-violet-300 px-3 py-1.5 rounded-lg transition-colors"
+                  >
+                    <RefreshCw size={12} /> Re-analyze
+                  </button>
+                </div>
               </div>
+
+              {/* Active filter badge */}
+              {result.column_stats[0]?.filter_applied && (
+                <div className="mb-3 flex items-center gap-2">
+                  <Filter size={12} className="text-violet-500 shrink-0" />
+                  <span className="text-xs font-mono text-violet-700 bg-violet-50 border border-violet-200 px-2 py-0.5 rounded-lg">
+                    WHERE {result.column_stats[0].filter_applied}
+                  </span>
+                </div>
+              )}
 
               {/* Quick stats */}
               <div className="flex gap-4 flex-wrap">
