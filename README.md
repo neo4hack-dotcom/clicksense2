@@ -1,7 +1,3 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
-</div>
-
 # ClickSense AI
 
 Self-service ClickHouse analysis tool with an AI assistant, drag-and-drop visual query builder, saved dashboards, and a knowledge base — all powered by a Python/Flask backend.
