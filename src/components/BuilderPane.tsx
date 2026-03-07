@@ -26,7 +26,7 @@ import {
   Maximize2, Minimize2, Palette, ArrowUp, ArrowDown, Filter, RotateCcw, Search, Plus,
   History, Brain, AlertTriangle, Lightbulb, TrendingUp, Grid3X3, AreaChart, ScatterChart,
   ChevronRight, Clock, LayoutGrid, Activity, Telescope, ChevronDown, CheckCircle2,
-  Database, Hash, Type, Calendar, ToggleLeft, Percent, Layers
+  Database, Hash, Type, Calendar, ToggleLeft, Percent, Layers, Download, FolderOpen, Loader2
 } from 'lucide-react';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Legend, ResponsiveContainer,
@@ -310,6 +310,12 @@ export function BuilderPane() {
   const [columnOrder, setColumnOrder] = useState<string[]>([]);
   const [activeDragColumn, setActiveDragColumn] = useState<string | null>(null);
   const [addMeasureFor, setAddMeasureFor] = useState<string | null>(null);
+
+  // CSV export state
+  const [exportDialogOpen, setExportDialogOpen] = useState(false);
+  const [exportPath, setExportPath] = useState('');
+  const [isExporting, setIsExporting] = useState(false);
+  const [exportResult, setExportResult] = useState<{ success: boolean; message: string } | null>(null);
 
   // Initialize column order when results change
   useEffect(() => {
@@ -697,6 +703,51 @@ export function BuilderPane() {
     sql += ` LIMIT ${lim}`;
     return sql;
   }, [selectedTable, rowDims, colDims, queryConfig.measures, queryLimit, buildWhereClause]);
+
+  const buildExportSql = useCallback(() => {
+    const table = selectedTable;
+    if (!table) throw new Error("Aucune table sélectionnée");
+    const allDims = [...rowDims, ...colDims];
+    const selects = [
+      ...allDims.map(d => d.name),
+      ...queryConfig.measures.map((m: any) => measureSql(m))
+    ];
+    if (selects.length === 0) throw new Error("Ajoutez au moins une dimension ou une mesure");
+    let sql = `SELECT ${selects.join(', ')} FROM ${table}`;
+    sql += buildWhereClause();
+    if (allDims.length > 0 && queryConfig.measures.length > 0) {
+      sql += ` GROUP BY ${allDims.map(d => d.name).join(', ')}`;
+    }
+    sql += ` LIMIT 1000000`;
+    return sql;
+  }, [selectedTable, rowDims, colDims, queryConfig.measures, buildWhereClause]);
+
+  const openExportDialog = () => {
+    const defaultName = `export_${selectedTable || 'data'}_${new Date().toISOString().slice(0, 10)}.csv`;
+    setExportPath(defaultName);
+    setExportResult(null);
+    setExportDialogOpen(true);
+  };
+
+  const handleExportCsv = async () => {
+    setIsExporting(true);
+    setExportResult(null);
+    try {
+      const sql = buildExportSql();
+      const res = await fetch('/api/export_csv', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sql, output_path: exportPath }),
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      setExportResult({ success: true, message: `${data.row_count.toLocaleString()} lignes exportées → ${data.path}` });
+    } catch (e: any) {
+      setExportResult({ success: false, message: e.message });
+    } finally {
+      setIsExporting(false);
+    }
+  };
 
   const buildAndExecuteQuery = async () => {
     const allDims = [...rowDims, ...colDims];
@@ -1329,6 +1380,15 @@ export function BuilderPane() {
             >
               <Brain size={16} />
               Run AI
+            </button>
+            <button
+              onClick={openExportDialog}
+              disabled={[...rowDims, ...colDims].length === 0 && queryConfig.measures.length === 0}
+              className="flex items-center gap-2 bg-amber-500 hover:bg-amber-600 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
+              title="Exporter les résultats en CSV (séparateur pipe, max 1M lignes)"
+            >
+              <Download size={16} />
+              Export CSV
             </button>
             <button
               onClick={buildAndExecuteQuery}
@@ -2123,6 +2183,69 @@ export function BuilderPane() {
                   </div>
                 );
               })()}
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {/* ------------------------------------------------------------------ */}
+      {/* CSV Export Dialog                                                    */}
+      {/* ------------------------------------------------------------------ */}
+      {exportDialogOpen && createPortal(
+        <div className="fixed inset-0 z-[350] flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden">
+            <div className="p-4 border-b border-slate-200 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Download size={18} className="text-amber-600" />
+                <h3 className="text-sm font-bold text-slate-800">Exporter en CSV</h3>
+              </div>
+              <button onClick={() => setExportDialogOpen(false)} className="text-slate-400 hover:text-slate-600 p-1.5 hover:bg-slate-100 rounded-md">
+                <X size={16} />
+              </button>
+            </div>
+            <div className="p-5 space-y-4">
+              <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-xs text-amber-700 space-y-1">
+                <p className="font-semibold">Format : CSV avec séparateur pipe ( | )</p>
+                <p>Limite : 1 000 000 lignes maximum</p>
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wide mb-1">
+                  <FolderOpen size={12} className="inline mr-1" />
+                  Répertoire / fichier de destination
+                </label>
+                <input
+                  type="text"
+                  value={exportPath}
+                  onChange={e => { setExportPath(e.target.value); setExportResult(null); }}
+                  placeholder="/home/user/mes_données/export.csv"
+                  className="w-full bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-sm font-mono focus:ring-2 focus:ring-amber-500/20 focus:border-amber-500 transition-all"
+                />
+                <p className="mt-1 text-xs text-slate-400">Chemin absolu sur le serveur (ex : /home/user/export.csv)</p>
+              </div>
+              {exportResult && (
+                <div className={clsx(
+                  "flex items-start gap-2 p-3 rounded-lg text-xs",
+                  exportResult.success ? "bg-emerald-50 text-emerald-700 border border-emerald-200" : "bg-red-50 text-red-700 border border-red-200"
+                )}>
+                  <CheckCircle2 size={14} className="shrink-0 mt-0.5" />
+                  <span>{exportResult.message}</span>
+                </div>
+              )}
+              <div className="flex justify-end gap-2 pt-1">
+                <button onClick={() => setExportDialogOpen(false)} className="px-4 py-2 text-sm text-slate-600 hover:bg-slate-100 rounded-lg transition-colors">
+                  {exportResult?.success ? 'Fermer' : 'Annuler'}
+                </button>
+                {!exportResult?.success && (
+                  <button
+                    onClick={handleExportCsv}
+                    disabled={isExporting || !exportPath.trim()}
+                    className="flex items-center gap-2 bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+                  >
+                    {isExporting ? <><Loader2 size={14} className="animate-spin" />Export en cours…</> : <><Download size={14} />Exporter</>}
+                  </button>
+                )}
+              </div>
             </div>
           </div>
         </div>,

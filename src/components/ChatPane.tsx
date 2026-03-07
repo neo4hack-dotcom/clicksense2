@@ -4,6 +4,7 @@ import {
   Maximize2, Minimize2, Minus, CheckSquare, Filter, X,
   Brain, ChevronDown, ChevronRight, CheckCircle2, XCircle, Database,
   AlertTriangle, Info, Lightbulb, TrendingUp, TrendingDown, BarChart2, BookOpen,
+  Download, FolderOpen,
 } from 'lucide-react';
 import { useAppStore } from '../store';
 import clsx from 'clsx';
@@ -178,6 +179,13 @@ export function ChatPane() {
   const [isLoading, setIsLoading] = useState(false);
   const [isAgentLoading, setIsAgentLoading] = useState(false);
   const [expandedSteps, setExpandedSteps] = useState<Record<number, boolean>>({});
+
+  // CSV export state
+  const [exportDialogOpen, setExportDialogOpen] = useState(false);
+  const [exportSql, setExportSql] = useState('');
+  const [exportPath, setExportPath] = useState('');
+  const [isExporting, setIsExporting] = useState(false);
+  const [exportResult, setExportResult] = useState<{ success: boolean; message: string } | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const scrollToBottom = () => {
@@ -315,6 +323,33 @@ export function ChatPane() {
     } catch (e) {
       console.error(e);
       alert("Failed to save");
+    }
+  };
+
+  const openExportDialog = (sql: string, suggestedPath?: string) => {
+    setExportSql(sql);
+    const defaultName = suggestedPath || `export_${new Date().toISOString().slice(0, 10)}.csv`;
+    setExportPath(defaultName);
+    setExportResult(null);
+    setExportDialogOpen(true);
+  };
+
+  const handleExportCsv = async () => {
+    setIsExporting(true);
+    setExportResult(null);
+    try {
+      const res = await fetch('/api/export_csv', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sql: exportSql, output_path: exportPath }),
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      setExportResult({ success: true, message: `${data.row_count.toLocaleString()} lignes exportées → ${data.path}` });
+    } catch (e: any) {
+      setExportResult({ success: false, message: e.message });
+    } finally {
+      setIsExporting(false);
     }
   };
 
@@ -580,6 +615,14 @@ export function ChatPane() {
                           Save
                         </button>
                         <button
+                          onClick={() => openExportDialog(msg.sql!)}
+                          className="flex items-center gap-1 text-xs bg-amber-500 hover:bg-amber-400 text-white px-2.5 py-1 rounded-md transition-colors"
+                          title="Exporter en CSV (séparateur pipe, max 1M lignes)"
+                        >
+                          <Download size={11} />
+                          Export CSV
+                        </button>
+                        <button
                           onClick={() => handleExecuteQuery(msg.sql!, chatHistory[i - 1]?.content || 'Chat Query')}
                           className="flex items-center gap-1 text-xs bg-emerald-500 hover:bg-emerald-400 text-white px-2.5 py-1 rounded-md transition-colors"
                         >
@@ -622,9 +665,11 @@ export function ChatPane() {
                               <span className="text-indigo-400 shrink-0 flex items-center gap-1">
                                 {step.type === 'search_knowledge'
                                   ? <BookOpen size={10} className="text-violet-400" />
-                                  : <Database size={10} />
+                                  : step.type === 'export_csv'
+                                    ? <Download size={10} className="text-amber-400" />
+                                    : <Database size={10} />
                                 }
-                                {step.type === 'search_knowledge' ? 'KB' : `${step.row_count} ligne${step.row_count !== 1 ? 's' : ''}`}
+                                {step.type === 'search_knowledge' ? 'KB' : step.type === 'export_csv' ? 'Export' : `${step.row_count} ligne${step.row_count !== 1 ? 's' : ''}`}
                               </span>
                               {open
                                 ? <ChevronDown size={12} className="text-indigo-400 shrink-0" />
@@ -643,6 +688,33 @@ export function ChatPane() {
                                       <p className="text-[10px] text-violet-700 font-mono italic">{step.search_query}</p>
                                     </div>
                                   </div>
+                                ) : step.type === 'export_csv' ? (
+                                  <div className="bg-amber-50 border border-amber-200 rounded-lg overflow-hidden">
+                                    <div className="px-2 py-1 bg-amber-100/60 border-b border-amber-200">
+                                      <span className="text-[10px] font-mono text-amber-700 flex items-center gap-1">
+                                        <Download size={9} /> Export CSV demandé
+                                      </span>
+                                    </div>
+                                    <div className="p-2 space-y-2">
+                                      <div>
+                                        <p className="text-[10px] font-semibold text-amber-700 mb-1">SQL d'export</p>
+                                        <pre className="text-[10px] font-mono text-slate-700 whitespace-pre-wrap bg-white border border-amber-100 rounded p-1.5 overflow-x-auto">
+                                          {step.sql}
+                                        </pre>
+                                      </div>
+                                      <div className="flex items-center gap-1.5">
+                                        <FolderOpen size={10} className="text-amber-600 shrink-0" />
+                                        <span className="text-[10px] text-amber-700 font-mono">{step.suggested_path}</span>
+                                      </div>
+                                      <button
+                                        onClick={() => openExportDialog(step.sql!, step.suggested_path)}
+                                        className="w-full flex items-center justify-center gap-1.5 bg-amber-500 hover:bg-amber-600 text-white text-[11px] font-medium py-1.5 rounded-lg transition-colors"
+                                      >
+                                        <Download size={10} />
+                                        Confirmer et exporter
+                                      </button>
+                                    </div>
+                                  </div>
                                 ) : (
                                   <div className="bg-slate-900 rounded-lg overflow-hidden">
                                     <div className="px-2 py-1 bg-slate-800/50 border-b border-slate-700">
@@ -653,10 +725,12 @@ export function ChatPane() {
                                     </pre>
                                   </div>
                                 )}
-                                <div className="bg-white border border-indigo-100 rounded-lg p-2">
-                                  <p className="text-[10px] font-semibold text-slate-500 mb-1">Résultat</p>
-                                  <pre className="text-[10px] text-slate-600 whitespace-pre-wrap">{step.result_summary}</pre>
-                                </div>
+                                {step.type !== 'export_csv' && (
+                                  <div className="bg-white border border-indigo-100 rounded-lg p-2">
+                                    <p className="text-[10px] font-semibold text-slate-500 mb-1">Résultat</p>
+                                    <pre className="text-[10px] text-slate-600 whitespace-pre-wrap">{step.result_summary}</pre>
+                                  </div>
+                                )}
                               </div>
                             )}
                           </div>
@@ -736,6 +810,68 @@ export function ChatPane() {
           {isAgentLoading ? 'Agent en cours…' : 'Analyser avec l\'Agent'}
         </button>
       </div>
+
+      {/* ------------------------------------------------------------------ */}
+      {/* CSV Export Dialog                                                    */}
+      {/* ------------------------------------------------------------------ */}
+      {exportDialogOpen && (
+        <div className="fixed inset-0 z-[350] flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden">
+            <div className="p-4 border-b border-slate-200 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Download size={18} className="text-amber-600" />
+                <h3 className="text-sm font-bold text-slate-800">Exporter en CSV</h3>
+              </div>
+              <button onClick={() => setExportDialogOpen(false)} className="text-slate-400 hover:text-slate-600 p-1.5 hover:bg-slate-100 rounded-md">
+                <X size={16} />
+              </button>
+            </div>
+            <div className="p-5 space-y-4">
+              <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-xs text-amber-700 space-y-1">
+                <p className="font-semibold">Format : CSV avec séparateur pipe ( | )</p>
+                <p>Limite : 1 000 000 lignes maximum</p>
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wide mb-1">
+                  <FolderOpen size={12} className="inline mr-1" />
+                  Répertoire / fichier de destination
+                </label>
+                <input
+                  type="text"
+                  value={exportPath}
+                  onChange={e => { setExportPath(e.target.value); setExportResult(null); }}
+                  placeholder="/home/user/mes_données/export.csv"
+                  className="w-full bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-sm font-mono focus:ring-2 focus:ring-amber-500/20 focus:border-amber-500 transition-all"
+                />
+                <p className="mt-1 text-xs text-slate-400">Chemin absolu sur le serveur (ex : /home/user/export.csv)</p>
+              </div>
+              {exportResult && (
+                <div className={clsx(
+                  "flex items-start gap-2 p-3 rounded-lg text-xs",
+                  exportResult.success ? "bg-emerald-50 text-emerald-700 border border-emerald-200" : "bg-red-50 text-red-700 border border-red-200"
+                )}>
+                  <CheckCircle2 size={14} className="shrink-0 mt-0.5" />
+                  <span>{exportResult.message}</span>
+                </div>
+              )}
+              <div className="flex justify-end gap-2 pt-1">
+                <button onClick={() => setExportDialogOpen(false)} className="px-4 py-2 text-sm text-slate-600 hover:bg-slate-100 rounded-lg transition-colors">
+                  {exportResult?.success ? 'Fermer' : 'Annuler'}
+                </button>
+                {!exportResult?.success && (
+                  <button
+                    onClick={handleExportCsv}
+                    disabled={isExporting || !exportPath.trim()}
+                    className="flex items-center gap-2 bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+                  >
+                    {isExporting ? <><Loader2 size={14} className="animate-spin" />Export en cours…</> : <><Download size={14} />Exporter</>}
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

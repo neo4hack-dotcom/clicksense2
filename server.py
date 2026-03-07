@@ -1636,10 +1636,11 @@ USER QUESTION:
 {user_question}
 
 INSTRUCTIONS:
-You have THREE possible actions:
+You have FOUR possible actions:
 1. Run a ClickHouse SQL query to fetch data → action "query"
 2. Search the knowledge base for business rules, definitions or context → action "search_knowledge"
-3. Produce the final answer when you have enough information → action "finish"
+3. Export data to a CSV file (pipe-separated) — ONLY if the user explicitly asks to export or save results → action "export_csv"
+4. Produce the final answer when you have enough information → action "finish"
 
 {"IMPORTANT: You have used all available steps — you MUST respond with action 'finish'." if len(steps_so_far) >= MAX_AGENT_STEPS else ""}
 
@@ -1657,6 +1658,14 @@ For a knowledge base search:
   "action": "search_knowledge",
   "reasoning": "Why you need to search the knowledge base and what concept you're looking for",
   "search_query": "the search terms or question to look up"
+}}
+
+For an export request (only when the user asks to save/export data):
+{{
+  "action": "export_csv",
+  "reasoning": "Why this export is needed",
+  "sql": "SELECT ... (the query whose results will be exported, include LIMIT 1000000)",
+  "suggested_path": "/home/user/export.csv"
 }}
 
 For the final answer:
@@ -1721,6 +1730,19 @@ No markdown fences. Only raw JSON."""
                     "sql": None,
                     "search_query": search_query,
                     "result_summary": f"Knowledge base results:\n{kb_summary}",
+                    "row_count": 0,
+                    "ok": True,
+                })
+            elif action == "export_csv" and iteration < MAX_AGENT_STEPS:
+                export_sql = decision.get("sql", "").strip()
+                suggested_path = decision.get("suggested_path", "/tmp/export.csv").strip()
+                steps.append({
+                    "step": iteration + 1,
+                    "type": "export_csv",
+                    "reasoning": reasoning,
+                    "sql": export_sql,
+                    "suggested_path": suggested_path,
+                    "result_summary": f"Export CSV demandé → {suggested_path}",
                     "row_count": 0,
                     "ok": True,
                 })
@@ -2387,6 +2409,77 @@ Return ONLY valid JSON with this exact structure:
 
     except Exception as exc:
         print(f"Data quality error: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+
+# ---------------------------------------------------------------------------
+# CSV Export
+# ---------------------------------------------------------------------------
+MAX_EXPORT_ROWS = 1_000_000
+
+
+@app.route("/api/export_csv", methods=["POST"])
+def export_csv():
+    """Export a ClickHouse query result to a pipe-separated CSV file.
+
+    Body parameters:
+      - sql  (required): the SELECT query to execute
+      - output_path (optional): absolute server-side path to write the file.
+        When provided the file is written locally and the path + row count are
+        returned. When absent the CSV content is sent as an HTTP download.
+
+    Row count is capped at MAX_EXPORT_ROWS (1 000 000).
+    """
+    import csv
+    import io as _io
+
+    data = request.get_json(silent=True) or {}
+    sql = (data.get("sql") or "").strip()
+    output_path = (data.get("output_path") or "").strip()
+
+    if not sql:
+        return jsonify({"error": "Aucune requête SQL fournie."}), 400
+
+    # Ensure the query has a LIMIT that does not exceed MAX_EXPORT_ROWS.
+    # We inject one when absent; when the user already has LIMIT we leave it
+    # so that their intentional cap is respected (it will still be capped
+    # client-side at MAX_EXPORT_ROWS rows after fetch).
+    if "LIMIT" not in sql.upper():
+        sql = f"{sql} LIMIT {MAX_EXPORT_ROWS}"
+
+    try:
+        client = get_clickhouse_client()
+        result = client.query(sql)
+        rows = _rows_to_dicts(result)
+        rows = rows[:MAX_EXPORT_ROWS]
+
+        if not rows:
+            return jsonify({"error": "La requête n'a retourné aucune donnée."}), 400
+
+        # Build pipe-separated CSV
+        output = _io.StringIO()
+        writer = csv.writer(output, delimiter="|", quoting=csv.QUOTE_MINIMAL)
+        writer.writerow(rows[0].keys())
+        for row in rows:
+            writer.writerow(row.values())
+        csv_content = output.getvalue()
+
+        if output_path:
+            parent_dir = os.path.dirname(output_path)
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
+            with open(output_path, "w", encoding="utf-8", newline="") as f:
+                f.write(csv_content)
+            return jsonify({"path": output_path, "row_count": len(rows)})
+        else:
+            from flask import Response
+            return Response(
+                csv_content,
+                mimetype="text/csv; charset=utf-8",
+                headers={"Content-Disposition": 'attachment; filename="export.csv"'},
+            )
+
+    except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
 

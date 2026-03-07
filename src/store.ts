@@ -64,10 +64,11 @@ interface AppState {
     is_agent?: boolean;
     agent_steps?: {
       step: number;
-      type?: 'query' | 'search_knowledge';
+      type?: 'query' | 'search_knowledge' | 'export_csv';
       reasoning: string;
       sql?: string;
       search_query?: string;
+      suggested_path?: string;
       result_summary: string;
       row_count: number;
       ok: boolean;
@@ -85,10 +86,11 @@ interface AppState {
     is_agent?: boolean;
     agent_steps?: {
       step: number;
-      type?: 'query' | 'search_knowledge';
+      type?: 'query' | 'search_knowledge' | 'export_csv';
       reasoning: string;
       sql?: string;
       search_query?: string;
+      suggested_path?: string;
       result_summary: string;
       row_count: number;
       ok: boolean;
