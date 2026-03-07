@@ -1481,11 +1481,17 @@ Do not include markdown formatting. Just the raw JSON.
 
     try:
         content = _call_llm(system_prompt, formatted_messages, temperature=0.3)
-        return jsonify(_parse_llm_json(content))
-
     except Exception as exc:
         print(f"Chat error: {exc}")
         return jsonify({"error": str(exc)}), 500
+
+    try:
+        return jsonify(_parse_llm_json(content))
+    except ValueError:
+        # The LLM replied with plain text (e.g. a conversational answer not
+        # requiring a SQL query). Return it as an explanation-only response so
+        # the frontend can display it without treating it as an error.
+        return jsonify({"explanation": content})
 
 
 # ---------------------------------------------------------------------------
