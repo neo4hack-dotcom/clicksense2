@@ -1554,21 +1554,64 @@ def agent_analysis():
     # Accumulate steps
     steps: list = []
 
+    def _search_knowledge_for_agent(query: str) -> str:
+        """Search the knowledge base (ES RAG) for context relevant to the query.
+
+        Falls back to full folder dump if ES is unavailable or not configured.
+        """
+        try:
+            query_embedding = _get_embedding(query)
+            host = rag_config.get("esHost", "http://localhost:9200").rstrip("/")
+            index = rag_config.get("esIndex", "clicksense_rag")
+            auth = None
+            if rag_config.get("esUsername"):
+                auth = (rag_config["esUsername"], rag_config.get("esPassword", ""))
+            top_k = int(rag_config.get("topK", 5))
+            knn_query = {
+                "knn": {
+                    "field": "embedding",
+                    "query_vector": query_embedding,
+                    "k": top_k,
+                    "num_candidates": top_k * 10,
+                },
+                "_source": ["title", "content"],
+            }
+            es_resp = http_requests.post(
+                f"{host}/{index}/_search",
+                auth=auth,
+                json=knn_query,
+                verify=False,
+                timeout=15,
+            )
+            if es_resp.ok:
+                hits = es_resp.json().get("hits", {}).get("hits", [])
+                if hits:
+                    parts = [
+                        f"[Source: {h['_source'].get('title', 'Unknown')} | score={round(h.get('_score', 0), 3)}]\n{h['_source'].get('content', '')}"
+                        for h in hits
+                    ]
+                    return "\n\n---\n\n".join(parts)
+        except Exception as exc:
+            print(f"[Agent] Knowledge search failed: {exc}")
+        # Fallback: static folder text
+        return knowledge_context or "No knowledge base content available."
+
     def _run_agent_step(steps_so_far: list) -> dict:
         """Ask the LLM for its next action given the accumulated context."""
         steps_context = ""
         for i, s in enumerate(steps_so_far, 1):
+            action_label = "SQL executed" if s.get("type") == "query" else "Knowledge search"
             steps_context += (
-                f"\n--- Step {i} ---\n"
+                f"\n--- Step {i} ({s.get('type', 'query')}) ---\n"
                 f"Reasoning: {s['reasoning']}\n"
-                f"SQL executed:\n{s['sql']}\n"
+                f"{action_label}:\n{s.get('sql') or s.get('search_query', '')}\n"
                 f"Result summary: {s['result_summary']}\n"
             )
 
         system_prompt = f"""You are an autonomous ClickHouse data analyst agent.
-Your goal is to answer the user's question by executing a sequence of targeted ClickHouse SQL queries.
-You may run up to {MAX_AGENT_STEPS} distinct queries in total. Each query must bring NEW information
-(no pure duplicate of a previous one). After gathering enough evidence you MUST produce a final answer.
+Your goal is to answer the user's question by executing a sequence of targeted actions.
+You may run up to {MAX_AGENT_STEPS} distinct actions in total. Each action must bring NEW information.
+After gathering enough evidence you MUST produce a final answer.
 
 DATABASE SCHEMA:
 {schema_str}
@@ -1578,7 +1621,7 @@ TABLE METADATA (functional descriptions):
 
 {mapping_note}
 
-KNOWLEDGE BASE:
+STATIC KNOWLEDGE BASE (always available):
 {knowledge_context}
 
 CLICKHOUSE INSTRUCTIONS:
@@ -1593,24 +1636,34 @@ USER QUESTION:
 {user_question}
 
 INSTRUCTIONS:
-If you need more data to answer thoroughly, respond with action "query".
-If you have gathered sufficient evidence to give a complete, detailed answer, respond with action "finish".
+You have THREE possible actions:
+1. Run a ClickHouse SQL query to fetch data → action "query"
+2. Search the knowledge base for business rules, definitions or context → action "search_knowledge"
+3. Produce the final answer when you have enough information → action "finish"
+
 {"IMPORTANT: You have used all available steps — you MUST respond with action 'finish'." if len(steps_so_far) >= MAX_AGENT_STEPS else ""}
 
-Respond ONLY with valid JSON in one of these two forms:
+Respond ONLY with valid JSON in one of these three forms:
 
-For a new query:
+For a SQL query:
 {{
   "action": "query",
   "reasoning": "Why this specific query is needed and what new insight it will provide",
   "sql": "SELECT ..."
 }}
 
+For a knowledge base search:
+{{
+  "action": "search_knowledge",
+  "reasoning": "Why you need to search the knowledge base and what concept you're looking for",
+  "search_query": "the search terms or question to look up"
+}}
+
 For the final answer:
 {{
   "action": "finish",
   "reasoning": "Why you have enough information to conclude",
-  "final_answer": "A detailed, structured answer for the user based on all query results"
+  "final_answer": "A detailed, structured answer for the user based on all gathered information"
 }}
 
 No markdown fences. Only raw JSON."""
@@ -1650,11 +1703,26 @@ No markdown fences. Only raw JSON."""
                 exec_result = _execute_and_summarise(sql)
                 steps.append({
                     "step": iteration + 1,
+                    "type": "query",
                     "reasoning": reasoning,
                     "sql": sql,
                     "result_summary": exec_result["summary"],
                     "row_count": exec_result["total_rows"],
                     "ok": exec_result["ok"],
+                })
+            elif action == "search_knowledge" and iteration < MAX_AGENT_STEPS:
+                search_query = decision.get("search_query", "").strip()
+                kb_result = _search_knowledge_for_agent(search_query)
+                kb_summary = kb_result[:1500] if len(kb_result) > 1500 else kb_result
+                steps.append({
+                    "step": iteration + 1,
+                    "type": "search_knowledge",
+                    "reasoning": reasoning,
+                    "sql": None,
+                    "search_query": search_query,
+                    "result_summary": f"Knowledge base results:\n{kb_summary}",
+                    "row_count": 0,
+                    "ok": True,
                 })
             else:
                 # action == "finish" or max steps reached
@@ -1663,15 +1731,18 @@ No markdown fences. Only raw JSON."""
 
         # If the loop exhausted all steps without a finish, ask for synthesis
         if final_answer is None:
+            step_lines = []
+            for s in steps:
+                if s.get("type") == "search_knowledge":
+                    step_lines.append(f"Step {s['step']} (knowledge search): {s['reasoning']}\nSearch: {s.get('search_query', '')}\nResult: {s['result_summary']}")
+                else:
+                    step_lines.append(f"Step {s['step']}: {s['reasoning']}\nSQL: {s.get('sql', '')}\nResult: {s['result_summary']}")
             synth_prompt = f"""Based on the following analysis steps, write a detailed final answer for the user.
 
 USER QUESTION: {user_question}
 
 STEPS AND RESULTS:
-""" + "\n".join(
-                f"Step {s['step']}: {s['reasoning']}\nSQL: {s['sql']}\nResult: {s['result_summary']}"
-                for s in steps
-            ) + "\n\nProvide a comprehensive, structured answer."
+""" + "\n\n".join(step_lines) + "\n\nProvide a comprehensive, structured answer."
             final_answer = _call_llm(synth_prompt, [{"role": "user", "content": "Synthesise the final answer."}], temperature=0.3)
 
         return jsonify({
@@ -2030,6 +2101,16 @@ def _dq_column_stats(
                 oc = int(r3.result_rows[0][0])
                 stats["outlier_count"] = oc
                 stats["outlier_pct"] = round(100 * oc / max(total - null_count, 1), 2)
+            # Outlier detection via Z-Score (|value - mean| > 3 * stddev)
+            if avg_val is not None and stddev_val and stddev_val > 0:
+                r4 = client.query(
+                    f"SELECT countIf(abs(`{safe_col}` - {avg_val}) > 3 * {stddev_val})"
+                    f" FROM {sub}"
+                    f" WHERE `{safe_col}` IS NOT NULL"
+                )
+                zoc = int(r4.result_rows[0][0])
+                stats["zscore_outlier_count"] = zoc
+                stats["zscore_outlier_pct"] = round(100 * zoc / max(total - null_count, 1), 2)
 
         elif is_string:
             r2 = client.query(
@@ -2118,6 +2199,8 @@ def analyze_data_quality():
     filter_val = data.get("filter_value")
     if filter_val is not None:
         filter_val = str(filter_val)
+    # Optional time series column for temporal/volume analysis
+    time_col = (data.get("time_column") or "").strip() or None
 
     if not table:
         return jsonify({"error": "Table name is required"}), 400
@@ -2152,12 +2235,71 @@ def analyze_data_quality():
             )
             column_stats.append(cs)
 
+        # ── Volume Consistency Analysis (Temporal) ────────────────────────────
+        volume_analysis = None
+        if time_col and _re.match(r"^\w+$", time_col):
+            safe_time_col = _re.sub(r"[^\w]", "", time_col)
+            try:
+                # Auto-detect granularity: use hourly if range < 7 days, else daily
+                range_r = client.query(
+                    f"SELECT min(`{safe_time_col}`), max(`{safe_time_col}`) FROM {safe_table}"
+                )
+                rr = range_r.result_rows[0]
+                min_ts, max_ts = rr[0], rr[1]
+                try:
+                    from datetime import timezone as _tz
+                    delta_days = (max_ts - min_ts).days if hasattr(max_ts, 'days') else 999
+                except Exception:
+                    delta_days = 999
+                granularity = "hour" if delta_days <= 7 else "day"
+                trunc_fn = "toStartOfHour" if granularity == "hour" else "toStartOfDay"
+
+                where_vol = where_clause if where_clause else ""
+                vol_r = client.query(
+                    f"SELECT {trunc_fn}(`{safe_time_col}`) AS period, count() AS cnt"
+                    f" FROM {safe_table}{where_vol}"
+                    f" WHERE `{safe_time_col}` IS NOT NULL"
+                    f" GROUP BY period ORDER BY period"
+                )
+                vol_rows = [{"period": str(row[0]), "count": int(row[1])} for row in vol_r.result_rows]
+
+                if vol_rows:
+                    counts = [r["count"] for r in vol_rows]
+                    vol_avg = sum(counts) / len(counts)
+                    vol_stddev = (sum((c - vol_avg) ** 2 for c in counts) / max(len(counts), 1)) ** 0.5
+                    vol_p25 = sorted(counts)[len(counts) // 4]
+                    vol_p75 = sorted(counts)[3 * len(counts) // 4]
+                    iqr_vol = vol_p75 - vol_p25
+                    low_threshold = max(1, vol_p25 - 1.5 * iqr_vol)
+                    anomaly_periods = [r for r in vol_rows if r["count"] < low_threshold]
+                    volume_analysis = {
+                        "time_column": time_col,
+                        "granularity": granularity,
+                        "periods": len(vol_rows),
+                        "avg_volume": round(vol_avg, 1),
+                        "stddev_volume": round(vol_stddev, 1),
+                        "min_volume": min(counts),
+                        "max_volume": max(counts),
+                        "p25_volume": vol_p25,
+                        "p75_volume": vol_p75,
+                        "low_volume_threshold": round(low_threshold, 1),
+                        "anomaly_count": len(anomaly_periods),
+                        "anomaly_periods": anomaly_periods[:20],
+                        "recent_periods": vol_rows[-10:],
+                    }
+            except Exception as ve:
+                volume_analysis = {"error": str(ve), "time_column": time_col}
+
         # ── LLM analysis ─────────────────────────────────────────────────────
         stats_json = json.dumps(column_stats, indent=2, default=str)
 
         filter_note = ""
         if filter_col and filter_val is not None:
             filter_note = f" (filtered to rows where `{filter_col}` {filter_op} '{filter_val}')"
+
+        volume_note = ""
+        if volume_analysis and "error" not in volume_analysis:
+            volume_note = f"\n\nVOLUME CONSISTENCY (by {volume_analysis['granularity']}):\n{json.dumps(volume_analysis, indent=2, default=str)}"
 
         system_prompt = """You are an expert data quality analyst specializing in database analytics and anomaly detection.
 Analyze the statistical profiles of the provided columns and identify all data quality issues.
@@ -2167,10 +2309,16 @@ Evaluate each column for:
 2. **Format anomalies**: Inconsistent patterns, unexpected length distributions, mixed formats
 3. **Content anomalies**: Impossible values, values outside expected business domain
 4. **Cardinality anomalies**: Suspiciously low distinct counts (near-constant column), or unexpectedly high cardinality
-5. **Distribution anomalies**: Extreme skew (use skewness_approx), statistical outliers (IQR method), zero inflation (zero_count), highly unbalanced categories
+5. **Distribution anomalies**: Extreme skew (use skewness_approx), statistical outliers (IQR method), Z-Score outliers (zscore_outlier_count/zscore_outlier_pct), zero inflation (zero_count), highly unbalanced categories
 6. **Temporal anomalies**: Future dates, epoch sentinel dates (1970-01-01, epoch_sentinel_count), implausible date ranges (pre_1900_count), weekend concentration (weekend_count)
 7. **String quality**: Whitespace padding (whitespace_padded_count), ALL-CAPS inconsistency (all_caps_count), numeric strings in text fields (numeric_string_count), unexpected email-like values (email_like_count)
 8. **Spread anomalies**: High coefficient of variation (coeff_variation > 1 indicates extreme spread), high skewness (|skewness_approx| > 2 indicates strong skew)
+9. **Volume/Temporal consistency** (if provided): Periods with abnormally low record counts may indicate pipeline issues or data loss
+
+For outlier severity guidance:
+- IQR outliers > 10% of rows = warning, > 25% = critical
+- Z-Score outliers (3σ) > 5% = warning, > 15% = critical
+- If both IQR and Z-Score detect outliers, the column likely has heavy tails
 
 Return ONLY valid JSON with this exact structure:
 {
@@ -2183,7 +2331,7 @@ Return ONLY valid JSON with this exact structure:
       "issues": [
         {
           "severity": "critical|warning|info",
-          "category": "nulls|format|content|cardinality|distribution|temporal|string_quality|spread",
+          "category": "nulls|format|content|cardinality|distribution|temporal|string_quality|spread|volume",
           "title": "<short issue title>",
           "description": "<detailed description with specific numbers>",
           "affected_rows": <number or null>,
@@ -2198,7 +2346,7 @@ Return ONLY valid JSON with this exact structure:
 
         user_msg = (
             f"Analyze data quality for table `{table}` (sample of {sample_size:,} rows{filter_note}).\n\n"
-            f"Column Statistics:\n{stats_json}\n\n"
+            f"Column Statistics:\n{stats_json}{volume_note}\n\n"
             "Provide a thorough analysis identifying all data quality issues with specific numbers."
         )
 
@@ -2219,6 +2367,7 @@ Return ONLY valid JSON with this exact structure:
             "sample_size": sample_size,
             "column_stats": column_stats,
             "analysis": analysis,
+            "volume_analysis": volume_analysis,
         })
 
     except Exception as exc:

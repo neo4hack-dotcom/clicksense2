@@ -3,10 +3,166 @@ import {
   Send, Bot, Loader2, Sparkles, Play, Save, History, Trash2,
   Maximize2, Minimize2, Minus, CheckSquare, Filter, X,
   Brain, ChevronDown, ChevronRight, CheckCircle2, XCircle, Database,
+  AlertTriangle, Info, Lightbulb, TrendingUp, TrendingDown, BarChart2, BookOpen,
 } from 'lucide-react';
 import { useAppStore } from '../store';
 import clsx from 'clsx';
 import { motion, AnimatePresence } from 'motion/react';
+
+// ── Markdown renderer ──────────────────────────────────────────────────────
+
+function renderInline(text: string, isUser = false) {
+  const parts: any[] = [];
+  let remaining = text;
+  let key = 0;
+
+  while (remaining.length > 0) {
+    const boldMatch = remaining.match(/^([\s\S]*?)(\*\*|__)(.+?)\2/);
+    const italicMatch = remaining.match(/^([\s\S]*?)(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/);
+    const codeMatch = remaining.match(/^([\s\S]*?)`([^`]+)`/);
+
+    const bPos = boldMatch ? (boldMatch[1] || '').length : Infinity;
+    const iPos = italicMatch ? (italicMatch[1] || '').length : Infinity;
+    const cPos = codeMatch ? (codeMatch[1] || '').length : Infinity;
+    const first = Math.min(bPos, iPos, cPos);
+
+    if (first === Infinity) {
+      parts.push(<span key={key++}>{remaining}</span>);
+      break;
+    }
+
+    if (boldMatch && first === bPos) {
+      if (boldMatch[1]) parts.push(<span key={key++}>{boldMatch[1]}</span>);
+      parts.push(<strong key={key++} className={isUser ? 'font-bold text-white' : 'font-bold text-slate-900'}>{boldMatch[3]}</strong>);
+      remaining = remaining.slice(boldMatch[0].length);
+    } else if (italicMatch && first === iPos) {
+      if (italicMatch[1]) parts.push(<span key={key++}>{italicMatch[1]}</span>);
+      parts.push(<em key={key++} className="italic">{italicMatch[2]}</em>);
+      remaining = remaining.slice(italicMatch[0].length);
+    } else if (codeMatch && first === cPos) {
+      if (codeMatch[1]) parts.push(<span key={key++}>{codeMatch[1]}</span>);
+      parts.push(
+        <code key={key++} className={clsx(
+          'font-mono text-xs px-1.5 py-0.5 rounded mx-0.5 border',
+          isUser ? 'bg-blue-600/40 text-blue-100 border-blue-400/30' : 'bg-slate-100 text-slate-700 border-slate-200'
+        )}>{codeMatch[2]}</code>
+      );
+      remaining = remaining.slice(codeMatch[0].length);
+    } else {
+      parts.push(<span key={key++}>{remaining[0]}</span>);
+      remaining = remaining.slice(1);
+    }
+  }
+  return parts;
+}
+
+function MarkdownContent({ text, isUser = false }: { text: string; isUser?: boolean }) {
+  if (!text) return null;
+
+  const lines = text.split('\n');
+  const elements: any[] = [];
+  let listBuffer: { text: string; ordered: boolean }[] = [];
+  let listOrdered = false;
+  let key = 0;
+
+  const flushList = () => {
+    if (listBuffer.length === 0) return;
+    const isOl = listOrdered;
+    const items = [...listBuffer];
+    listBuffer = [];
+    elements.push(
+      <div key={key++} className="my-1">
+        {items.map((item, i) => (
+          <div key={i} className="flex items-start gap-2 text-sm leading-relaxed py-0.5">
+            {isOl
+              ? <span className={clsx('shrink-0 text-xs font-bold mt-0.5 min-w-[1.2rem]', isUser ? 'text-blue-200' : 'text-slate-400')}>{i + 1}.</span>
+              : <span className={clsx('shrink-0 mt-2 w-1.5 h-1.5 rounded-full', isUser ? 'bg-blue-200' : 'bg-slate-400')} />
+            }
+            <span>{renderInline(item.text, isUser)}</span>
+          </div>
+        ))}
+      </div>
+    );
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // Heading ### / ## / #
+    const headingMatch = line.match(/^(#{1,3})\s+(.+)/);
+    if (headingMatch) {
+      flushList();
+      const level = headingMatch[1].length;
+      const cls = level === 1
+        ? clsx('text-base font-bold mt-2.5 mb-1', isUser ? 'text-white' : 'text-slate-900')
+        : level === 2
+          ? clsx('text-sm font-bold mt-2 mb-0.5', isUser ? 'text-blue-100 border-b border-blue-400/30 pb-0.5' : 'text-slate-800 border-b border-slate-200 pb-0.5')
+          : clsx('text-xs font-bold uppercase tracking-wide mt-1.5', isUser ? 'text-blue-200' : 'text-slate-600');
+      elements.push(<p key={key++} className={cls}>{renderInline(headingMatch[2], isUser)}</p>);
+      continue;
+    }
+
+    // Horizontal rule
+    if (/^-{3,}$/.test(line.trim()) || /^\*{3,}$/.test(line.trim())) {
+      flushList();
+      elements.push(<hr key={key++} className={clsx('my-2', isUser ? 'border-blue-400/30' : 'border-slate-200')} />);
+      continue;
+    }
+
+    // Blockquote > text
+    const bqMatch = line.match(/^>\s*(.*)/);
+    if (bqMatch) {
+      flushList();
+      elements.push(
+        <div key={key++} className={clsx(
+          'border-l-2 pl-3 my-1 text-sm italic',
+          isUser ? 'border-blue-300/60 text-blue-100' : 'border-slate-300 text-slate-500'
+        )}>
+          {renderInline(bqMatch[1], isUser)}
+        </div>
+      );
+      continue;
+    }
+
+    // Unordered list: - * •
+    const ulMatch = line.match(/^[\s]*[-*•]\s+(.+)/);
+    if (ulMatch) {
+      if (listBuffer.length > 0 && listOrdered) flushList();
+      listOrdered = false;
+      listBuffer.push({ text: ulMatch[1], ordered: false });
+      continue;
+    }
+
+    // Ordered list: 1. 2. etc.
+    const olMatch = line.match(/^[\s]*\d+[.)]\s+(.+)/);
+    if (olMatch) {
+      if (listBuffer.length > 0 && !listOrdered) flushList();
+      listOrdered = true;
+      listBuffer.push({ text: olMatch[1], ordered: true });
+      continue;
+    }
+
+    // Empty line
+    if (line.trim() === '') {
+      flushList();
+      if (i < lines.length - 1 && lines[i + 1]?.trim() !== '') {
+        elements.push(<div key={key++} className="h-1" />);
+      }
+      continue;
+    }
+
+    // Regular paragraph
+    flushList();
+    elements.push(
+      <p key={key++} className={clsx('text-sm leading-relaxed', isUser ? 'text-white' : 'text-slate-800')}>
+        {renderInline(line, isUser)}
+      </p>
+    );
+  }
+
+  flushList();
+  return <div className="space-y-0.5">{elements}</div>;
+}
 
 export function ChatPane() {
   const {
@@ -387,7 +543,7 @@ export function ChatPane() {
                     )}
                   </div>
                 )}
-                <p className="text-sm leading-relaxed whitespace-pre-wrap">{msg.content}</p>
+                <MarkdownContent text={msg.content} isUser={msg.role === 'user'} />
 
                 {/* Clarification options */}
                 {msg.needs_clarification && msg.options && msg.options.length > 0 && (
@@ -464,8 +620,11 @@ export function ChatPane() {
                               <span className="font-medium text-indigo-800">Étape {step.step}</span>
                               <span className="text-indigo-500 truncate flex-1">{step.reasoning}</span>
                               <span className="text-indigo-400 shrink-0 flex items-center gap-1">
-                                <Database size={10} />
-                                {step.row_count} ligne{step.row_count !== 1 ? 's' : ''}
+                                {step.type === 'search_knowledge'
+                                  ? <BookOpen size={10} className="text-violet-400" />
+                                  : <Database size={10} />
+                                }
+                                {step.type === 'search_knowledge' ? 'KB' : `${step.row_count} ligne${step.row_count !== 1 ? 's' : ''}`}
                               </span>
                               {open
                                 ? <ChevronDown size={12} className="text-indigo-400 shrink-0" />
@@ -474,14 +633,26 @@ export function ChatPane() {
                             </button>
                             {open && (
                               <div className="px-3 pb-3 space-y-2">
-                                <div className="bg-slate-900 rounded-lg overflow-hidden">
-                                  <div className="px-2 py-1 bg-slate-800/50 border-b border-slate-700">
-                                    <span className="text-[10px] font-mono text-slate-400">SQL exécuté</span>
+                                {step.type === 'search_knowledge' ? (
+                                  <div className="bg-violet-50 border border-violet-200 rounded-lg overflow-hidden">
+                                    <div className="px-2 py-1 bg-violet-100/60 border-b border-violet-200">
+                                      <span className="text-[10px] font-mono text-violet-600">Recherche knowledge base</span>
+                                    </div>
+                                    <div className="p-2">
+                                      <p className="text-[10px] font-semibold text-violet-600 mb-1">Requête</p>
+                                      <p className="text-[10px] text-violet-700 font-mono italic">{step.search_query}</p>
+                                    </div>
                                   </div>
-                                  <pre className="p-2 text-[10px] font-mono text-emerald-400 overflow-x-auto whitespace-pre-wrap">
-                                    {step.sql}
-                                  </pre>
-                                </div>
+                                ) : (
+                                  <div className="bg-slate-900 rounded-lg overflow-hidden">
+                                    <div className="px-2 py-1 bg-slate-800/50 border-b border-slate-700">
+                                      <span className="text-[10px] font-mono text-slate-400">SQL exécuté</span>
+                                    </div>
+                                    <pre className="p-2 text-[10px] font-mono text-emerald-400 overflow-x-auto whitespace-pre-wrap">
+                                      {step.sql}
+                                    </pre>
+                                  </div>
+                                )}
                                 <div className="bg-white border border-indigo-100 rounded-lg p-2">
                                   <p className="text-[10px] font-semibold text-slate-500 mb-1">Résultat</p>
                                   <pre className="text-[10px] text-slate-600 whitespace-pre-wrap">{step.result_summary}</pre>

@@ -2,7 +2,8 @@ import { useState } from 'react';
 import {
   ShieldCheck, ChevronDown, ChevronRight, AlertTriangle,
   Info, AlertCircle, Loader2, BarChart3, CheckCircle2,
-  Search, X, RefreshCw, Table2, Filter, FileDown
+  Search, X, RefreshCw, Table2, Filter, FileDown,
+  TrendingDown, TrendingUp, Clock, Activity, Calendar,
 } from 'lucide-react';
 import { useAppStore } from '../store';
 import { motion, AnimatePresence } from 'motion/react';
@@ -52,6 +53,8 @@ interface ColumnStat {
   p75?: number;
   outlier_count?: number;
   outlier_pct?: number;
+  zscore_outlier_count?: number;
+  zscore_outlier_pct?: number;
   negative_count?: number;
   zero_count?: number;
   coeff_variation?: number;
@@ -75,11 +78,29 @@ interface ColumnStat {
   query_error?: string;
 }
 
+interface VolumeAnalysis {
+  time_column: string;
+  granularity: 'hour' | 'day';
+  periods: number;
+  avg_volume: number;
+  stddev_volume: number;
+  min_volume: number;
+  max_volume: number;
+  p25_volume: number;
+  p75_volume: number;
+  low_volume_threshold: number;
+  anomaly_count: number;
+  anomaly_periods: { period: string; count: number }[];
+  recent_periods: { period: string; count: number }[];
+  error?: string;
+}
+
 interface DQResult {
   table: string;
   sample_size: number;
   column_stats: ColumnStat[];
   analysis: DQAnalysis;
+  volume_analysis?: VolumeAnalysis | null;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -145,7 +166,8 @@ function ColumnStatCard({ stat }: { stat: ColumnStat }) {
             <StatPill label="Median" value={stat.p50 !== undefined ? Number(stat.p50).toFixed(2) : undefined} />
             <StatPill label="Zeros" value={stat.zero_count} accent={(stat.zero_count ?? 0) > 0} />
             <StatPill label="Negatives" value={stat.negative_count} accent={(stat.negative_count ?? 0) > 0} />
-            <StatPill label="Outliers" value={stat.outlier_count !== undefined ? `${stat.outlier_count} (${stat.outlier_pct}%)` : undefined} accent={(stat.outlier_pct ?? 0) > 5} />
+            <StatPill label="Outliers IQR" value={stat.outlier_count !== undefined ? `${stat.outlier_count} (${stat.outlier_pct}%)` : undefined} accent={(stat.outlier_pct ?? 0) > 5} />
+            <StatPill label="Outliers Z-Score" value={stat.zscore_outlier_count !== undefined ? `${stat.zscore_outlier_count} (${stat.zscore_outlier_pct}%)` : undefined} accent={(stat.zscore_outlier_pct ?? 0) > 5} />
             <StatPill label="CV" value={stat.coeff_variation !== undefined ? stat.coeff_variation.toFixed(2) : undefined} accent={(stat.coeff_variation ?? 0) > 1} />
             <StatPill label="Skewness" value={stat.skewness_approx !== undefined ? stat.skewness_approx.toFixed(2) : undefined} accent={Math.abs(stat.skewness_approx ?? 0) > 2} />
           </>
@@ -197,6 +219,7 @@ export function DataQualityPane() {
   const [result, setResult] = useState<DQResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [expandedColumns, setExpandedColumns] = useState<Set<string>>(new Set());
+  const [timeColumn, setTimeColumn] = useState<string>('');
 
   // Row filter state
   const [filterEnabled, setFilterEnabled] = useState(false);
@@ -245,6 +268,9 @@ export function DataQualityPane() {
       body.filter_column = filterColumn;
       body.filter_operator = filterOperator;
       body.filter_value = filterValue;
+    }
+    if (timeColumn) {
+      body.time_column = timeColumn;
     }
 
     try {
@@ -309,7 +335,8 @@ export function DataQualityPane() {
       if (stat.zero_count != null && stat.zero_count > 0) statPills.push(`Zeros: ${stat.zero_count}`);
       if (stat.skewness_approx != null) statPills.push(`Skewness: ${stat.skewness_approx.toFixed(2)}`);
       if (stat.coeff_variation != null) statPills.push(`CV: ${stat.coeff_variation.toFixed(2)}`);
-      if (stat.outlier_count != null) statPills.push(`Outliers: ${stat.outlier_count} (${stat.outlier_pct}%)`);
+      if (stat.outlier_count != null) statPills.push(`Outliers IQR: ${stat.outlier_count} (${stat.outlier_pct}%)`);
+      if (stat.zscore_outlier_count != null) statPills.push(`Outliers Z-Score: ${stat.zscore_outlier_count} (${stat.zscore_outlier_pct}%)`);
       if (stat.empty_pct != null) statPills.push(`Empty: ${stat.empty_pct}%`);
       if (stat.avg_length != null) statPills.push(`Avg len: ${stat.avg_length}`);
       if (stat.sentinel_count != null && stat.sentinel_count > 0) statPills.push(`Sentinels: ${stat.sentinel_count}`);
@@ -425,7 +452,7 @@ export function DataQualityPane() {
                 filteredTables.map(t => (
                   <button
                     key={t}
-                    onClick={() => { setSelectedTable(t); setSelectedColumns([]); setResult(null); setFilterColumn(''); setFilterValue(''); }}
+                    onClick={() => { setSelectedTable(t); setSelectedColumns([]); setResult(null); setFilterColumn(''); setFilterValue(''); setTimeColumn(''); }}
                     className={clsx(
                       'w-full text-left flex items-center gap-2 px-3 py-2 text-xs transition-colors',
                       selectedTable === t
@@ -562,6 +589,52 @@ export function DataQualityPane() {
               )}
             </div>
           )}
+
+          {/* Time Series Column (optional) */}
+          {selectedTable && (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <label className="text-xs font-semibold text-slate-600 uppercase tracking-wide flex items-center gap-1.5">
+                  <Calendar size={11} />
+                  Colonne Temporelle
+                  <span className="text-[10px] font-normal text-slate-400 normal-case">(optionnelle)</span>
+                </label>
+                {timeColumn && (
+                  <button
+                    onClick={() => setTimeColumn('')}
+                    className="text-xs text-slate-400 hover:text-slate-600 flex items-center gap-1"
+                  >
+                    <X size={11} /> Clear
+                  </button>
+                )}
+              </div>
+              <select
+                value={timeColumn}
+                onChange={e => setTimeColumn(e.target.value)}
+                className="w-full text-xs bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 focus:ring-2 focus:ring-violet-500/20 focus:border-violet-500 transition-all font-mono"
+              >
+                <option value="">— aucune (pas d'analyse temporelle) —</option>
+                {tableColumns
+                  .filter(col => ['DATE', 'DATETIME', 'TIMESTAMP'].some(t => col.type.toUpperCase().includes(t)))
+                  .map(col => (
+                    <option key={col.name} value={col.name}>{col.name} ({col.type})</option>
+                  ))
+                }
+                {tableColumns
+                  .filter(col => !['DATE', 'DATETIME', 'TIMESTAMP'].some(t => col.type.toUpperCase().includes(t)))
+                  .map(col => (
+                    <option key={col.name} value={col.name} className="text-slate-400">{col.name} ({col.type})</option>
+                  ))
+                }
+              </select>
+              {timeColumn && (
+                <p className="text-[10px] text-teal-700 bg-teal-50 border border-teal-200 rounded-lg px-2 py-1 flex items-center gap-1">
+                  <Activity size={9} />
+                  Analyse de cohérence volumétrique par heure / jour activée.
+                </p>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Analyze button */}
@@ -600,11 +673,12 @@ export function DataQualityPane() {
                 The LLM will detect format anomalies, outliers, null issues, cardinality problems and more.
               </p>
             </div>
-            <div className="grid grid-cols-3 gap-3 max-w-lg text-left mt-2">
+            <div className="grid grid-cols-2 gap-3 max-w-lg text-left mt-2">
               {[
                 { icon: AlertCircle, color: 'text-red-500 bg-red-50', label: 'Format & Content', desc: 'Invalid emails, wrong patterns, impossible values' },
                 { icon: AlertTriangle, color: 'text-amber-500 bg-amber-50', label: 'Nulls & Sentinels', desc: 'High null rates, "N/A", -1, empty string abuse' },
-                { icon: BarChart3, color: 'text-blue-500 bg-blue-50', label: 'Distributions', desc: 'Outliers (IQR), skew, cardinality anomalies' },
+                { icon: BarChart3, color: 'text-blue-500 bg-blue-50', label: 'Outliers IQR + Z-Score', desc: 'Distribution outliers via IQR and 3σ Z-Score methods' },
+                { icon: Activity, color: 'text-teal-500 bg-teal-50', label: 'Volume Consistency', desc: 'Detect pipeline gaps and volume drops by hour/day' },
               ].map(({ icon: Icon, color, label, desc }) => (
                 <div key={label} className="bg-white rounded-xl p-3 border border-slate-200 text-xs space-y-1.5">
                   <div className={clsx('w-8 h-8 rounded-lg flex items-center justify-center', color)}>
@@ -720,6 +794,123 @@ export function DataQualityPane() {
                     </li>
                   ))}
                 </ul>
+              </div>
+            )}
+
+            {/* Volume Consistency (temporal) */}
+            {result.volume_analysis && !result.volume_analysis.error && (
+              <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+                <div className="p-4 border-b border-slate-100">
+                  <div className="flex items-center gap-2 mb-1">
+                    <div className="bg-teal-100 p-1.5 rounded-lg text-teal-600">
+                      <Activity size={15} />
+                    </div>
+                    <div>
+                      <h4 className="text-sm font-bold text-slate-800">Cohérence Volumétrique</h4>
+                      <p className="text-xs text-slate-500">
+                        Volume par {result.volume_analysis.granularity} sur <span className="font-mono">{result.volume_analysis.time_column}</span>
+                      </p>
+                    </div>
+                    {result.volume_analysis.anomaly_count > 0 && (
+                      <span className="ml-auto flex items-center gap-1 text-xs font-semibold text-amber-700 bg-amber-50 border border-amber-200 px-2.5 py-1 rounded-full">
+                        <AlertTriangle size={11} />
+                        {result.volume_analysis.anomaly_count} période{result.volume_analysis.anomaly_count > 1 ? 's' : ''} anormale{result.volume_analysis.anomaly_count > 1 ? 's' : ''}
+                      </span>
+                    )}
+                    {result.volume_analysis.anomaly_count === 0 && (
+                      <span className="ml-auto flex items-center gap-1 text-xs font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded-full">
+                        <CheckCircle2 size={11} />
+                        Volume stable
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <div className="p-4 space-y-4">
+                  {/* Stats summary */}
+                  <div className="grid grid-cols-4 gap-3">
+                    {[
+                      { label: 'Moy. / période', value: result.volume_analysis.avg_volume.toLocaleString() },
+                      { label: 'Écart-type', value: result.volume_analysis.stddev_volume.toLocaleString() },
+                      { label: 'Min', value: result.volume_analysis.min_volume.toLocaleString(), accent: true },
+                      { label: 'Max', value: result.volume_analysis.max_volume.toLocaleString() },
+                    ].map(({ label, value, accent }) => (
+                      <div key={label} className={clsx(
+                        'rounded-xl px-3 py-2 text-center',
+                        accent && result.volume_analysis!.min_volume < result.volume_analysis!.low_volume_threshold
+                          ? 'bg-red-50 border border-red-200'
+                          : 'bg-slate-50'
+                      )}>
+                        <p className="text-[10px] text-slate-500">{label}</p>
+                        <p className={clsx(
+                          'text-sm font-bold',
+                          accent && result.volume_analysis!.min_volume < result.volume_analysis!.low_volume_threshold
+                            ? 'text-red-600'
+                            : 'text-slate-800'
+                        )}>{value}</p>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Anomaly periods */}
+                  {result.volume_analysis.anomaly_count > 0 && (
+                    <div>
+                      <p className="text-xs font-semibold text-amber-700 mb-2 flex items-center gap-1.5">
+                        <TrendingDown size={12} />
+                        Périodes sous le seuil ({result.volume_analysis.low_volume_threshold.toLocaleString()} entrées)
+                      </p>
+                      <div className="flex flex-wrap gap-1.5">
+                        {result.volume_analysis.anomaly_periods.map((p, i) => (
+                          <span key={i} className="inline-flex items-center gap-1.5 bg-amber-50 border border-amber-200 rounded-lg px-2 py-1 text-xs font-mono text-amber-800">
+                            <TrendingDown size={9} className="text-amber-600" />
+                            {p.period} — {p.count.toLocaleString()}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Recent periods */}
+                  <div>
+                    <p className="text-xs font-semibold text-slate-500 mb-2 flex items-center gap-1.5">
+                      <Clock size={11} />
+                      Périodes récentes
+                    </p>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-xs">
+                        <thead>
+                          <tr className="border-b border-slate-100">
+                            <th className="text-left py-1.5 px-2 text-slate-500 font-semibold">Période</th>
+                            <th className="text-right py-1.5 px-2 text-slate-500 font-semibold">Volume</th>
+                            <th className="py-1.5 px-2 w-24"></th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {result.volume_analysis.recent_periods.map((p, i) => {
+                            const isAnomaly = p.count < result.volume_analysis!.low_volume_threshold;
+                            const pct = Math.min(100, Math.round(100 * p.count / result.volume_analysis!.avg_volume));
+                            return (
+                              <tr key={i} className={clsx('border-b border-slate-50', isAnomaly && 'bg-amber-50/60')}>
+                                <td className="py-1 px-2 font-mono text-slate-700">{p.period}</td>
+                                <td className={clsx('py-1 px-2 text-right font-semibold', isAnomaly ? 'text-amber-700' : 'text-slate-700')}>
+                                  {p.count.toLocaleString()}
+                                  {isAnomaly && <TrendingDown size={9} className="inline ml-1 text-amber-600" />}
+                                </td>
+                                <td className="py-1 px-2">
+                                  <div className="w-full bg-slate-100 rounded-full h-1.5">
+                                    <div
+                                      className={clsx('h-1.5 rounded-full', isAnomaly ? 'bg-amber-400' : 'bg-teal-400')}
+                                      style={{ width: `${pct}%` }}
+                                    />
+                                  </div>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
               </div>
             )}
 

@@ -64,8 +64,10 @@ interface AppState {
     is_agent?: boolean;
     agent_steps?: {
       step: number;
+      type?: 'query' | 'search_knowledge';
       reasoning: string;
-      sql: string;
+      sql?: string;
+      search_query?: string;
       result_summary: string;
       row_count: number;
       ok: boolean;
@@ -83,8 +85,10 @@ interface AppState {
     is_agent?: boolean;
     agent_steps?: {
       step: number;
+      type?: 'query' | 'search_knowledge';
       reasoning: string;
-      sql: string;
+      sql?: string;
+      search_query?: string;
       result_summary: string;
       row_count: number;
       ok: boolean;
