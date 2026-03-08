@@ -1,9 +1,9 @@
 import { useState, useEffect, useRef } from 'react';
-import { Save, Database, Cpu, CheckCircle2, RefreshCw, Search, AlertCircle, Layers, Download, Upload } from 'lucide-react';
+import { Save, Database, Cpu, CheckCircle2, RefreshCw, Search, AlertCircle, Layers, Download, Upload, Brain } from 'lucide-react';
 import { useAppStore } from '../store';
 
 export function SettingsPane() {
-  const { ragConfig, setRagConfig } = useAppStore();
+  const { ragConfig, setRagConfig, agentMaxSteps, setAgentMaxSteps } = useAppStore();
 
   const [config, setConfig] = useState({
     clickhouse: { host: '', username: '', password: '', database: '' },
@@ -352,6 +352,33 @@ export function SettingsPane() {
                 <RefreshCw size={16} className={isLoadingModels ? "animate-spin" : ""} /> Refresh
               </button>
             </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Agent Settings */}
+      <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+        <div className="p-6 border-b border-slate-100 flex items-center gap-3">
+          <div className="bg-indigo-100 p-2 rounded-lg text-indigo-600"><Brain size={20} /></div>
+          <div>
+            <h3 className="text-lg font-semibold text-slate-800">Agent Settings</h3>
+            <p className="text-xs text-slate-500 mt-0.5">Configure the behavior of the AI analysis agent</p>
+          </div>
+        </div>
+        <div className="p-6">
+          <div className="space-y-2 max-w-xs">
+            <label className={labelClass}>Maximum steps per agent run</label>
+            <input
+              type="number"
+              min={1}
+              max={50}
+              value={agentMaxSteps}
+              onChange={e => setAgentMaxSteps(Math.max(1, Math.min(50, Number(e.target.value))))}
+              className={inputClass}
+            />
+            <p className="text-xs text-slate-400">
+              Number of query iterations the agent can perform before being forced to conclude (default: 10).
+            </p>
           </div>
         </div>
       </div>

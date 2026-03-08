@@ -122,6 +122,9 @@ interface AppState {
   ragHistory: RagMessage[];
   addRagMessage: (msg: RagMessage) => void;
   clearRagHistory: () => void;
+
+  agentMaxSteps: number;
+  setAgentMaxSteps: (steps: number) => void;
 }
 
 export const useAppStore = create<AppState>((set) => ({
@@ -179,4 +182,7 @@ export const useAppStore = create<AppState>((set) => ({
   ragHistory: [],
   addRagMessage: (msg) => set((state) => ({ ragHistory: [...state.ragHistory, msg] })),
   clearRagHistory: () => set({ ragHistory: [] }),
+
+  agentMaxSteps: 10,
+  setAgentMaxSteps: (agentMaxSteps) => set({ agentMaxSteps }),
 }));

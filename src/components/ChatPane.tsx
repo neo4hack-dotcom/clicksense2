@@ -171,6 +171,7 @@ export function ChatPane() {
     schema, setQueryResult, queryHistory, setQueryHistory,
     tableMetadata, chatPaneSize, setChatPaneSize,
     tableMappings, selectedTableMappings, setSelectedTableMappings,
+    agentMaxSteps,
   } = useAppStore();
 
   const [filterOpen, setFilterOpen] = useState(false);
@@ -266,6 +267,7 @@ export function ChatPane() {
           schema,
           tableMetadata,
           tableMappingFilter: selectedTableMappings,
+          maxSteps: agentMaxSteps,
         }),
       });
 
@@ -765,7 +767,7 @@ export function ChatPane() {
                 <span className="text-xs font-medium text-indigo-700">Agent en cours d'analyse…</span>
               </div>
               <p className="text-[11px] text-indigo-500">
-                L'agent mène des requêtes itératives sur vos données ClickHouse (jusqu'à 10 étapes).
+                L'agent mène des requêtes itératives sur vos données ClickHouse (jusqu'à {agentMaxSteps} étapes).
               </p>
             </div>
           </div>
@@ -801,7 +803,7 @@ export function ChatPane() {
             "bg-indigo-600 hover:bg-indigo-700 text-white border-indigo-600",
             "disabled:opacity-40 disabled:cursor-not-allowed"
           )}
-          title="Analyse approfondie multi-étapes par l'agent IA (jusqu'à 10 requêtes)"
+          title={`Analyse approfondie multi-étapes par l'agent IA (jusqu'à ${agentMaxSteps} requêtes)`}
         >
           {isAgentLoading
             ? <Loader2 size={15} className="animate-spin" />

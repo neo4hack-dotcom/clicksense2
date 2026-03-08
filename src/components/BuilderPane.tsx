@@ -1742,31 +1742,31 @@ export function BuilderPane() {
               )}>
                 <div className="p-4 border-b border-slate-100 flex items-center gap-2 bg-white shrink-0 overflow-x-auto">
                   <h3 className="text-sm font-semibold text-slate-800 shrink-0">Results</h3>
+                  <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg shrink-0">
+                    {[
+                      { id: 'table',  icon: Table,       title: 'Table' },
+                      { id: 'matrix', icon: LayoutGrid,   title: 'Matrix / Pivot' },
+                      { id: 'bar',    icon: BarChart2,    title: 'Bar Chart' },
+                      { id: 'line',   icon: LineChart,    title: 'Line Chart' },
+                      { id: 'area',   icon: Activity,     title: 'Area Chart' },
+                      { id: 'pie',    icon: PieChart,     title: 'Pie Chart' },
+                      { id: 'scatter',icon: ScatterChart, title: 'Scatter Plot' },
+                      { id: 'radar',  icon: Grid3X3,      title: 'Radar Chart' },
+                    ].map((v) => (
+                      <button
+                        key={v.id}
+                        onClick={() => setVisualType(v.id as VisualType)}
+                        title={v.title}
+                        className={clsx(
+                          "p-1.5 rounded-md transition-all",
+                          visualType === v.id ? "bg-white shadow-sm text-emerald-600" : "text-slate-500 hover:text-slate-700"
+                        )}
+                      >
+                        <v.icon size={16} />
+                      </button>
+                    ))}
+                  </div>
                   <div className="flex items-center gap-2 ml-auto shrink-0">
-                    <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg">
-                      {[
-                        { id: 'table',  icon: Table,       title: 'Table' },
-                        { id: 'matrix', icon: LayoutGrid,   title: 'Matrix / Pivot' },
-                        { id: 'bar',    icon: BarChart2,    title: 'Bar Chart' },
-                        { id: 'line',   icon: LineChart,    title: 'Line Chart' },
-                        { id: 'area',   icon: Activity,     title: 'Area Chart' },
-                        { id: 'pie',    icon: PieChart,     title: 'Pie Chart' },
-                        { id: 'scatter',icon: ScatterChart, title: 'Scatter Plot' },
-                        { id: 'radar',  icon: Grid3X3,      title: 'Radar Chart' },
-                      ].map((v) => (
-                        <button
-                          key={v.id}
-                          onClick={() => setVisualType(v.id as VisualType)}
-                          title={v.title}
-                          className={clsx(
-                            "p-1.5 rounded-md transition-all",
-                            visualType === v.id ? "bg-white shadow-sm text-emerald-600" : "text-slate-500 hover:text-slate-700"
-                          )}
-                        >
-                          <v.icon size={16} />
-                        </button>
-                      ))}
-                    </div>
                     {queryResult && queryResult.length > 0 && (
                       <>
                         <div className="w-px h-6 bg-slate-200 mx-1"></div>
