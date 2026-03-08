@@ -10,6 +10,11 @@ Self-service ClickHouse analysis tool with an AI assistant, drag-and-drop visual
 - **Dashboard** — save and replay queries as mini charts
 - **Knowledge Base** — inject business context into the LLM system prompt
 - **Settings** — configure ClickHouse and LLM connections at runtime
+- **Agents** — autonomous AI agents for advanced database tasks:
+  - **Data Dictionary Agent** — analyses every table and column in your ClickHouse database, generates a fully described data dictionary with business descriptions, data types, formats and possible values; outputs both an interactive **Technical Specification Document** (with cover page, executive overview, table of contents and colour-coded schema sections) and a classic table view — one click exports a professional, print-ready **PDF**
+  - **ClickHouse Writer Agent** — autonomous 12-step planning loop that understands natural language objectives, plans and executes multi-step SQL operations, creates intermediate tables, self-reflects and replans, then produces a detailed synthesis with key findings and recommendations
+- **Data Quality** — automated data profiling and quality checks across your tables
+- **RAG** — retrieval-augmented generation: embed your own documents and query them alongside your data
 
 ## Stack
 
@@ -105,9 +110,12 @@ ClickSense/
 ├── requirements.txt           # Python dependencies
 ├── src/
 │   ├── components/
+│   │   ├── AgentsPane.tsx     # AI agents hub (Data Dictionary, ClickHouse Writer)
 │   │   ├── ChatPane.tsx       # AI chat interface
 │   │   ├── BuilderPane.tsx    # Visual query builder + grid/charts
 │   │   ├── DashboardPane.tsx  # Saved queries dashboard
+│   │   ├── DataQualityPane.tsx# Automated data profiling & quality checks
+│   │   ├── RagPane.tsx        # Retrieval-augmented generation (document Q&A)
 │   │   ├── SettingsPane.tsx   # DB & LLM configuration
 │   │   ├── KnowledgeBasePane.tsx
 │   │   └── Sidebar.tsx
@@ -141,3 +149,5 @@ ClickSense/
 | POST | `/api/saved_queries` | Save a query to the dashboard |
 | GET | `/api/saved_queries/:user_id` | Get dashboard queries for a user |
 | DELETE | `/api/saved_queries/:id` | Delete a saved query |
+| GET | `/api/agents` | List available agents and their parameters |
+| POST | `/api/agents/:id/chat` | Run an agent turn (data-dictionary, clickhouse-writer) |

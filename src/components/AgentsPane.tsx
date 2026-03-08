@@ -1,9 +1,9 @@
-import { useState, useRef, useEffect, KeyboardEvent } from 'react';
+import { useState, useRef, useEffect, KeyboardEvent, CSSProperties } from 'react';
 import {
   Cpu, Send, ChevronDown, ChevronRight, CheckCircle2, XCircle,
   Loader2, Database, FileText, Settings2, Table2, Columns3,
   MessageSquare, Play, RefreshCw, Zap, AlertTriangle, Info,
-  RotateCcw, Trash2, BookOpen, TrendingUp, Star, Code2,
+  RotateCcw, Trash2, BookOpen, TrendingUp, Star, Code2, Download,
 } from 'lucide-react';
 import clsx from 'clsx';
 
@@ -279,6 +279,450 @@ function DataDictionaryView({ entries }: { entries: DictEntry[] }) {
           )}
         </div>
       ))}
+    </div>
+  );
+}
+
+// ── Technical Specification Document ─────────────────────────────────────────
+
+function getTypeColorInline(type: string): CSSProperties {
+  const t = type.toLowerCase();
+  if (t.includes('int') || t.includes('float') || t.includes('decimal') || t.includes('numeric'))
+    return { color: '#1d4ed8', backgroundColor: '#dbeafe', borderColor: '#bfdbfe' };
+  if (t.includes('string') || t.includes('varchar') || t.includes('text') || t.includes('char'))
+    return { color: '#6d28d9', backgroundColor: '#ede9fe', borderColor: '#c4b5fd' };
+  if (t.includes('date') || t.includes('time') || t.includes('timestamp'))
+    return { color: '#b45309', backgroundColor: '#fef3c7', borderColor: '#fde68a' };
+  if (t.includes('bool'))
+    return { color: '#065f46', backgroundColor: '#d1fae5', borderColor: '#a7f3d0' };
+  if (t.includes('uuid') || t.includes('fixedstring'))
+    return { color: '#9d174d', backgroundColor: '#fce7f3', borderColor: '#fbcfe8' };
+  if (t.includes('array') || t.includes('map') || t.includes('tuple'))
+    return { color: '#9a3412', backgroundColor: '#fff7ed', borderColor: '#fed7aa' };
+  return { color: '#374151', backgroundColor: '#f3f4f6', borderColor: '#e5e7eb' };
+}
+
+function TechSpecView({ entries }: { entries: DictEntry[] }) {
+  const totalColumns = entries.reduce((acc, e) => acc + (e.columns?.length || 0), 0);
+  const allTypes = [...new Set(
+    entries.flatMap(e => e.columns?.map(c => c.type.split('(')[0].split('<')[0]) || [])
+  )].sort();
+  const documented = entries.filter(e => e.table_description && e.table_description !== '—').length;
+  const coverage = entries.length ? Math.round((documented / entries.length) * 100) : 0;
+  const genDate = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+
+  return (
+    <div className="mt-3 space-y-4">
+      {/* Cover / Header */}
+      <div className="rounded-2xl overflow-hidden" style={{ background: 'linear-gradient(135deg, #059669 0%, #0d9488 50%, #0891b2 100%)' }}>
+        <div className="px-6 pt-6 pb-5">
+          <div className="flex items-start justify-between mb-5">
+            <div>
+              <span className="inline-block px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-widest mb-2"
+                style={{ background: 'rgba(255,255,255,0.2)', color: 'rgba(255,255,255,0.9)' }}>
+                Technical Specification Document
+              </span>
+              <h1 className="text-2xl font-extrabold text-white leading-tight">Data Dictionary</h1>
+              <p className="text-sm mt-0.5" style={{ color: 'rgba(255,255,255,0.75)' }}>
+                Database Schema &amp; Column Reference Guide
+              </p>
+            </div>
+            <div className="p-3 rounded-2xl" style={{ background: 'rgba(255,255,255,0.15)' }}>
+              <Database size={28} className="text-white" />
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-6 pt-4" style={{ borderTop: '1px solid rgba(255,255,255,0.2)' }}>
+            {[
+              { label: 'Tables', value: entries.length },
+              { label: 'Columns', value: totalColumns },
+              { label: 'Data Types', value: allTypes.length },
+              { label: 'Coverage', value: `${coverage}%` },
+            ].map(({ label, value }) => (
+              <div key={label}>
+                <p className="text-2xl font-black text-white">{value}</p>
+                <p className="text-xs" style={{ color: 'rgba(255,255,255,0.65)' }}>{label}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="px-6 py-2.5 flex items-center gap-3 text-[10px]"
+          style={{ background: 'rgba(0,0,0,0.2)', color: 'rgba(255,255,255,0.6)' }}>
+          <span>Generated: {genDate}</span>
+          <span>·</span>
+          <span>ClickSense AI Data Agent</span>
+          <span>·</span>
+          <span>v1.0</span>
+        </div>
+      </div>
+
+      {/* Section 1: Executive Overview */}
+      <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden">
+        <div className="px-4 py-3 bg-slate-50 border-b border-slate-100 flex items-center gap-2">
+          <div className="w-6 h-6 rounded-lg bg-emerald-500 text-white text-xs font-black flex items-center justify-center flex-shrink-0">1</div>
+          <h2 className="text-sm font-bold text-slate-800">Executive Overview</h2>
+        </div>
+        <div className="p-4 grid grid-cols-2 sm:grid-cols-4 gap-3">
+          {[
+            { label: 'Total Tables', value: entries.length, sub: 'tables analyzed', bg: '#ecfdf5', border: '#a7f3d0', color: '#065f46' },
+            { label: 'Total Columns', value: totalColumns, sub: 'fields documented', bg: '#f0fdfa', border: '#99f6e4', color: '#0f766e' },
+            { label: 'Distinct Types', value: allTypes.length, sub: 'data types found', bg: '#ecfeff', border: '#a5f3fc', color: '#0e7490' },
+            { label: 'Coverage', value: `${coverage}%`, sub: 'tables with desc.', bg: '#eff6ff', border: '#bfdbfe', color: '#1d4ed8' },
+          ].map(({ label, value, sub, bg, border, color }) => (
+            <div key={label} className="p-3 rounded-xl border" style={{ backgroundColor: bg, borderColor: border, color }}>
+              <p className="text-2xl font-black">{value}</p>
+              <p className="text-xs font-semibold mt-0.5">{label}</p>
+              <p className="text-[10px] mt-0.5 opacity-70">{sub}</p>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Section 2: Table of Contents */}
+      <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden">
+        <div className="px-4 py-3 bg-slate-50 border-b border-slate-100 flex items-center gap-2">
+          <div className="w-6 h-6 rounded-lg bg-emerald-500 text-white text-xs font-black flex items-center justify-center flex-shrink-0">2</div>
+          <h2 className="text-sm font-bold text-slate-800">Table of Contents</h2>
+          <span className="ml-auto text-xs text-slate-400">{entries.length} tables</span>
+        </div>
+        <div className="p-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-0.5">
+            {entries.map((entry, i) => (
+              <div key={i} className="flex items-center gap-2 px-3 py-1.5 rounded-lg hover:bg-slate-50 transition-colors">
+                <span className="text-[10px] font-bold text-slate-400 w-5 text-right flex-shrink-0">{i + 1}</span>
+                <span className="text-xs font-mono font-semibold text-emerald-700 truncate">{entry.table}</span>
+                <span className="ml-auto text-[10px] text-slate-400 flex-shrink-0">{entry.columns?.length || 0} cols</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* Section 3: Schema Documentation */}
+      <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden">
+        <div className="px-4 py-3 bg-slate-50 border-b border-slate-100 flex items-center gap-2">
+          <div className="w-6 h-6 rounded-lg bg-emerald-500 text-white text-xs font-black flex items-center justify-center flex-shrink-0">3</div>
+          <h2 className="text-sm font-bold text-slate-800">Schema Documentation</h2>
+          <span className="ml-auto text-xs text-slate-400">{entries.length} tables</span>
+        </div>
+        <div className="divide-y divide-slate-100">
+          {entries.map((entry, i) => (
+            <div key={i} className="p-4">
+              <div className="flex items-start gap-3 mb-3">
+                <div className="w-7 h-7 rounded-lg bg-emerald-50 border border-emerald-200 flex items-center justify-center flex-shrink-0">
+                  <span className="text-[10px] font-black text-emerald-600">{i + 1}</span>
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h3 className="text-sm font-bold font-mono text-slate-800">{entry.table}</h3>
+                    <span className="px-1.5 py-0.5 rounded bg-slate-100 text-[9px] font-bold text-slate-500">
+                      {entry.columns?.length || 0} columns
+                    </span>
+                  </div>
+                  {entry.table_description && (
+                    <p className="text-xs text-slate-500 mt-0.5 leading-relaxed">{entry.table_description}</p>
+                  )}
+                </div>
+              </div>
+              {entry.columns && entry.columns.length > 0 ? (
+                <div className="overflow-x-auto rounded-xl border border-slate-100">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="bg-slate-50">
+                        <th className="text-left px-3 py-2 text-slate-500 font-semibold border-b border-slate-100 whitespace-nowrap">Column</th>
+                        <th className="text-left px-3 py-2 text-slate-500 font-semibold border-b border-slate-100 whitespace-nowrap">Type</th>
+                        <th className="text-left px-3 py-2 text-slate-500 font-semibold border-b border-slate-100">Business Description</th>
+                        <th className="text-left px-3 py-2 text-slate-500 font-semibold border-b border-slate-100 whitespace-nowrap">Format</th>
+                        <th className="text-left px-3 py-2 text-slate-500 font-semibold border-b border-slate-100 whitespace-nowrap">Possible Values</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-50">
+                      {entry.columns.map((col, j) => (
+                        <tr key={j} className={j % 2 === 0 ? 'bg-white' : 'bg-slate-50/50'}>
+                          <td className="px-3 py-2 font-mono font-semibold text-slate-800 whitespace-nowrap">{col.name}</td>
+                          <td className="px-3 py-2 whitespace-nowrap">
+                            <span className="px-1.5 py-0.5 rounded text-[9px] font-bold font-mono border"
+                              style={getTypeColorInline(col.type)}>
+                              {col.type}
+                            </span>
+                          </td>
+                          <td className="px-3 py-2 text-slate-600 leading-relaxed">{col.business_description || '—'}</td>
+                          <td className="px-3 py-2 text-slate-500 whitespace-nowrap">{col.format || '—'}</td>
+                          <td className="px-3 py-2 text-slate-500">{col.possible_values || '—'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <p className="text-xs text-slate-400 italic">No columns documented.</p>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Section 4: Data Types Reference */}
+      {allTypes.length > 0 && (
+        <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden">
+          <div className="px-4 py-3 bg-slate-50 border-b border-slate-100 flex items-center gap-2">
+            <div className="w-6 h-6 rounded-lg bg-emerald-500 text-white text-xs font-black flex items-center justify-center flex-shrink-0">4</div>
+            <h2 className="text-sm font-bold text-slate-800">Data Types Reference</h2>
+          </div>
+          <div className="p-4 flex flex-wrap gap-2">
+            {allTypes.map((t, i) => (
+              <span key={i} className="px-2 py-1 rounded-lg text-xs font-bold font-mono border"
+                style={getTypeColorInline(t)}>
+                {t}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Document Footer */}
+      <div className="flex items-center justify-between px-4 py-2.5 bg-slate-50 rounded-xl border border-slate-200 text-[10px] text-slate-400">
+        <span>Data Dictionary · ClickSense AI Agent</span>
+        <span>{genDate}</span>
+      </div>
+    </div>
+  );
+}
+
+function generateTechSpecHTML(entries: DictEntry[]): string {
+  const genDate = new Date().toLocaleDateString('en-US', {
+    year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit',
+  });
+  const totalColumns = entries.reduce((acc, e) => acc + (e.columns?.length || 0), 0);
+  const allTypes = [...new Set(
+    entries.flatMap(e => e.columns?.map(c => c.type.split('(')[0].split('<')[0]) || [])
+  )].sort();
+  const documented = entries.filter(e => e.table_description && e.table_description !== '—').length;
+  const coverage = entries.length ? Math.round((documented / entries.length) * 100) : 0;
+
+  function typeStyle(type: string): string {
+    const t = type.toLowerCase();
+    if (t.includes('int') || t.includes('float') || t.includes('decimal') || t.includes('numeric'))
+      return 'color:#1d4ed8;background-color:#dbeafe;border:1px solid #bfdbfe';
+    if (t.includes('string') || t.includes('varchar') || t.includes('text') || t.includes('char'))
+      return 'color:#6d28d9;background-color:#ede9fe;border:1px solid #c4b5fd';
+    if (t.includes('date') || t.includes('time') || t.includes('timestamp'))
+      return 'color:#b45309;background-color:#fef3c7;border:1px solid #fde68a';
+    if (t.includes('bool'))
+      return 'color:#065f46;background-color:#d1fae5;border:1px solid #a7f3d0';
+    if (t.includes('uuid') || t.includes('fixedstring'))
+      return 'color:#9d174d;background-color:#fce7f3;border:1px solid #fbcfe8';
+    if (t.includes('array') || t.includes('map') || t.includes('tuple'))
+      return 'color:#9a3412;background-color:#fff7ed;border:1px solid #fed7aa';
+    return 'color:#374151;background-color:#f3f4f6;border:1px solid #e5e7eb';
+  }
+
+  const tocRows = entries.map((entry, i) => `
+    <tr>
+      <td style="color:#94a3b8;font-weight:700;width:36px;text-align:right;padding:6px 12px;border-bottom:1px solid #f8fafc;">${i + 1}</td>
+      <td style="font-family:'Courier New',monospace;color:#059669;font-weight:600;padding:6px 12px;border-bottom:1px solid #f8fafc;">${entry.table}</td>
+      <td style="color:#94a3b8;text-align:right;width:64px;padding:6px 12px;border-bottom:1px solid #f8fafc;">${entry.columns?.length || 0} cols</td>
+    </tr>`).join('');
+
+  const schemaSections = entries.map((entry, i) => {
+    const colRows = entry.columns?.length ? entry.columns.map((col, j) => `
+      <tr style="background:${j % 2 === 0 ? '#ffffff' : '#fafafa'};">
+        <td style="padding:7px 10px;font-family:'Courier New',monospace;font-weight:600;color:#1e293b;white-space:nowrap;border-bottom:1px solid #f1f5f9;">${col.name}</td>
+        <td style="padding:7px 10px;white-space:nowrap;border-bottom:1px solid #f1f5f9;">
+          <span style="display:inline-block;padding:2px 6px;border-radius:4px;font-size:9px;font-weight:700;font-family:'Courier New',monospace;${typeStyle(col.type)};">${col.type}</span>
+        </td>
+        <td style="padding:7px 10px;color:#475569;line-height:1.5;border-bottom:1px solid #f1f5f9;">${col.business_description || '—'}</td>
+        <td style="padding:7px 10px;color:#64748b;white-space:nowrap;border-bottom:1px solid #f1f5f9;">${col.format || '—'}</td>
+        <td style="padding:7px 10px;color:#64748b;border-bottom:1px solid #f1f5f9;">${col.possible_values || '—'}</td>
+      </tr>`).join('') : '';
+    return `
+    <div style="padding:20px;border-bottom:1px solid #f1f5f9;page-break-inside:avoid;">
+      <div style="display:flex;align-items:flex-start;gap:12px;margin-bottom:12px;">
+        <div style="width:28px;height:28px;border-radius:8px;background:#ecfdf5;border:1px solid #a7f3d0;display:flex;align-items:center;justify-content:center;flex-shrink:0;">
+          <span style="font-size:10px;font-weight:900;color:#059669;">${i + 1}</span>
+        </div>
+        <div style="flex:1;min-width:0;">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+            <span style="font-family:'Courier New',monospace;font-size:13px;font-weight:700;color:#1e293b;">${entry.table}</span>
+            <span style="padding:2px 8px;border-radius:20px;font-size:9px;font-weight:700;background:#f1f5f9;color:#64748b;">${entry.columns?.length || 0} columns</span>
+          </div>
+          ${entry.table_description ? `<p style="font-size:11px;color:#64748b;margin-top:4px;line-height:1.6;">${entry.table_description}</p>` : ''}
+        </div>
+      </div>
+      ${entry.columns?.length ? `
+        <table style="width:100%;border-collapse:collapse;border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;font-size:11px;">
+          <thead>
+            <tr style="background:#f8fafc;">
+              <th style="text-align:left;padding:8px 10px;color:#64748b;font-weight:600;border-bottom:1px solid #e2e8f0;">Column</th>
+              <th style="text-align:left;padding:8px 10px;color:#64748b;font-weight:600;border-bottom:1px solid #e2e8f0;">Type</th>
+              <th style="text-align:left;padding:8px 10px;color:#64748b;font-weight:600;border-bottom:1px solid #e2e8f0;">Business Description</th>
+              <th style="text-align:left;padding:8px 10px;color:#64748b;font-weight:600;border-bottom:1px solid #e2e8f0;">Format</th>
+              <th style="text-align:left;padding:8px 10px;color:#64748b;font-weight:600;border-bottom:1px solid #e2e8f0;">Possible Values</th>
+            </tr>
+          </thead>
+          <tbody>${colRows}</tbody>
+        </table>
+      ` : '<p style="font-size:11px;color:#94a3b8;font-style:italic;">No columns documented.</p>'}
+    </div>`;
+  }).join('');
+
+  const typePills = allTypes.map(t =>
+    `<span style="display:inline-block;padding:4px 10px;border-radius:8px;font-size:11px;font-weight:700;font-family:'Courier New',monospace;${typeStyle(t)};">${t}</span>`
+  ).join(' ');
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<title>Data Dictionary — Technical Specification Document</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; color: #1e293b; background: #f8fafc; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+@media print {
+  body { background: white; }
+  @page { margin: 15mm 12mm; size: A4; }
+  .no-break { page-break-inside: avoid; }
+}
+</style>
+</head>
+<body style="max-width:900px;margin:0 auto;padding:24px;">
+
+  <!-- Cover -->
+  <div style="border-radius:16px;overflow:hidden;margin-bottom:28px;background:linear-gradient(135deg,#059669 0%,#0d9488 50%,#0891b2 100%);">
+    <div style="padding:40px 36px 28px;">
+      <span style="display:inline-block;background:rgba(255,255,255,0.2);color:rgba(255,255,255,0.9);font-size:9px;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;padding:3px 10px;border-radius:20px;margin-bottom:12px;">Technical Specification Document</span>
+      <h1 style="font-size:32px;font-weight:900;color:white;line-height:1.1;margin-bottom:6px;">Data Dictionary</h1>
+      <p style="font-size:14px;color:rgba(255,255,255,0.75);margin-bottom:24px;">Database Schema &amp; Column Reference Guide</p>
+      <div style="display:flex;gap:32px;padding-top:20px;border-top:1px solid rgba(255,255,255,0.2);">
+        <div><div style="font-size:24px;font-weight:900;color:white;">${entries.length}</div><div style="font-size:11px;color:rgba(255,255,255,0.65);">Tables</div></div>
+        <div><div style="font-size:24px;font-weight:900;color:white;">${totalColumns}</div><div style="font-size:11px;color:rgba(255,255,255,0.65);">Columns</div></div>
+        <div><div style="font-size:24px;font-weight:900;color:white;">${allTypes.length}</div><div style="font-size:11px;color:rgba(255,255,255,0.65);">Data Types</div></div>
+        <div><div style="font-size:24px;font-weight:900;color:white;">${coverage}%</div><div style="font-size:11px;color:rgba(255,255,255,0.65);">Coverage</div></div>
+      </div>
+    </div>
+    <div style="padding:10px 36px;background:rgba(0,0,0,0.2);font-size:10px;color:rgba(255,255,255,0.6);display:flex;gap:16px;">
+      <span>Generated: ${genDate}</span><span>·</span><span>ClickSense AI Data Agent</span><span>·</span><span>v1.0</span>
+    </div>
+  </div>
+
+  <!-- Section 1: Executive Overview -->
+  <div style="background:white;border:1px solid #e2e8f0;border-radius:16px;overflow:hidden;margin-bottom:20px;" class="no-break">
+    <div style="display:flex;align-items:center;gap:10px;padding:12px 16px;background:#f8fafc;border-bottom:1px solid #f1f5f9;">
+      <div style="width:24px;height:24px;border-radius:8px;background:#059669;color:white;font-size:11px;font-weight:900;display:flex;align-items:center;justify-content:center;flex-shrink:0;">1</div>
+      <span style="font-size:13px;font-weight:700;color:#1e293b;">Executive Overview</span>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;padding:16px;">
+      <div style="padding:12px;border-radius:12px;background:#ecfdf5;border:1px solid #a7f3d0;color:#065f46;">
+        <div style="font-size:24px;font-weight:900;">${entries.length}</div>
+        <div style="font-size:11px;font-weight:600;margin-top:2px;">Total Tables</div>
+        <div style="font-size:9px;opacity:0.7;margin-top:2px;">tables analyzed</div>
+      </div>
+      <div style="padding:12px;border-radius:12px;background:#f0fdfa;border:1px solid #99f6e4;color:#0f766e;">
+        <div style="font-size:24px;font-weight:900;">${totalColumns}</div>
+        <div style="font-size:11px;font-weight:600;margin-top:2px;">Total Columns</div>
+        <div style="font-size:9px;opacity:0.7;margin-top:2px;">fields documented</div>
+      </div>
+      <div style="padding:12px;border-radius:12px;background:#ecfeff;border:1px solid #a5f3fc;color:#0e7490;">
+        <div style="font-size:24px;font-weight:900;">${allTypes.length}</div>
+        <div style="font-size:11px;font-weight:600;margin-top:2px;">Distinct Types</div>
+        <div style="font-size:9px;opacity:0.7;margin-top:2px;">data types detected</div>
+      </div>
+      <div style="padding:12px;border-radius:12px;background:#eff6ff;border:1px solid #bfdbfe;color:#1d4ed8;">
+        <div style="font-size:24px;font-weight:900;">${coverage}%</div>
+        <div style="font-size:11px;font-weight:600;margin-top:2px;">Documentation</div>
+        <div style="font-size:9px;opacity:0.7;margin-top:2px;">tables with descriptions</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Section 2: Table of Contents -->
+  <div style="background:white;border:1px solid #e2e8f0;border-radius:16px;overflow:hidden;margin-bottom:20px;" class="no-break">
+    <div style="display:flex;align-items:center;gap:10px;padding:12px 16px;background:#f8fafc;border-bottom:1px solid #f1f5f9;">
+      <div style="width:24px;height:24px;border-radius:8px;background:#059669;color:white;font-size:11px;font-weight:900;display:flex;align-items:center;justify-content:center;flex-shrink:0;">2</div>
+      <span style="font-size:13px;font-weight:700;color:#1e293b;">Table of Contents</span>
+    </div>
+    <table style="width:100%;border-collapse:collapse;">${tocRows}</table>
+  </div>
+
+  <!-- Section 3: Schema Documentation -->
+  <div style="background:white;border:1px solid #e2e8f0;border-radius:16px;overflow:hidden;margin-bottom:20px;">
+    <div style="display:flex;align-items:center;gap:10px;padding:12px 16px;background:#f8fafc;border-bottom:1px solid #f1f5f9;">
+      <div style="width:24px;height:24px;border-radius:8px;background:#059669;color:white;font-size:11px;font-weight:900;display:flex;align-items:center;justify-content:center;flex-shrink:0;">3</div>
+      <span style="font-size:13px;font-weight:700;color:#1e293b;">Schema Documentation</span>
+      <span style="margin-left:auto;font-size:10px;color:#94a3b8;">${entries.length} tables</span>
+    </div>
+    ${schemaSections}
+  </div>
+
+  ${allTypes.length ? `
+  <!-- Section 4: Data Types Reference -->
+  <div style="background:white;border:1px solid #e2e8f0;border-radius:16px;overflow:hidden;margin-bottom:20px;" class="no-break">
+    <div style="display:flex;align-items:center;gap:10px;padding:12px 16px;background:#f8fafc;border-bottom:1px solid #f1f5f9;">
+      <div style="width:24px;height:24px;border-radius:8px;background:#059669;color:white;font-size:11px;font-weight:900;display:flex;align-items:center;justify-content:center;flex-shrink:0;">4</div>
+      <span style="font-size:13px;font-weight:700;color:#1e293b;">Data Types Reference</span>
+    </div>
+    <div style="padding:16px;display:flex;flex-wrap:wrap;gap:8px;">${typePills}</div>
+  </div>` : ''}
+
+  <!-- Footer -->
+  <div style="display:flex;justify-content:space-between;padding:10px 16px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;font-size:10px;color:#94a3b8;">
+    <span>Data Dictionary · ClickSense AI Data Agent</span>
+    <span>${genDate}</span>
+  </div>
+
+</body>
+</html>`;
+}
+
+function DictionaryOutputPanel({ entries }: { entries: DictEntry[] }) {
+  const [view, setView] = useState<'spec' | 'table'>('spec');
+
+  function exportToPDF() {
+    const html = generateTechSpecHTML(entries);
+    const win = window.open('', '_blank');
+    if (!win) return;
+    win.document.write(html);
+    win.document.close();
+    setTimeout(() => { try { win.print(); } catch { /* ignore */ } }, 800);
+  }
+
+  return (
+    <div>
+      <div className="flex items-center gap-2 mt-3">
+        <div className="flex bg-slate-100 rounded-lg p-0.5 text-xs">
+          <button
+            onClick={() => setView('spec')}
+            className={clsx(
+              'flex items-center gap-1 px-3 py-1.5 rounded-md font-medium transition-all',
+              view === 'spec' ? 'bg-white text-emerald-700 shadow-sm' : 'text-slate-500 hover:text-slate-700',
+            )}
+          >
+            <FileText size={11} />
+            Tech Spec
+          </button>
+          <button
+            onClick={() => setView('table')}
+            className={clsx(
+              'flex items-center gap-1 px-3 py-1.5 rounded-md font-medium transition-all',
+              view === 'table' ? 'bg-white text-slate-700 shadow-sm' : 'text-slate-500 hover:text-slate-700',
+            )}
+          >
+            <Table2 size={11} />
+            Table view
+          </button>
+        </div>
+        <button
+          onClick={exportToPDF}
+          className="ml-auto flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-emerald-500 hover:bg-emerald-600 text-white rounded-lg transition-colors shadow-sm"
+        >
+          <Download size={12} />
+          Export PDF
+        </button>
+      </div>
+      {view === 'spec' ? (
+        <TechSpecView entries={entries} />
+      ) : (
+        <DataDictionaryView entries={entries} />
+      )}
     </div>
   );
 }
@@ -869,7 +1313,7 @@ function AssistantMessage({
         {/* Data dictionary views */}
         {msg.steps && msg.steps.length > 0 && <StepsPanel steps={msg.steps} />}
         {msg.data_dictionary && msg.data_dictionary.length > 0 && (
-          <DataDictionaryView entries={msg.data_dictionary} />
+          <DictionaryOutputPanel entries={msg.data_dictionary} />
         )}
 
         {/* Writer agent views */}
