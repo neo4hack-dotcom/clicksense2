@@ -49,8 +49,8 @@ interface AppState {
   };
   setQueryConfig: (config: any) => void;
 
-  activeTab: 'chat' | 'builder' | 'dashboard' | 'settings' | 'knowledge' | 'rag' | 'data-quality';
-  setActiveTab: (tab: 'chat' | 'builder' | 'dashboard' | 'settings' | 'knowledge' | 'rag' | 'data-quality') => void;
+  activeTab: 'chat' | 'builder' | 'dashboard' | 'settings' | 'knowledge' | 'rag' | 'data-quality' | 'agents';
+  setActiveTab: (tab: 'chat' | 'builder' | 'dashboard' | 'settings' | 'knowledge' | 'rag' | 'data-quality' | 'agents') => void;
 
   chatHistory: {
     role: 'user' | 'assistant';

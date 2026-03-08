@@ -2555,6 +2555,219 @@ def import_config():
 
 
 # ---------------------------------------------------------------------------
+# Agents system
+# ---------------------------------------------------------------------------
+
+AGENTS_CATALOG = [
+    {
+        "id": "data-dictionary",
+        "name": "Générateur de Data Dictionary dynamique",
+        "description": (
+            "Se connecte au Data Warehouse, analyse le contenu des tables, "
+            "comprend le contexte métier et génère (puis maintient à jour) une "
+            "documentation complète et compréhensible pour les utilisateurs métiers."
+        ),
+        "parameters": [
+            {
+                "name": "database",
+                "label": "Base de données",
+                "type": "string",
+                "default": "",
+                "description": "Nom de la base à documenter (vide = base par défaut configurée)",
+            },
+            {
+                "name": "tables",
+                "label": "Tables à analyser",
+                "type": "string",
+                "default": "",
+                "description": "Liste de tables séparées par virgule (vide = toutes les tables)",
+            },
+            {
+                "name": "language",
+                "label": "Langue de la documentation",
+                "type": "select",
+                "options": ["fr", "en"],
+                "default": "fr",
+                "description": "Langue utilisée pour la génération des descriptions",
+            },
+            {
+                "name": "sample_rows",
+                "label": "Lignes d'échantillon",
+                "type": "number",
+                "default": 5,
+                "description": "Nombre de lignes d'exemple par table pour aider le LLM",
+            },
+        ],
+    },
+]
+
+
+@app.route("/api/agents", methods=["GET"])
+def list_agents():
+    """Return the catalog of available agents."""
+    return jsonify(AGENTS_CATALOG)
+
+
+@app.route("/api/agents/<agent_id>/chat", methods=["POST"])
+def agent_chat(agent_id):
+    """Dispatch a chat message to the requested agent."""
+    if agent_id == "data-dictionary":
+        return _run_data_dictionary_agent()
+    return jsonify({"error": f"Agent '{agent_id}' introuvable."}), 404
+
+
+def _run_data_dictionary_agent():
+    """
+    Data Dictionary Generator agent.
+
+    Connects to the configured ClickHouse instance, lists/filters tables,
+    fetches their schema and a small sample of rows, then calls the local LLM
+    to produce a structured, business-friendly data dictionary.
+
+    Request body (JSON):
+        messages  – conversation history (list of {role, content})
+        params    – agent parameters:
+            database    : str   – database name (empty = clickhouse_config default)
+            tables      : str   – comma-separated table filter (empty = all tables)
+            language    : str   – "fr" | "en"
+            sample_rows : int   – rows sampled per table (default 5)
+
+    Response (JSON):
+        steps            – per-table processing log
+        data_dictionary  – list of documented tables
+        tables_processed – count of successfully documented tables
+        total_tables     – total tables attempted
+    """
+    data = request.get_json(silent=True) or {}
+    params = data.get("params", {})
+
+    database = (params.get("database") or "").strip() or clickhouse_config.get("database", "default")
+    tables_filter = (params.get("tables") or "").strip()
+    language = params.get("language", "fr")
+    try:
+        sample_rows = max(1, min(int(params.get("sample_rows", 5)), 20))
+    except (TypeError, ValueError):
+        sample_rows = 5
+
+    lang_label = "français" if language == "fr" else "English"
+
+    try:
+        client = get_clickhouse_client()
+    except Exception as exc:
+        return jsonify({"error": f"Impossible de se connecter à ClickHouse : {exc}"}), 500
+
+    # Build table list
+    if tables_filter:
+        table_list = [t.strip() for t in tables_filter.split(",") if t.strip()]
+    else:
+        try:
+            res = client.query(f"SHOW TABLES FROM `{database}`")
+            table_list = [row[0] for row in res.result_rows]
+        except Exception as exc:
+            return jsonify({"error": f"Impossible de lister les tables de '{database}' : {exc}"}), 500
+
+    if not table_list:
+        return jsonify({"error": f"Aucune table trouvée dans la base '{database}'."}), 404
+
+    steps = []
+    dict_entries = []
+
+    system_prompt = (
+        "You are a senior data engineer specialized in writing clear, precise data dictionaries "
+        "for business users. You produce concise, accurate, and helpful documentation. "
+        f"All descriptions MUST be written in {lang_label}. "
+        "Always reply with valid JSON only — no markdown fences, no extra text."
+    )
+
+    for table_name in table_list:
+        # ── Fetch schema ──────────────────────────────────────────────────
+        try:
+            schema_res = client.query(f"DESCRIBE TABLE `{database}`.`{table_name}`")
+            # DESCRIBE returns: name, type, default_type, default_expression,
+            #                   comment, codec_expression, ttl_expression, ...
+            columns = []
+            for row in schema_res.result_rows:
+                col = {
+                    "name": row[0],
+                    "type": row[1],
+                    "comment": row[4] if len(row) > 4 else "",
+                }
+                columns.append(col)
+        except Exception as exc:
+            steps.append({"table": table_name, "ok": False, "error": str(exc)})
+            continue
+
+        # ── Sample data ───────────────────────────────────────────────────
+        sample_data = []
+        try:
+            sample_res = client.query(
+                f"SELECT * FROM `{database}`.`{table_name}` LIMIT {sample_rows}"
+            )
+            sample_data = _rows_to_dicts(sample_res)
+        except Exception:
+            pass  # proceed without sample data
+
+        # ── Call LLM ─────────────────────────────────────────────────────
+        user_content = (
+            f"Table: {database}.{table_name}\n\n"
+            f"Columns:\n{json.dumps(columns, ensure_ascii=False, indent=2)}\n\n"
+            + (
+                f"Sample rows ({len(sample_data)}):\n"
+                f"{json.dumps(sample_data, ensure_ascii=False, default=str, indent=2)}\n\n"
+                if sample_data else ""
+            )
+            + "Generate a complete data dictionary for this table.\n"
+            "Return ONLY a JSON object with this exact structure:\n"
+            "{\n"
+            '  "table_description": "<business description of the table>",\n'
+            '  "columns": [\n'
+            "    {\n"
+            '      "name": "<column name>",\n'
+            '      "type": "<clickhouse type>",\n'
+            '      "business_description": "<plain-language meaning>",\n'
+            '      "format": "<expected format or unit>",\n'
+            '      "possible_values": "<enum values, ranges, or free-form description>"\n'
+            "    }\n"
+            "  ]\n"
+            "}"
+        )
+
+        try:
+            llm_raw = _call_llm(
+                system_prompt,
+                [{"role": "user", "content": user_content}],
+                temperature=0.2,
+            )
+            try:
+                doc = json.loads(llm_raw)
+            except json.JSONDecodeError:
+                # Fallback: wrap raw text
+                doc = {
+                    "table_description": llm_raw,
+                    "columns": [
+                        {"name": c["name"], "type": c["type"],
+                         "business_description": c.get("comment", ""),
+                         "format": "", "possible_values": ""}
+                        for c in columns
+                    ],
+                }
+            doc["table"] = f"{database}.{table_name}"
+            dict_entries.append(doc)
+            steps.append({"table": table_name, "ok": True, "columns_count": len(columns)})
+        except Exception as exc:
+            steps.append({"table": table_name, "ok": False, "error": str(exc)})
+
+    tables_processed = sum(1 for s in steps if s.get("ok"))
+
+    return jsonify({
+        "steps": steps,
+        "data_dictionary": dict_entries,
+        "tables_processed": tables_processed,
+        "total_tables": len(table_list),
+    })
+
+
+# ---------------------------------------------------------------------------
 # Serve built frontend
 # ---------------------------------------------------------------------------
 @app.route("/", defaults={"path": ""})

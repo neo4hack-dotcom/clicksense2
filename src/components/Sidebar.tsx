@@ -1,4 +1,4 @@
-import { MessageSquare, LayoutDashboard, Settings, BookOpen, Database, Grid, Layers, ShieldCheck, Bot, BarChart2, Wrench } from 'lucide-react';
+import { MessageSquare, LayoutDashboard, Settings, BookOpen, Database, Grid, Layers, ShieldCheck, Bot, BarChart2, Wrench, Cpu } from 'lucide-react';
 import { useAppStore } from '../store';
 import clsx from 'clsx';
 
@@ -8,6 +8,7 @@ const navGroups = [
     icon: Bot,
     items: [
       { id: 'chat', icon: MessageSquare, label: 'AI Assistant' },
+      { id: 'agents', icon: Cpu, label: 'Agents' },
       { id: 'data-quality', icon: ShieldCheck, label: 'AI Data Quality' },
       { id: 'rag', icon: Layers, label: 'RAG' },
     ],
