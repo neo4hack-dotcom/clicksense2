@@ -2720,6 +2720,130 @@ def _cw_detect_bot_table(sql: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _cw_extract_table_name(sql: str, pattern: str) -> str | None:
+    """Extract a table name (with optional db prefix) from a SQL statement."""
+    m = re.match(pattern, sql.strip(), re.IGNORECASE)
+    if not m:
+        return None
+    # The table name may be backtick-quoted; strip them
+    return m.group(1).strip("`")
+
+
+def _cw_is_sql_safe(sql: str) -> tuple[bool, str]:
+    """
+    Security guard: verify that a SQL statement cannot destroy or alter
+    pre-existing (non-BOT_) tables.
+
+    Rules
+    -----
+    - SELECT / SHOW / DESCRIBE / EXPLAIN / WITH  → always allowed (read-only)
+    - CREATE TABLE                               → allowed only for BOT_* tables
+    - INSERT INTO                                → allowed only into BOT_* tables
+    - DROP TABLE [IF EXISTS]                     → allowed only for BOT_* tables
+    - ALTER TABLE                                → allowed only for BOT_* tables
+    - TRUNCATE [TABLE]                           → allowed only for BOT_* tables
+    - DELETE FROM                                → allowed only for BOT_* tables
+    - DROP DATABASE / DROP SCHEMA                → always blocked
+    - RENAME TABLE                               → always blocked
+
+    Returns (is_safe: bool, reason: str).
+    """
+    sql_stripped = sql.strip()
+    sql_upper = sql_stripped.upper()
+
+    # ── Read-only operations ─────────────────────────────────────────────────
+    read_prefixes = ("SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH")
+    if any(sql_upper.startswith(k) for k in read_prefixes):
+        return True, ""
+
+    # ── DROP DATABASE / DROP SCHEMA – never allowed ──────────────────────────
+    if re.match(r"DROP\s+(DATABASE|SCHEMA)\b", sql_stripped, re.IGNORECASE):
+        return False, "DROP DATABASE/SCHEMA n'est pas autorisé par l'agent Writer."
+
+    # ── RENAME TABLE – never allowed ─────────────────────────────────────────
+    if re.match(r"RENAME\s+TABLE\b", sql_stripped, re.IGNORECASE):
+        return False, "RENAME TABLE n'est pas autorisé par l'agent Writer."
+
+    # Helper: return (False, message) if table does not start with BOT_
+    def _require_bot(table_name: str, op: str) -> tuple[bool, str] | None:
+        if not table_name.upper().startswith("BOT_"):
+            return (
+                False,
+                f"[SÉCURITÉ] {op} refusé : la table '{table_name}' n'est pas une table "
+                f"temporaire BOT_. L'agent Writer ne peut pas modifier les tables existantes.",
+            )
+        return None  # OK
+
+    # ── DROP TABLE [IF EXISTS] [db.]table ────────────────────────────────────
+    table = _cw_extract_table_name(
+        sql_stripped,
+        r"DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:`[^`]+`\.)?(`?\w+`?)",
+    )
+    if table is not None:
+        err = _require_bot(table, "DROP TABLE")
+        if err:
+            return err
+        return True, ""
+
+    # ── ALTER TABLE [db.]table ───────────────────────────────────────────────
+    table = _cw_extract_table_name(
+        sql_stripped,
+        r"ALTER\s+TABLE\s+(?:`[^`]+`\.)?(`?\w+`?)",
+    )
+    if table is not None:
+        err = _require_bot(table, "ALTER TABLE")
+        if err:
+            return err
+        return True, ""
+
+    # ── TRUNCATE [TABLE] [db.]table ──────────────────────────────────────────
+    table = _cw_extract_table_name(
+        sql_stripped,
+        r"TRUNCATE\s+(?:TABLE\s+)?(?:`[^`]+`\.)?(`?\w+`?)",
+    )
+    if table is not None:
+        err = _require_bot(table, "TRUNCATE")
+        if err:
+            return err
+        return True, ""
+
+    # ── DELETE FROM [db.]table ───────────────────────────────────────────────
+    table = _cw_extract_table_name(
+        sql_stripped,
+        r"DELETE\s+FROM\s+(?:`[^`]+`\.)?(`?\w+`?)",
+    )
+    if table is not None:
+        err = _require_bot(table, "DELETE FROM")
+        if err:
+            return err
+        return True, ""
+
+    # ── CREATE TABLE [IF NOT EXISTS] [db.]table ──────────────────────────────
+    table = _cw_extract_table_name(
+        sql_stripped,
+        r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:`[^`]+`\.)?(`?\w+`?)",
+    )
+    if table is not None:
+        err = _require_bot(table, "CREATE TABLE")
+        if err:
+            return err
+        return True, ""
+
+    # ── INSERT INTO [db.]table ───────────────────────────────────────────────
+    table = _cw_extract_table_name(
+        sql_stripped,
+        r"INSERT\s+INTO\s+(?:`[^`]+`\.)?(`?\w+`?)",
+    )
+    if table is not None:
+        err = _require_bot(table, "INSERT INTO")
+        if err:
+            return err
+        return True, ""
+
+    # All other statements (OPTIMIZE TABLE, SYSTEM ..., etc.) are allowed
+    return True, ""
+
+
 def _cw_plan(user_request: str, database: str, schema_info: str) -> dict:
     """LLM generates a detailed execution plan."""
     system_prompt = (
@@ -2734,6 +2858,9 @@ def _cw_plan(user_request: str, database: str, schema_info: str) -> dict:
         f"Demande de l'utilisateur: {user_request}\n\n"
         "Crée un plan d'exécution détaillé avec AU MAXIMUM 12 étapes pour réaliser cette demande.\n"
         "Tu peux créer des tables intermédiaires (MUST start with BOT_) pour les calculs complexes.\n"
+        "RÈGLE DE SÉCURITÉ ABSOLUE: tu n'as JAMAIS le droit de DROP, ALTER, TRUNCATE, DELETE, "
+        "INSERT ou CREATE sur des tables existantes. Seules les tables préfixées BOT_ peuvent être "
+        "créées ou modifiées. Tout écart sera bloqué côté serveur.\n"
         "Sois stratégique: identifie les données nécessaires, les transformations requises, "
         "les vérifications à faire.\n\n"
         "Réponds UNIQUEMENT avec ce JSON:\n"
@@ -2810,6 +2937,9 @@ def _cw_generate_sql(session: dict, step: dict, client, database: str) -> dict:
         + f"\n\nContexte fourni par l'utilisateur: {json.dumps(user_context, ensure_ascii=False)}\n\n"
         "Génère le SQL pour cette étape.\n"
         "Règles OBLIGATOIRES:\n"
+        "- SÉCURITÉ ABSOLUE: tu n'as le droit d'écrire (CREATE, INSERT, DROP, ALTER, TRUNCATE, DELETE) "
+        "QUE sur des tables dont le nom commence par BOT_. "
+        "Toute tentative d'écrire sur une table existante (non-BOT_) sera bloquée par le système.\n"
         "- Tables temporaires: TOUJOURS préfixées BOT_ (ex: BOT_aggreg_results)\n"
         "- Syntaxe ClickHouse valide uniquement\n"
         "- Pour grandes tables: utilise LIMIT ou SAMPLE pour les explorations\n"
@@ -3019,29 +3149,36 @@ def _cw_execute_steps(session: dict, client, database: str, preview_rows: int = 
             entry["ok"] = False
             entry["result_preview"] = "SQL vide généré par le LLM."
         else:
-            sql_upper = sql.lstrip().upper()
-            is_read = any(sql_upper.startswith(k) for k in
-                          ("SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH"))
-            try:
-                if is_read:
-                    res = client.query(sql)
-                    rows = _rows_to_dicts(res)
-                    entry["ok"] = True
-                    entry["result_preview"] = rows[:preview_rows]
-                    entry["rows_affected"] = len(rows)
-                else:
-                    client.command(sql)
-                    entry["ok"] = True
-                    entry["result_preview"] = "Commande exécutée avec succès."
-                    entry["rows_affected"] = None
-                    # Track BOT_ table creation
-                    bot_table = (sql_result.get("creates_table")
-                                 or _cw_detect_bot_table(sql))
-                    if bot_table and bot_table not in session["created_tables"]:
-                        session["created_tables"].append(bot_table)
-            except Exception as exc:
+            # ── Security guard: block any write on non-BOT_ tables ────────
+            is_safe, safety_reason = _cw_is_sql_safe(sql)
+            if not is_safe:
                 entry["ok"] = False
-                entry["result_preview"] = f"Erreur: {str(exc)}"
+                entry["result_preview"] = safety_reason
+                print(f"[SÉCURITÉ] SQL bloqué — {safety_reason}\nSQL: {sql[:300]}")
+            else:
+                sql_upper = sql.lstrip().upper()
+                is_read = any(sql_upper.startswith(k) for k in
+                              ("SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH"))
+                try:
+                    if is_read:
+                        res = client.query(sql)
+                        rows = _rows_to_dicts(res)
+                        entry["ok"] = True
+                        entry["result_preview"] = rows[:preview_rows]
+                        entry["rows_affected"] = len(rows)
+                    else:
+                        client.command(sql)
+                        entry["ok"] = True
+                        entry["result_preview"] = "Commande exécutée avec succès."
+                        entry["rows_affected"] = None
+                        # Track BOT_ table creation
+                        bot_table = (sql_result.get("creates_table")
+                                     or _cw_detect_bot_table(sql))
+                        if bot_table and bot_table not in session["created_tables"]:
+                            session["created_tables"].append(bot_table)
+                except Exception as exc:
+                    entry["ok"] = False
+                    entry["result_preview"] = f"Erreur: {str(exc)}"
 
         session["action_log"].append(entry)
         session["action_index"] += 1
