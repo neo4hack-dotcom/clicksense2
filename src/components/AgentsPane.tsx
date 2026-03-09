@@ -748,6 +748,116 @@ function DictionaryOutputPanel({ entries }: { entries: DictEntry[] }) {
   );
 }
 
+// ── Knowledge Injection Proposal ─────────────────────────────────────────────
+
+function formatDictEntryContent(entry: DictEntry): string {
+  const lines: string[] = [];
+  if (entry.table_description) {
+    lines.push(`Description: ${entry.table_description}`);
+    lines.push('');
+  }
+  if (entry.columns && entry.columns.length > 0) {
+    lines.push('Colonnes:');
+    for (const col of entry.columns) {
+      let line = `- ${col.name} (${col.type})`;
+      if (col.business_description) line += `: ${col.business_description}`;
+      lines.push(line);
+      if (col.format) lines.push(`  Format: ${col.format}`);
+      if (col.possible_values) lines.push(`  Valeurs possibles: ${col.possible_values}`);
+    }
+  }
+  return lines.join('\n');
+}
+
+function KnowledgeInjectionProposal({ entries, isLast }: { entries: DictEntry[]; isLast: boolean }) {
+  const { knowledgeFolders, setKnowledgeFolders } = useAppStore();
+  const [status, setStatus] = useState<'idle' | 'injecting' | 'done' | 'dismissed'>('idle');
+  const [injected, setInjected] = useState(0);
+
+  if (!isLast || status === 'dismissed') return null;
+
+  if (status === 'done') {
+    return (
+      <div className="mt-3 flex items-center gap-2 p-3 bg-emerald-50 border border-emerald-200 rounded-xl">
+        <CheckCircle2 size={14} className="text-emerald-500 shrink-0" />
+        <span className="text-xs text-emerald-700 font-medium">
+          {injected} entrée{injected > 1 ? 's' : ''} injectée{injected > 1 ? 's' : ''} dans la Knowledge Base.
+        </span>
+      </div>
+    );
+  }
+
+  if (status === 'injecting') {
+    return (
+      <div className="mt-3 flex items-center gap-2 p-3 bg-emerald-50 border border-emerald-200 rounded-xl">
+        <Loader2 size={14} className="animate-spin text-emerald-500 shrink-0" />
+        <span className="text-xs text-emerald-700 font-medium">
+          Injection en cours… ({injected}/{entries.length})
+        </span>
+      </div>
+    );
+  }
+
+  async function handleInject() {
+    setStatus('injecting');
+    let count = 0;
+    const newFolders: { id: number; title: string; content: string; updated_at: string }[] = [];
+    for (const entry of entries) {
+      const title = `${entry.table} — ${entry.table_description || 'Table'} BOT`;
+      const content = formatDictEntryContent(entry);
+      try {
+        const res = await fetch('/api/knowledge/folders', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title, content }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          newFolders.push(data);
+          count++;
+          setInjected(count);
+        }
+      } catch {
+        // continue with next entry
+      }
+    }
+    setKnowledgeFolders([...knowledgeFolders, ...newFolders]);
+    setInjected(count);
+    setStatus('done');
+  }
+
+  return (
+    <div className="mt-3 p-3 bg-amber-50 border border-amber-200 rounded-xl">
+      <div className="flex items-start gap-2">
+        <BookOpen size={14} className="text-amber-600 shrink-0 mt-0.5" />
+        <div className="flex-1 min-w-0">
+          <p className="text-xs font-semibold text-amber-800">
+            Injecter dans la Knowledge Base ?
+          </p>
+          <p className="text-[10px] text-amber-700 mt-0.5 leading-relaxed">
+            {entries.length} table{entries.length > 1 ? 's' : ''} documentée{entries.length > 1 ? 's' : ''} — souhaitez-vous enregistrer ces résultats dans la Knowledge Base pour enrichir les futures requêtes AI ?
+          </p>
+          <div className="flex gap-2 mt-2">
+            <button
+              onClick={handleInject}
+              className="flex items-center gap-1 px-3 py-1.5 bg-emerald-500 hover:bg-emerald-600 text-white text-[10px] font-semibold rounded-lg transition-colors"
+            >
+              <BookOpen size={10} />
+              Oui, injecter
+            </button>
+            <button
+              onClick={() => setStatus('dismissed')}
+              className="px-3 py-1.5 text-[10px] font-medium text-amber-700 hover:bg-amber-100 rounded-lg transition-colors"
+            >
+              Non merci
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Key Identifier Sub-components ────────────────────────────────────────────
 
 const CONFIDENCE_BADGE: Record<string, string> = {
@@ -1655,6 +1765,9 @@ function AssistantMessage({
         {msg.steps && msg.steps.length > 0 && <StepsPanel steps={msg.steps} />}
         {msg.data_dictionary && msg.data_dictionary.length > 0 && (
           <DictionaryOutputPanel entries={msg.data_dictionary} />
+        )}
+        {msg.data_dictionary && msg.data_dictionary.length > 0 && (
+          <KnowledgeInjectionProposal entries={msg.data_dictionary} isLast={isLast} />
         )}
 
         {/* Key Identifier views */}
