@@ -1598,6 +1598,83 @@ Do not include markdown formatting. Just the raw JSON.
 
 
 # ---------------------------------------------------------------------------
+# Executive Summary — bullet-point synthesis
+# ---------------------------------------------------------------------------
+@app.route("/api/summarize_executive", methods=["POST"])
+def summarize_executive():
+    """Condense an executive summary into 5 key bullet points with risk flags.
+
+    Request body (JSON):
+        text  – the full executive summary / agent final answer
+        lang  – optional language code ("fr" | "en", default "fr")
+
+    Response (JSON):
+        bullets – list of dicts {point: str, risk: bool, severity: "high"|"medium"|"info"}
+        preamble – short introductory sentence
+    """
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
+    lang = data.get("lang", "fr")
+
+    if not text:
+        return jsonify({"error": "No text provided."}), 400
+
+    system_prompt = (
+        "You are an expert executive analyst. Your task is to distill a detailed "
+        "analysis report into exactly 5 concise bullet points for a C-level audience. "
+        "For each point, identify if it contains a risk or warning flag. "
+        "Reply ONLY with valid JSON — no markdown, no extra text."
+    )
+
+    if lang == "fr":
+        format_instruction = (
+            "Réponds en FRANÇAIS. Rédige exactement 5 points synthétiques en langage "
+            "de comité exécutif. Pour chaque point indique s'il constitue un risque/point "
+            "d'attention (risk: true/false) et sa sévérité (severity: 'high', 'medium' ou 'info').\n"
+            "Format JSON attendu:\n"
+            '{"preamble": "Phrase introductive courte.", "bullets": ['
+            '{"point": "Texte du bullet point", "risk": false, "severity": "info"}, ...]}'
+        )
+    else:
+        format_instruction = (
+            "Write in ENGLISH. Draft exactly 5 concise bullet points in executive committee "
+            "language. For each point indicate if it is a risk/watch point (risk: true/false) "
+            "and its severity (severity: 'high', 'medium' or 'info').\n"
+            "Expected JSON format:\n"
+            '{"preamble": "Short introductory sentence.", "bullets": ['
+            '{"point": "Bullet point text", "risk": false, "severity": "info"}, ...]}'
+        )
+
+    messages = [{"role": "user", "content": f"Analysis to summarize:\n\n{text}\n\n{format_instruction}"}]
+
+    try:
+        raw = _call_llm(system_prompt, messages, temperature=0.3)
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError:
+            import re as _re
+            m = _re.search(r"\{.*\}", raw, _re.DOTALL)
+            result = json.loads(m.group(0)) if m else {}
+
+        bullets = result.get("bullets", [])
+        # Ensure exactly 5 bullets and normalize fields
+        normalized = []
+        for b in bullets[:5]:
+            if isinstance(b, dict):
+                normalized.append({
+                    "point": str(b.get("point", "")),
+                    "risk": bool(b.get("risk", False)),
+                    "severity": b.get("severity", "info") if b.get("severity") in ("high", "medium", "info") else "info",
+                })
+        return jsonify({
+            "preamble": str(result.get("preamble", "")),
+            "bullets": normalized,
+        })
+    except Exception as exc:
+        return jsonify({"error": f"LLM error: {exc}"}), 500
+
+
+# ---------------------------------------------------------------------------
 # Agent Analysis — agentic loop (up to 10 distinct ClickHouse queries)
 # ---------------------------------------------------------------------------
 @app.route("/api/agent", methods=["POST"])
@@ -3845,7 +3922,9 @@ def _run_key_identifier_agent():
             sample_res = client.query(
                 f"SELECT * FROM `{database}`.`{table_name}` LIMIT {sample_size * 3}"
             )
-            col_names = [c[0] for c in sample_res.column_names] if hasattr(sample_res, 'column_names') else [c[0] for c in columns]
+            # column_names is a tuple/list of strings — use directly, not c[0]
+            raw_names = sample_res.column_names if hasattr(sample_res, 'column_names') else None
+            col_names = list(raw_names) if raw_names is not None else [c[0] for c in columns]
             rows = sample_res.result_rows
         except Exception:
             rows = []
@@ -3853,10 +3932,15 @@ def _run_key_identifier_agent():
 
         # Build per-column value sets from sampled rows
         col_samples: dict[str, set] = {c[0]: set() for c in columns}
-        for row in rows:
-            for i, val in enumerate(row):
-                if i < len(col_names) and val is not None and str(val).strip() != "":
-                    col_samples[col_names[i]].add(str(val))
+        try:
+            for row in rows:
+                for i, val in enumerate(row):
+                    if i < len(col_names) and val is not None and str(val).strip() != "":
+                        col_key = col_names[i]
+                        if col_key in col_samples:
+                            col_samples[col_key].add(str(val))
+        except Exception:
+            pass  # Sampling failure is non-fatal
 
         kept = 0
         for col_name, col_type in columns:

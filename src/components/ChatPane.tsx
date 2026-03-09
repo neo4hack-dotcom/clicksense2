@@ -4,7 +4,7 @@ import {
   Maximize2, Minimize2, Minus, CheckSquare, Filter, X,
   Brain, ChevronDown, ChevronRight, CheckCircle2, XCircle, Database,
   AlertTriangle, Info, Lightbulb, TrendingUp, TrendingDown, BarChart2, BookOpen,
-  Download, FolderOpen,
+  Download, FolderOpen, FileText, Zap, ShieldAlert, ShieldCheck,
 } from 'lucide-react';
 import { useAppStore } from '../store';
 import clsx from 'clsx';
@@ -165,6 +165,330 @@ function MarkdownContent({ text, isUser = false }: { text: string; isUser?: bool
   return <div className="space-y-0.5">{elements}</div>;
 }
 
+// ── Executive Summary Bullet Result ────────────────────────────────────────
+
+interface ExecBullet {
+  point: string;
+  risk: boolean;
+  severity: 'high' | 'medium' | 'info';
+}
+
+interface ExecSummaryResult {
+  preamble: string;
+  bullets: ExecBullet[];
+}
+
+function ExecBulletView({ result }: { result: ExecSummaryResult }) {
+  const severityStyle = {
+    high: 'border-red-200 bg-red-50 text-red-800',
+    medium: 'border-amber-200 bg-amber-50 text-amber-800',
+    info: 'border-emerald-200 bg-emerald-50 text-emerald-800',
+  };
+  const severityDot = {
+    high: 'bg-red-500',
+    medium: 'bg-amber-400',
+    info: 'bg-emerald-400',
+  };
+
+  return (
+    <div className="mt-3 rounded-xl overflow-hidden border border-indigo-200 shadow-sm">
+      <div className="px-4 py-2.5 bg-gradient-to-r from-indigo-600 to-violet-600 flex items-center gap-2">
+        <Zap size={13} className="text-indigo-200" />
+        <span className="text-xs font-bold text-white uppercase tracking-wide">5 Points Clés — Comité Exécutif</span>
+      </div>
+      {result.preamble && (
+        <div className="px-4 pt-3 pb-1">
+          <p className="text-xs text-slate-500 italic leading-relaxed">{result.preamble}</p>
+        </div>
+      )}
+      <div className="p-3 space-y-2">
+        {result.bullets.map((b, i) => (
+          <div
+            key={i}
+            className={clsx(
+              'flex items-start gap-3 p-3 rounded-lg border text-xs leading-relaxed',
+              severityStyle[b.severity]
+            )}
+          >
+            <div className="flex items-center gap-1.5 flex-shrink-0 mt-0.5">
+              <span className={clsx('w-2 h-2 rounded-full', severityDot[b.severity])} />
+              <span className="font-black text-slate-400 text-[10px] w-3">{i + 1}</span>
+            </div>
+            <span className="flex-1">{b.point}</span>
+            {b.risk && (
+              <ShieldAlert size={13} className={clsx(
+                'flex-shrink-0 mt-0.5',
+                b.severity === 'high' ? 'text-red-500' : 'text-amber-500'
+              )} />
+            )}
+            {!b.risk && <ShieldCheck size={13} className="flex-shrink-0 mt-0.5 text-emerald-500" />}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── PDF Generator for Executive Summary ─────────────────────────────────────
+
+function generateExecSummaryPDF(content: string, title?: string) {
+  const genDate = new Date().toLocaleDateString('fr-FR', {
+    year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit',
+  });
+  const reportTitle = title || 'Executive Summary';
+
+  // Convert markdown to styled HTML sections
+  function mdToHtml(md: string): string {
+    const lines = md.split('\n');
+    let html = '';
+    let inList = false;
+    let listOrdered = false;
+
+    const flushList = () => {
+      if (!inList) return '';
+      inList = false;
+      return listOrdered ? '</ol>' : '</ul>';
+    };
+
+    const inlineStyles = (text: string) =>
+      text
+        .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+        .replace(/\*([^*]+)\*/g, '<em>$1</em>')
+        .replace(/`([^`]+)`/g, '<code style="font-family:\'Courier New\',monospace;background:#f1f5f9;padding:1px 5px;border-radius:3px;font-size:11px;">$1</code>');
+
+    for (const line of lines) {
+      const h1 = line.match(/^#\s+(.+)/);
+      const h2 = line.match(/^##\s+(.+)/);
+      const h3 = line.match(/^###\s+(.+)/);
+      const ul = line.match(/^[\s]*[-*•]\s+(.+)/);
+      const ol = line.match(/^[\s]*\d+[.)]\s+(.+)/);
+      const hr = /^-{3,}$/.test(line.trim());
+      const bq = line.match(/^>\s*(.*)/);
+
+      if (h1) {
+        html += flushList();
+        html += `<h1 style="font-size:20px;font-weight:900;color:#0f172a;margin:20px 0 8px;line-height:1.2;">${inlineStyles(h1[1])}</h1>`;
+      } else if (h2) {
+        html += flushList();
+        html += `<h2 style="font-size:15px;font-weight:700;color:#1e293b;margin:16px 0 6px;padding-bottom:4px;border-bottom:1px solid #e2e8f0;">${inlineStyles(h2[1])}</h2>`;
+      } else if (h3) {
+        html += flushList();
+        html += `<h3 style="font-size:12px;font-weight:700;color:#334155;margin:12px 0 4px;text-transform:uppercase;letter-spacing:0.05em;">${inlineStyles(h3[1])}</h3>`;
+      } else if (hr) {
+        html += flushList();
+        html += `<hr style="border:none;border-top:1px solid #e2e8f0;margin:16px 0;" />`;
+      } else if (bq) {
+        html += flushList();
+        html += `<blockquote style="border-left:3px solid #6366f1;padding:6px 12px;margin:8px 0;background:#f8f7ff;color:#4338ca;font-style:italic;font-size:12px;">${inlineStyles(bq[1])}</blockquote>`;
+      } else if (ul) {
+        if (!inList || listOrdered) { html += flushList(); html += '<ul style="margin:6px 0;padding-left:20px;">'; inList = true; listOrdered = false; }
+        html += `<li style="font-size:12px;line-height:1.7;color:#334155;margin:2px 0;">${inlineStyles(ul[1])}</li>`;
+      } else if (ol) {
+        if (!inList || !listOrdered) { html += flushList(); html += '<ol style="margin:6px 0;padding-left:20px;">'; inList = true; listOrdered = true; }
+        html += `<li style="font-size:12px;line-height:1.7;color:#334155;margin:2px 0;">${inlineStyles(ol[1])}</li>`;
+      } else if (line.trim() === '') {
+        html += flushList();
+        html += '<div style="height:8px;"></div>';
+      } else {
+        html += flushList();
+        html += `<p style="font-size:12px;line-height:1.75;color:#334155;margin:4px 0;">${inlineStyles(line)}</p>`;
+      }
+    }
+    html += flushList();
+    return html;
+  }
+
+  const bodyHtml = mdToHtml(content);
+
+  const html = `<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8"/>
+<title>${reportTitle} — ClickSense</title>
+<style>
+* { box-sizing:border-box; margin:0; padding:0; }
+body { font-family:'Segoe UI',system-ui,-apple-system,sans-serif; color:#0f172a; background:#f8fafc; -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+@media print {
+  body { background:white; }
+  @page { margin:15mm 14mm; size:A4; }
+  .no-print { display:none !important; }
+  .page-break { page-break-before:always; }
+}
+strong { font-weight:700; color:#0f172a; }
+em { font-style:italic; }
+</style>
+</head>
+<body style="max-width:860px;margin:0 auto;padding:28px 24px;">
+
+  <!-- Cover gradient banner -->
+  <div style="border-radius:16px;overflow:hidden;margin-bottom:32px;background:linear-gradient(135deg,#4f46e5 0%,#6d28d9 40%,#0891b2 100%);">
+    <div style="padding:36px 40px 28px;">
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:20px;">
+        <div>
+          <span style="display:inline-block;background:rgba(255,255,255,0.18);color:rgba(255,255,255,0.92);font-size:9px;font-weight:700;letter-spacing:0.14em;text-transform:uppercase;padding:3px 11px;border-radius:20px;margin-bottom:12px;">Rapport Confidentiel · Comité Exécutif</span>
+          <h1 style="font-size:28px;font-weight:900;color:white;line-height:1.15;margin-bottom:6px;">${reportTitle}</h1>
+          <p style="font-size:13px;color:rgba(255,255,255,0.72);">Analyse approfondie multi-étapes · ClickSense AI Agent</p>
+        </div>
+        <div style="padding:14px;border-radius:16px;background:rgba(255,255,255,0.12);flex-shrink:0;">
+          <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.9)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+          </svg>
+        </div>
+      </div>
+      <div style="display:flex;gap:24px;padding-top:18px;border-top:1px solid rgba(255,255,255,0.2);">
+        <div>
+          <div style="font-size:10px;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:0.08em;">Généré le</div>
+          <div style="font-size:12px;font-weight:600;color:rgba(255,255,255,0.9);margin-top:2px;">${genDate}</div>
+        </div>
+        <div>
+          <div style="font-size:10px;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:0.08em;">Outil</div>
+          <div style="font-size:12px;font-weight:600;color:rgba(255,255,255,0.9);margin-top:2px;">ClickSense AI</div>
+        </div>
+        <div>
+          <div style="font-size:10px;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:0.08em;">Classification</div>
+          <div style="font-size:12px;font-weight:600;color:rgba(255,255,255,0.9);margin-top:2px;">Confidentiel</div>
+        </div>
+      </div>
+    </div>
+    <div style="padding:8px 40px;background:rgba(0,0,0,0.18);font-size:9px;color:rgba(255,255,255,0.55);letter-spacing:0.04em;">
+      Document généré automatiquement par ClickSense · Usage réservé au comité de direction
+    </div>
+  </div>
+
+  <!-- Main content -->
+  <div style="background:white;border:1px solid #e2e8f0;border-radius:16px;overflow:hidden;margin-bottom:24px;">
+    <div style="display:flex;align-items:center;gap:10px;padding:14px 20px;background:#f8fafc;border-bottom:1px solid #f1f5f9;">
+      <div style="width:6px;height:6px;border-radius:50%;background:linear-gradient(135deg,#4f46e5,#0891b2);"></div>
+      <span style="font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.08em;">Analyse complète</span>
+    </div>
+    <div style="padding:28px 32px;line-height:1.75;">
+      ${bodyHtml}
+    </div>
+  </div>
+
+  <!-- Footer -->
+  <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 18px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;font-size:9px;color:#94a3b8;">
+    <span>ClickSense Executive Report · Confidentiel</span>
+    <span>${genDate}</span>
+  </div>
+
+  <!-- Print button (hidden in print) -->
+  <div class="no-print" style="text-align:center;margin-top:20px;">
+    <button onclick="window.print()" style="padding:10px 28px;background:linear-gradient(135deg,#4f46e5,#6d28d9);color:white;border:none;border-radius:10px;font-size:13px;font-weight:600;cursor:pointer;box-shadow:0 2px 12px rgba(79,70,229,0.3);">
+      Imprimer / Enregistrer en PDF
+    </button>
+  </div>
+
+</body>
+</html>`;
+
+  const win = window.open('', '_blank');
+  if (!win) return;
+  win.document.write(html);
+  win.document.close();
+  setTimeout(() => { try { win.print(); } catch { /* ignore */ } }, 900);
+}
+
+// ── Executive Summary Action Buttons ────────────────────────────────────────
+
+function ExecSummaryActions({ content, dismissed, onDismiss }: {
+  content: string;
+  dismissed: boolean;
+  onDismiss: () => void;
+}) {
+  const [loading5, setLoading5] = useState(false);
+  const [result5, setResult5] = useState<ExecSummaryResult | null>(null);
+  const [error5, setError5] = useState('');
+
+  if (dismissed) return null;
+
+  const handle5Points = async () => {
+    setLoading5(true);
+    setError5('');
+    try {
+      const res = await fetch('/api/summarize_executive', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: content, lang: 'fr' }),
+      });
+      const data = await res.json();
+      if (data.error) { setError5(data.error); return; }
+      setResult5(data);
+    } catch (e: any) {
+      setError5(e.message);
+    } finally {
+      setLoading5(false);
+    }
+  };
+
+  return (
+    <div className="mt-3">
+      {!result5 && (
+        <div className="flex items-center gap-2 p-3 rounded-xl bg-gradient-to-r from-indigo-50 to-violet-50 border border-indigo-100">
+          <div className="flex-1 min-w-0">
+            <p className="text-[11px] font-semibold text-indigo-700 mb-0.5">Actions disponibles</p>
+            <p className="text-[10px] text-indigo-400 leading-relaxed">
+              Condensez cette analyse ou exportez-la en PDF pour votre comité exécutif.
+            </p>
+          </div>
+          <div className="flex items-center gap-1.5 flex-shrink-0">
+            <button
+              onClick={handle5Points}
+              disabled={loading5}
+              title="Résumé 5 points clés avec risques"
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white rounded-lg text-[11px] font-semibold transition-colors shadow-sm"
+            >
+              {loading5 ? <Loader2 size={11} className="animate-spin" /> : <Zap size={11} />}
+              5 points clés
+            </button>
+            <button
+              onClick={() => generateExecSummaryPDF(content)}
+              title="Export PDF — présentation comité exécutif"
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-violet-600 hover:bg-violet-700 text-white rounded-lg text-[11px] font-semibold transition-colors shadow-sm"
+            >
+              <FileText size={11} />
+              Export PDF
+            </button>
+            <button
+              onClick={onDismiss}
+              title="Ignorer"
+              className="p-1.5 text-indigo-300 hover:text-indigo-500 hover:bg-indigo-100 rounded-md transition-colors"
+            >
+              <X size={12} />
+            </button>
+          </div>
+        </div>
+      )}
+      {error5 && (
+        <div className="mt-2 flex items-center gap-2 p-2 bg-red-50 border border-red-200 rounded-lg text-xs text-red-600">
+          <AlertTriangle size={12} />
+          {error5}
+        </div>
+      )}
+      {result5 && (
+        <div>
+          <ExecBulletView result={result5} />
+          <div className="mt-2 flex items-center justify-between">
+            <button
+              onClick={() => generateExecSummaryPDF(content)}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-violet-600 hover:bg-violet-700 text-white rounded-lg text-[11px] font-semibold transition-colors shadow-sm"
+            >
+              <FileText size={11} />
+              Export PDF complet
+            </button>
+            <button
+              onClick={onDismiss}
+              className="text-[10px] text-slate-400 hover:text-slate-600 flex items-center gap-1"
+            >
+              <X size={10} /> Fermer
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function ChatPane() {
   const {
     chatHistory, addChatMessage, clearChatHistory,
@@ -180,6 +504,7 @@ export function ChatPane() {
   const [isLoading, setIsLoading] = useState(false);
   const [isAgentLoading, setIsAgentLoading] = useState(false);
   const [expandedSteps, setExpandedSteps] = useState<Record<number, boolean>>({});
+  const [dismissedExecActions, setDismissedExecActions] = useState<Set<number>>(new Set());
 
   // CSV export state
   const [exportDialogOpen, setExportDialogOpen] = useState(false);
@@ -740,6 +1065,15 @@ export function ChatPane() {
                       })}
                     </div>
                   </div>
+                )}
+
+                {/* Executive Summary action buttons — shown after agent analysis */}
+                {msg.is_agent && msg.role === 'assistant' && (
+                  <ExecSummaryActions
+                    content={msg.content}
+                    dismissed={dismissedExecActions.has(i)}
+                    onDismiss={() => setDismissedExecActions(prev => new Set([...prev, i]))}
+                  />
                 )}
               </div>
             </motion.div>
