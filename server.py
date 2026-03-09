@@ -2946,7 +2946,7 @@ def _cw_get_schema_info(client, database: str, max_tables: int = 30) -> str:
 
 def _cw_detect_bot_table(sql: str) -> str | None:
     """Extract the BOT_ table name from a CREATE TABLE statement."""
-    m = re.search(r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:`[^`]+`\.)?`?(BOT_\w+)`?",
+    m = re.search(r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:(?:`[^`]+`|\w+)\.)?`?(BOT_\w+)`?",
                   sql, re.IGNORECASE)
     return m.group(1) if m else None
 
@@ -3008,7 +3008,7 @@ def _cw_is_sql_safe(sql: str) -> tuple[bool, str]:
     # ── DROP TABLE [IF EXISTS] [db.]table ────────────────────────────────────
     table = _cw_extract_table_name(
         sql_stripped,
-        r"DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:`[^`]+`\.)?(`?\w+`?)",
+        r"DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:(?:`[^`]+`|\w+)\.)?(`?\w+`?)",
     )
     if table is not None:
         err = _require_bot(table, "DROP TABLE")
@@ -3019,7 +3019,7 @@ def _cw_is_sql_safe(sql: str) -> tuple[bool, str]:
     # ── ALTER TABLE [db.]table ───────────────────────────────────────────────
     table = _cw_extract_table_name(
         sql_stripped,
-        r"ALTER\s+TABLE\s+(?:`[^`]+`\.)?(`?\w+`?)",
+        r"ALTER\s+TABLE\s+(?:(?:`[^`]+`|\w+)\.)?(`?\w+`?)",
     )
     if table is not None:
         err = _require_bot(table, "ALTER TABLE")
@@ -3030,7 +3030,7 @@ def _cw_is_sql_safe(sql: str) -> tuple[bool, str]:
     # ── TRUNCATE [TABLE] [db.]table ──────────────────────────────────────────
     table = _cw_extract_table_name(
         sql_stripped,
-        r"TRUNCATE\s+(?:TABLE\s+)?(?:`[^`]+`\.)?(`?\w+`?)",
+        r"TRUNCATE\s+(?:TABLE\s+)?(?:(?:`[^`]+`|\w+)\.)?(`?\w+`?)",
     )
     if table is not None:
         err = _require_bot(table, "TRUNCATE")
@@ -3041,7 +3041,7 @@ def _cw_is_sql_safe(sql: str) -> tuple[bool, str]:
     # ── DELETE FROM [db.]table ───────────────────────────────────────────────
     table = _cw_extract_table_name(
         sql_stripped,
-        r"DELETE\s+FROM\s+(?:`[^`]+`\.)?(`?\w+`?)",
+        r"DELETE\s+FROM\s+(?:(?:`[^`]+`|\w+)\.)?(`?\w+`?)",
     )
     if table is not None:
         err = _require_bot(table, "DELETE FROM")
@@ -3052,7 +3052,7 @@ def _cw_is_sql_safe(sql: str) -> tuple[bool, str]:
     # ── CREATE TABLE [IF NOT EXISTS] [db.]table ──────────────────────────────
     table = _cw_extract_table_name(
         sql_stripped,
-        r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:`[^`]+`\.)?(`?\w+`?)",
+        r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:(?:`[^`]+`|\w+)\.)?(`?\w+`?)",
     )
     if table is not None:
         err = _require_bot(table, "CREATE TABLE")
@@ -3063,7 +3063,7 @@ def _cw_is_sql_safe(sql: str) -> tuple[bool, str]:
     # ── INSERT INTO [db.]table ───────────────────────────────────────────────
     table = _cw_extract_table_name(
         sql_stripped,
-        r"INSERT\s+INTO\s+(?:`[^`]+`\.)?(`?\w+`?)",
+        r"INSERT\s+INTO\s+(?:(?:`[^`]+`|\w+)\.)?(`?\w+`?)",
     )
     if table is not None:
         err = _require_bot(table, "INSERT INTO")
