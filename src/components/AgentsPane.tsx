@@ -4,8 +4,10 @@ import {
   Loader2, Database, FileText, Settings2, Table2, Columns3,
   MessageSquare, Play, RefreshCw, Zap, AlertTriangle, Info,
   RotateCcw, Trash2, BookOpen, TrendingUp, Star, Code2, Download,
+  GitFork, ArrowRight, ArrowLeftRight, ThumbsUp, ThumbsDown,
 } from 'lucide-react';
 import clsx from 'clsx';
+import { useAppStore } from '../store';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -44,6 +46,18 @@ interface StepInfo {
   ok: boolean;
   columns_count?: number;
   error?: string;
+}
+
+// ── Key Identifier Types ────────────────────────────────────────────────────
+
+interface FkSuggestion {
+  table_a: string;
+  field_a: string;
+  table_b: string;
+  field_b: string;
+  direction: string;
+  confidence: 'high' | 'medium' | 'low';
+  reason: string;
 }
 
 // ── Writer Agent Types ──────────────────────────────────────────────────────
@@ -124,6 +138,9 @@ interface ChatMessage {
   tables_processed?: number;
   total_tables?: number;
   error?: string;
+  // Key Identifier fields
+  suggestions?: FkSuggestion[];
+  total_fields?: number;
   // Writer Agent fields
   status?: string;
   plan?: WriterPlan;
@@ -143,32 +160,36 @@ interface ChatMessage {
 
 function AgentCard({ agent, selected, onClick }: { agent: Agent; selected: boolean; onClick: () => void }) {
   const isWriter = agent.id === 'clickhouse-writer';
+  const isKeyId = agent.id === 'key-identifier';
+  const activeColor = isWriter ? 'violet' : isKeyId ? 'indigo' : 'emerald';
   return (
     <button
       onClick={onClick}
       className={clsx(
         'w-full text-left p-4 rounded-xl border transition-all duration-200 group',
         selected
-          ? isWriter ? 'border-violet-500 bg-violet-500/10' : 'border-emerald-500 bg-emerald-500/10'
-          : isWriter
-            ? 'border-slate-200 bg-white hover:border-violet-300 hover:shadow-sm'
-            : 'border-slate-200 bg-white hover:border-emerald-300 hover:shadow-sm',
+          ? `border-${activeColor}-500 bg-${activeColor}-500/10`
+          : `border-slate-200 bg-white hover:border-${activeColor}-300 hover:shadow-sm`,
       )}
     >
       <div className="flex items-start gap-3">
         <div className={clsx(
           'p-2 rounded-lg flex-shrink-0 transition-colors',
           selected
-            ? isWriter ? 'bg-violet-500 text-white' : 'bg-emerald-500 text-white'
+            ? isWriter ? 'bg-violet-500 text-white' : isKeyId ? 'bg-indigo-500 text-white' : 'bg-emerald-500 text-white'
             : isWriter
               ? 'bg-slate-100 text-slate-500 group-hover:bg-violet-100 group-hover:text-violet-600'
-              : 'bg-slate-100 text-slate-500 group-hover:bg-emerald-100 group-hover:text-emerald-600',
+              : isKeyId
+                ? 'bg-slate-100 text-slate-500 group-hover:bg-indigo-100 group-hover:text-indigo-600'
+                : 'bg-slate-100 text-slate-500 group-hover:bg-emerald-100 group-hover:text-emerald-600',
         )}>
-          {isWriter ? <Zap size={16} /> : <Cpu size={16} />}
+          {isWriter ? <Zap size={16} /> : isKeyId ? <GitFork size={16} /> : <Cpu size={16} />}
         </div>
         <div className="min-w-0">
           <p className={clsx('text-sm font-semibold truncate',
-            selected ? isWriter ? 'text-violet-700' : 'text-emerald-700' : 'text-slate-800')}>
+            selected
+              ? isWriter ? 'text-violet-700' : isKeyId ? 'text-indigo-700' : 'text-emerald-700'
+              : 'text-slate-800')}>
             {agent.name}
           </p>
           <p className="text-xs text-slate-500 mt-0.5 line-clamp-2 leading-relaxed">
@@ -723,6 +744,163 @@ function DictionaryOutputPanel({ entries }: { entries: DictEntry[] }) {
       ) : (
         <DataDictionaryView entries={entries} />
       )}
+    </div>
+  );
+}
+
+// ── Key Identifier Sub-components ────────────────────────────────────────────
+
+const CONFIDENCE_BADGE: Record<string, string> = {
+  high: 'bg-emerald-100 text-emerald-700 border-emerald-200',
+  medium: 'bg-amber-100 text-amber-700 border-amber-200',
+  low: 'bg-slate-100 text-slate-500 border-slate-200',
+};
+
+function KeyIdentifierView({ suggestions }: { suggestions: FkSuggestion[] }) {
+  const { fkRelations, setFkRelations } = useAppStore();
+  // Track confirmed/rejected per suggestion index
+  const [statuses, setStatuses] = useState<Record<number, 'confirmed' | 'rejected' | null>>({});
+  // Track flipped direction per suggestion index
+  const [flipped, setFlipped] = useState<Record<number, boolean>>({});
+  const [saving, setSaving] = useState<Record<number, boolean>>({});
+
+  if (!suggestions.length) {
+    return (
+      <div className="mt-3 flex flex-col items-center justify-center py-8 text-slate-400">
+        <GitFork size={28} className="mb-2 opacity-30" />
+        <p className="text-sm">Aucune relation FK détectée avec le seuil de confiance sélectionné.</p>
+      </div>
+    );
+  }
+
+  const handleConfirm = async (idx: number, sug: FkSuggestion) => {
+    const isFlipped = !!flipped[idx];
+    const table_a = isFlipped ? sug.table_b : sug.table_a;
+    const field_a = isFlipped ? sug.field_b : sug.field_a;
+    const table_b = isFlipped ? sug.table_a : sug.table_b;
+    const field_b = isFlipped ? sug.field_a : sug.field_b;
+    const direction = isFlipped
+      ? `${table_a}.${field_a} → ${table_b}.${field_b}  (${field_a} référence ${field_b})`
+      : (sug.direction || `${table_a}.${field_a} → ${table_b}.${field_b}`);
+
+    setSaving(prev => ({ ...prev, [idx]: true }));
+    try {
+      const res = await fetch('/api/fk-relations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ table_a, field_a, table_b, field_b, direction, llm_reason: sug.reason }),
+      });
+      if (res.ok) {
+        const newRel = await res.json();
+        setFkRelations([...fkRelations, newRel]);
+        setStatuses(prev => ({ ...prev, [idx]: 'confirmed' }));
+      } else {
+        alert('Erreur lors de la sauvegarde.');
+      }
+    } catch {
+      alert('Erreur réseau.');
+    } finally {
+      setSaving(prev => ({ ...prev, [idx]: false }));
+    }
+  };
+
+  const handleReject = (idx: number) => {
+    setStatuses(prev => ({ ...prev, [idx]: 'rejected' }));
+  };
+
+  const handleFlip = (idx: number) => {
+    setStatuses(prev => ({ ...prev, [idx]: null }));
+    setFlipped(prev => ({ ...prev, [idx]: !prev[idx] }));
+  };
+
+  return (
+    <div className="mt-3 space-y-2">
+      <p className="text-xs text-slate-500 font-medium">
+        {suggestions.length} relation{suggestions.length > 1 ? 's' : ''} potentielle{suggestions.length > 1 ? 's' : ''} détectée{suggestions.length > 1 ? 's' : ''} —
+        confirmez ou rejetez chaque relation, et ajustez le sens si nécessaire.
+      </p>
+      {suggestions.map((sug, idx) => {
+        const status = statuses[idx];
+        const isFlipped = !!flipped[idx];
+        const srcTable = isFlipped ? sug.table_b : sug.table_a;
+        const srcField = isFlipped ? sug.field_b : sug.field_a;
+        const dstTable = isFlipped ? sug.table_a : sug.table_b;
+        const dstField = isFlipped ? sug.field_a : sug.field_b;
+
+        return (
+          <div
+            key={idx}
+            className={clsx(
+              'rounded-xl border p-3 transition-all',
+              status === 'confirmed' ? 'border-emerald-300 bg-emerald-50' :
+              status === 'rejected' ? 'border-red-200 bg-red-50 opacity-50' :
+              'border-slate-200 bg-white',
+            )}
+          >
+            {/* Relation header */}
+            <div className="flex items-center gap-2 flex-wrap mb-1.5">
+              <span className="font-mono text-xs font-semibold text-slate-800">
+                {srcTable}.<span className="text-violet-600">{srcField}</span>
+              </span>
+              <ArrowRight size={12} className="text-slate-400 shrink-0" />
+              <span className="font-mono text-xs font-semibold text-slate-800">
+                {dstTable}.<span className="text-emerald-600">{dstField}</span>
+              </span>
+              <span className={clsx('ml-auto px-1.5 py-0.5 rounded-full text-[9px] font-bold border', CONFIDENCE_BADGE[sug.confidence] || CONFIDENCE_BADGE.medium)}>
+                {sug.confidence.toUpperCase()}
+              </span>
+            </div>
+
+            {/* LLM reason */}
+            {sug.reason && (
+              <p className="text-[10px] text-slate-500 italic mb-2">{sug.reason}</p>
+            )}
+
+            {/* Actions */}
+            {status == null && (
+              <div className="flex items-center gap-1.5 mt-2">
+                <button
+                  onClick={() => handleFlip(idx)}
+                  title="Inverser le sens de la relation"
+                  className="flex items-center gap-1 px-2 py-1 text-[10px] font-medium text-slate-500 hover:text-violet-600 hover:bg-violet-50 border border-slate-200 hover:border-violet-200 rounded-lg transition-colors"
+                >
+                  <ArrowLeftRight size={10} />
+                  Inverser
+                </button>
+                <button
+                  onClick={() => handleConfirm(idx, sug)}
+                  disabled={!!saving[idx]}
+                  className="flex items-center gap-1 px-2.5 py-1 text-[10px] font-semibold bg-emerald-500 hover:bg-emerald-600 text-white rounded-lg transition-colors disabled:opacity-50"
+                >
+                  {saving[idx] ? <Loader2 size={10} className="animate-spin" /> : <ThumbsUp size={10} />}
+                  Confirmer
+                </button>
+                <button
+                  onClick={() => handleReject(idx)}
+                  className="flex items-center gap-1 px-2.5 py-1 text-[10px] font-semibold text-red-500 hover:bg-red-50 border border-red-200 rounded-lg transition-colors"
+                >
+                  <ThumbsDown size={10} />
+                  Rejeter
+                </button>
+              </div>
+            )}
+
+            {/* Status badges */}
+            {status === 'confirmed' && (
+              <div className="flex items-center gap-1.5 mt-1.5">
+                <CheckCircle2 size={12} className="text-emerald-500" />
+                <span className="text-[10px] font-semibold text-emerald-700">Relation enregistrée dans la Knowledge Base</span>
+              </div>
+            )}
+            {status === 'rejected' && (
+              <div className="flex items-center gap-1.5 mt-1.5">
+                <XCircle size={12} className="text-red-400" />
+                <span className="text-[10px] text-red-500">Relation ignorée</span>
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -1282,21 +1460,24 @@ function AssistantMessage({
 
   const isWriter = !!(msg.plan || msg.action_log || msg.synthesis
     || msg.question || msg.status);
+  const isKeyId = msg.suggestions !== undefined;
 
   return (
     <div className="flex gap-3 justify-start">
       <div className={clsx(
         'p-2 rounded-full flex-shrink-0 self-start mt-1',
-        isWriter ? 'bg-violet-100' : 'bg-emerald-100',
+        isWriter ? 'bg-violet-100' : isKeyId ? 'bg-indigo-100' : 'bg-emerald-100',
       )}>
         {isWriter
           ? <Zap size={14} className="text-violet-600" />
-          : <Cpu size={14} className="text-emerald-600" />}
+          : isKeyId
+            ? <GitFork size={14} className="text-indigo-600" />
+            : <Cpu size={14} className="text-emerald-600" />}
       </div>
       <div className="flex-1 max-w-full overflow-hidden">
         <div className={clsx(
           'border rounded-xl px-4 py-3 shadow-sm',
-          isWriter ? 'bg-white border-violet-100' : 'bg-white border-slate-200',
+          isWriter ? 'bg-white border-violet-100' : isKeyId ? 'bg-white border-indigo-100' : 'bg-white border-slate-200',
         )}>
           <p className="text-sm text-slate-700">{msg.content}</p>
           {/* Data dictionary summary */}
@@ -1308,12 +1489,26 @@ function AssistantMessage({
               </span>
             </div>
           )}
+          {/* Key Identifier summary */}
+          {isKeyId && msg.suggestions !== undefined && (
+            <div className="flex items-center gap-2 mt-2">
+              <GitFork size={13} className="text-indigo-500" />
+              <span className="text-xs text-indigo-700 font-medium">
+                {msg.suggestions.length} relation{msg.suggestions.length !== 1 ? 's' : ''} potentielle{msg.suggestions.length !== 1 ? 's' : ''} · {msg.total_fields ?? '?'} champs analysés
+              </span>
+            </div>
+          )}
         </div>
 
         {/* Data dictionary views */}
         {msg.steps && msg.steps.length > 0 && <StepsPanel steps={msg.steps} />}
         {msg.data_dictionary && msg.data_dictionary.length > 0 && (
           <DictionaryOutputPanel entries={msg.data_dictionary} />
+        )}
+
+        {/* Key Identifier views */}
+        {isKeyId && msg.suggestions !== undefined && (
+          <KeyIdentifierView suggestions={msg.suggestions} />
         )}
 
         {/* Writer agent views */}
@@ -1399,6 +1594,20 @@ export function AgentsPane() {
           content: data.content ?? 'Opération terminée.',
           ...data,
         }]);
+      } else if (selectedAgent.id === 'key-identifier') {
+        // Key Identifier agent
+        const sugs = data.suggestions ?? [];
+        const totalFields = data.total_fields ?? 0;
+        const content = sugs.length > 0
+          ? `${sugs.length} relation${sugs.length > 1 ? 's' : ''} FK potentielle${sugs.length > 1 ? 's' : ''} identifiée${sugs.length > 1 ? 's' : ''} sur ${totalFields} champs candidats. Confirmez ou rejetez chaque proposition ci-dessous.`
+          : (data.message ?? `Analyse terminée — aucune relation FK détectée parmi ${totalFields} champs candidats.`);
+        setMessages(prev => [...prev, {
+          role: 'assistant',
+          content,
+          suggestions: sugs,
+          total_fields: totalFields,
+          steps: data.steps,
+        }]);
       } else {
         // Data dictionary agent
         const processed = data.tables_processed ?? 0;
@@ -1432,6 +1641,7 @@ export function AgentsPane() {
   }
 
   const isWriter = selectedAgent?.id === 'clickhouse-writer';
+  const isKeyId = selectedAgent?.id === 'key-identifier';
 
   // ── Render ────────────────────────────────────────────────────────────
 
@@ -1485,10 +1695,10 @@ export function AgentsPane() {
           {/* Agent header */}
           <div className={clsx(
             'bg-white border-b px-6 py-3 flex items-center gap-3 flex-shrink-0',
-            isWriter ? 'border-violet-100' : 'border-slate-200',
+            isWriter ? 'border-violet-100' : isKeyId ? 'border-indigo-100' : 'border-slate-200',
           )}>
-            <div className={clsx('p-2 rounded-lg', isWriter ? 'bg-violet-600' : 'bg-emerald-500')}>
-              {isWriter ? <Zap size={16} className="text-white" /> : <Cpu size={16} className="text-white" />}
+            <div className={clsx('p-2 rounded-lg', isWriter ? 'bg-violet-600' : isKeyId ? 'bg-indigo-500' : 'bg-emerald-500')}>
+              {isWriter ? <Zap size={16} className="text-white" /> : isKeyId ? <GitFork size={16} className="text-white" /> : <Cpu size={16} className="text-white" />}
             </div>
             <div className="flex-1 min-w-0">
               <h2 className="text-sm font-bold text-slate-800">{selectedAgent.name}</h2>
@@ -1583,6 +1793,35 @@ export function AgentsPane() {
                           key={s}
                           onClick={() => setInput(s)}
                           className="px-3 py-1.5 text-xs bg-white border border-violet-200 rounded-full text-violet-700 hover:border-violet-400 hover:bg-violet-50 transition-colors text-left"
+                        >
+                          {s}
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                ) : isKeyId ? (
+                  <>
+                    <div className="p-4 bg-indigo-50 rounded-2xl mb-4">
+                      <GitFork size={36} className="text-indigo-400" />
+                    </div>
+                    <p className="text-sm text-slate-600 font-semibold mb-1">
+                      Agent Key Identifier
+                    </p>
+                    <p className="text-xs text-slate-400 max-w-sm leading-relaxed mb-4">
+                      Cet agent va scanner toutes vos tables, échantillonner jusqu'à 5 valeurs par champ candidat,
+                      puis utiliser le LLM pour détecter les relations FK potentielles.
+                      Configurez les paramètres ci-dessus, puis lancez l'analyse.
+                    </p>
+                    <div className="flex flex-wrap gap-2 justify-center">
+                      {[
+                        'Analyse toutes les tables et identifie les clés étrangères',
+                        'Trouve les relations entre les tables de ma base',
+                        'Identifie les champs qui se correspondent entre les tables',
+                      ].map(s => (
+                        <button
+                          key={s}
+                          onClick={() => setInput(s)}
+                          className="px-3 py-1.5 text-xs bg-white border border-indigo-200 rounded-full text-indigo-700 hover:border-indigo-400 hover:bg-indigo-50 transition-colors text-left"
                         >
                           {s}
                         </button>

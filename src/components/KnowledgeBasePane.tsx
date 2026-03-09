@@ -1,11 +1,11 @@
 import { useState, useEffect } from 'react';
-import { BookOpen, Plus, Save, Trash2, Edit3, CheckCircle2, FolderOpen, X, ChevronDown, ChevronRight, Table2, Search } from 'lucide-react';
-import { useAppStore, KnowledgeFolder } from '../store';
+import { BookOpen, Plus, Save, Trash2, Edit3, CheckCircle2, FolderOpen, X, ChevronDown, ChevronRight, Table2, Search, GitFork, ArrowRight, RotateCcw } from 'lucide-react';
+import { useAppStore, KnowledgeFolder, FkRelation } from '../store';
 import { motion, AnimatePresence } from 'motion/react';
 
 export function KnowledgeBasePane() {
-  const { knowledgeFolders, setKnowledgeFolders, schema, tableMappings, setTableMappings } = useAppStore();
-  const [activeSubTab, setActiveSubTab] = useState<'folders' | 'table-mapping'>('folders');
+  const { knowledgeFolders, setKnowledgeFolders, schema, tableMappings, setTableMappings, fkRelations, setFkRelations } = useAppStore();
+  const [activeSubTab, setActiveSubTab] = useState<'folders' | 'table-mapping' | 'fk-relations'>('folders');
 
   // Folders state
   const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set());
@@ -21,6 +21,9 @@ export function KnowledgeBasePane() {
   const [savingTable, setSavingTable] = useState<string | null>(null);
   const [savedTable, setSavedTable] = useState<string | null>(null);
 
+  // FK relations state
+  const [deletingFkId, setDeletingFkId] = useState<number | null>(null);
+
   useEffect(() => {
     fetch('/api/knowledge/folders')
       .then(res => res.json())
@@ -28,6 +31,10 @@ export function KnowledgeBasePane() {
     fetch('/api/table-mappings')
       .then(res => res.json())
       .then((data: { table_name: string; mapping_name: string }[]) => setTableMappings(data));
+    fetch('/api/fk-relations')
+      .then(res => res.json())
+      .then((data: FkRelation[]) => setFkRelations(data))
+      .catch(() => {});
   }, []);
 
   const toggleExpand = (id: number) => {
@@ -162,6 +169,22 @@ export function KnowledgeBasePane() {
           {tableMappings.length > 0 && (
             <span className="bg-emerald-100 text-emerald-700 text-xs px-1.5 py-0.5 rounded-full font-semibold">
               {tableMappings.length}
+            </span>
+          )}
+        </button>
+        <button
+          onClick={() => setActiveSubTab('fk-relations')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+            activeSubTab === 'fk-relations'
+              ? 'bg-white text-slate-800 shadow-sm'
+              : 'text-slate-500 hover:text-slate-700'
+          }`}
+        >
+          <GitFork size={15} />
+          FK Relations
+          {fkRelations.length > 0 && (
+            <span className="bg-violet-100 text-violet-700 text-xs px-1.5 py-0.5 rounded-full font-semibold">
+              {fkRelations.length}
             </span>
           )}
         </button>
@@ -367,6 +390,16 @@ export function KnowledgeBasePane() {
       </div>
       )}
 
+      {/* ── FK Relations sub-tab ── */}
+      {activeSubTab === 'fk-relations' && (
+        <FkRelationsTab
+          fkRelations={fkRelations}
+          setFkRelations={setFkRelations}
+          deletingFkId={deletingFkId}
+          setDeletingFkId={setDeletingFkId}
+        />
+      )}
+
       {/* ── Table Mapping sub-tab ── */}
       {activeSubTab === 'table-mapping' && (
         <div>
@@ -455,6 +488,114 @@ export function KnowledgeBasePane() {
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+// ── FK Relations sub-tab ─────────────────────────────────────────────────────
+
+interface FkRelationsTabProps {
+  fkRelations: FkRelation[];
+  setFkRelations: (relations: FkRelation[]) => void;
+  deletingFkId: number | null;
+  setDeletingFkId: (id: number | null) => void;
+}
+
+function FkRelationsTab({ fkRelations, setFkRelations, deletingFkId, setDeletingFkId }: FkRelationsTabProps) {
+  const handleDelete = async (id: number) => {
+    if (!confirm('Supprimer cette relation FK ?')) return;
+    setDeletingFkId(id);
+    try {
+      await fetch(`/api/fk-relations/${id}`, { method: 'DELETE' });
+      setFkRelations(fkRelations.filter(r => r.id !== id));
+    } catch {
+      alert('Erreur lors de la suppression.');
+    } finally {
+      setDeletingFkId(null);
+    }
+  };
+
+  const CONFIDENCE_COLORS: Record<string, string> = {
+    high: 'bg-emerald-100 text-emerald-700',
+    medium: 'bg-amber-100 text-amber-700',
+    low: 'bg-slate-100 text-slate-500',
+  };
+
+  return (
+    <div>
+      <div className="mb-4 flex items-start justify-between">
+        <div>
+          <p className="text-slate-500 text-sm max-w-2xl">
+            Relations de clé étrangère identifiées par l'<strong>Agent Key Identifier</strong> et confirmées par vous.
+            Ces relations sont automatiquement injectées dans le contexte de l'IA pour améliorer la génération de requêtes SQL (JOINs).
+          </p>
+        </div>
+      </div>
+
+      {fkRelations.length === 0 ? (
+        <div className="flex flex-col items-center justify-center h-48 text-slate-400 bg-white rounded-2xl border border-dashed border-slate-200">
+          <GitFork size={36} className="mb-3 opacity-20" />
+          <p className="text-sm font-medium">Aucune relation FK enregistrée.</p>
+          <p className="text-xs mt-1 text-slate-400">Lancez l'<strong>Agent Key Identifier</strong> depuis l'onglet Agents pour découvrir des relations.</p>
+        </div>
+      ) : (
+        <div className="space-y-2">
+          <AnimatePresence>
+            {fkRelations.map(rel => (
+              <motion.div
+                key={rel.id}
+                initial={{ opacity: 0, y: -8 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, x: -20 }}
+                className="bg-white rounded-xl border border-slate-200 shadow-sm p-4 flex items-start gap-4"
+              >
+                {/* Icon */}
+                <div className="p-2 bg-violet-50 rounded-lg shrink-0 mt-0.5">
+                  <GitFork size={16} className="text-violet-500" />
+                </div>
+
+                {/* Relation detail */}
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="font-mono text-sm font-semibold text-slate-800">
+                      {rel.table_a}.<span className="text-violet-600">{rel.field_a}</span>
+                    </span>
+                    <ArrowRight size={14} className="text-slate-400 shrink-0" />
+                    <span className="font-mono text-sm font-semibold text-slate-800">
+                      {rel.table_b}.<span className="text-emerald-600">{rel.field_b}</span>
+                    </span>
+                  </div>
+                  {rel.direction && (
+                    <p className="text-xs text-slate-500 mt-1 font-mono">{rel.direction}</p>
+                  )}
+                  {rel.llm_reason && (
+                    <p className="text-xs text-slate-400 mt-1 italic">{rel.llm_reason}</p>
+                  )}
+                  <p className="text-[10px] text-slate-400 mt-1.5">
+                    Ajouté le {new Date(rel.created_at).toLocaleDateString()}
+                  </p>
+                </div>
+
+                {/* Delete */}
+                <button
+                  onClick={() => handleDelete(rel.id)}
+                  disabled={deletingFkId === rel.id}
+                  className="p-1.5 text-slate-300 hover:text-red-400 hover:bg-red-50 rounded-lg transition-colors shrink-0 disabled:opacity-50"
+                  title="Supprimer cette relation"
+                >
+                  {deletingFkId === rel.id ? <RotateCcw size={14} className="animate-spin" /> : <Trash2 size={14} />}
+                </button>
+              </motion.div>
+            ))}
+          </AnimatePresence>
+        </div>
+      )}
+
+      <div className="mt-4 p-3 bg-violet-50 border border-violet-100 rounded-xl text-xs text-violet-700">
+        <strong>Comment ça marche ?</strong> L'Agent Key Identifier analyse vos tables, échantillonne jusqu'à 5 valeurs par champ candidat,
+        puis utilise le LLM local pour identifier les correspondances FK↔PK. Vous confirmez les relations depuis l'onglet Agents
+        — elles apparaissent ici et enrichissent automatiquement la génération de SQL.
+      </div>
     </div>
   );
 }

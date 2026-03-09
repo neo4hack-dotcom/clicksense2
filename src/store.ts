@@ -13,6 +13,17 @@ export interface TableMapping {
   mapping_name: string;
 }
 
+export interface FkRelation {
+  id: number;
+  table_a: string;
+  field_a: string;
+  table_b: string;
+  field_b: string;
+  direction: string;
+  llm_reason: string;
+  created_at: string;
+}
+
 export interface RagConfig {
   esHost: string;
   esIndex: string;
@@ -113,6 +124,9 @@ interface AppState {
   tableMappings: TableMapping[];
   setTableMappings: (mappings: TableMapping[]) => void;
 
+  fkRelations: FkRelation[];
+  setFkRelations: (relations: FkRelation[]) => void;
+
   selectedTableMappings: string[];
   setSelectedTableMappings: (tables: string[]) => void;
 
@@ -164,6 +178,9 @@ export const useAppStore = create<AppState>((set) => ({
 
   tableMappings: [],
   setTableMappings: (tableMappings) => set({ tableMappings }),
+
+  fkRelations: [],
+  setFkRelations: (fkRelations) => set({ fkRelations }),
 
   selectedTableMappings: [],
   setSelectedTableMappings: (selectedTableMappings) => set({ selectedTableMappings }),

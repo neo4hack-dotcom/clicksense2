@@ -69,6 +69,7 @@ DEFAULT_DB = {
     "table_metadata": [],
     "knowledge_folders": [],
     "table_mappings": [],
+    "fk_relations": [],
 }
 
 
@@ -1265,6 +1266,48 @@ def delete_table_mapping(table_name):
 
 
 # ---------------------------------------------------------------------------
+# FK Relations (foreign-key relationships discovered by the Key Identifier agent)
+# ---------------------------------------------------------------------------
+@app.route("/api/fk-relations", methods=["GET"])
+def get_fk_relations():
+    db = read_db()
+    return jsonify(db.get("fk_relations", []))
+
+
+@app.route("/api/fk-relations", methods=["POST"])
+def create_fk_relation():
+    data = request.get_json(silent=True) or {}
+    required = ["table_a", "field_a", "table_b", "field_b"]
+    for field in required:
+        if not data.get(field, "").strip():
+            return jsonify({"error": f"'{field}' is required"}), 400
+    db = read_db()
+    relations = db.setdefault("fk_relations", [])
+    new_id = max((r["id"] for r in relations), default=0) + 1
+    record = {
+        "id": new_id,
+        "table_a": data["table_a"].strip(),
+        "field_a": data["field_a"].strip(),
+        "table_b": data["table_b"].strip(),
+        "field_b": data["field_b"].strip(),
+        "direction": data.get("direction", "").strip(),
+        "llm_reason": data.get("llm_reason", "").strip(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    relations.append(record)
+    write_db(db)
+    return jsonify(record), 201
+
+
+@app.route("/api/fk-relations/<int:relation_id>", methods=["DELETE"])
+def delete_fk_relation(relation_id):
+    db = read_db()
+    db["fk_relations"] = [r for r in db.get("fk_relations", []) if r["id"] != relation_id]
+    write_db(db)
+    return jsonify({"success": True})
+
+
+# ---------------------------------------------------------------------------
 # Query history
 # ---------------------------------------------------------------------------
 @app.route("/api/history", methods=["POST"])
@@ -1372,6 +1415,20 @@ def chat():
     # Build a map of technical name -> friendly mapping name
     all_mappings = {m["table_name"]: m["mapping_name"] for m in db.get("table_mappings", [])}
 
+    # Build FK relations context (confirmed by user via Key Identifier agent)
+    fk_relations = db.get("fk_relations", [])
+    if fk_relations:
+        fk_lines = []
+        for r in fk_relations:
+            direction = r.get("direction") or f"{r['table_a']}.{r['field_a']} → {r['table_b']}.{r['field_b']}"
+            fk_lines.append(f"  - {direction}")
+        fk_context = (
+            "KNOWN FOREIGN KEY RELATIONS — use these to build JOIN clauses when relevant:\n"
+            + "\n".join(fk_lines)
+        )
+    else:
+        fk_context = ""
+
     # If a filter is active, restrict the schema to selected tables only
     if table_mapping_filter:
         schema = {t: cols for t, cols in schema.items() if t in table_mapping_filter}
@@ -1454,7 +1511,7 @@ When NOT ambiguous, return ONLY this JSON:
 Do not include markdown formatting. Just the raw JSON.
 """
     messages_tokens = sum(_estimate_tokens(m.get("content", "")) for m in formatted_messages)
-    base_tokens = _estimate_tokens(base_prompt_template) + _estimate_tokens(mapping_note) + messages_tokens
+    base_tokens = _estimate_tokens(base_prompt_template) + _estimate_tokens(mapping_note) + _estimate_tokens(fk_context) + messages_tokens
 
     # Truncate dynamic context (schema / metadata / knowledge) to fit the budget
     schema, table_metadata, knowledge_context = _truncate_prompt_context(
@@ -1471,6 +1528,8 @@ Here is the table metadata (functional descriptions):
 {json.dumps(table_metadata, indent=2)}
 
 {mapping_note}
+
+{fk_context}
 
 Here is the functional knowledge base:
 {knowledge_context}
@@ -2642,6 +2701,39 @@ AGENTS_CATALOG = [
         ],
     },
     {
+        "id": "key-identifier",
+        "name": "Agent Key Identifier",
+        "description": (
+            "Scanne toutes les tables et identifie par similarité de nom de champ et de type de valeur "
+            "les relations de clé étrangère potentielles entre les tables. Propose d'enregistrer les "
+            "relations confirmées dans la Knowledge Base pour enrichir la génération de requêtes SQL."
+        ),
+        "parameters": [
+            {
+                "name": "database",
+                "label": "Base de données",
+                "type": "string",
+                "default": "",
+                "description": "Nom de la base à analyser (vide = base par défaut configurée)",
+            },
+            {
+                "name": "sample_size",
+                "label": "Valeurs échantillon par champ",
+                "type": "number",
+                "default": 5,
+                "description": "Nombre de valeurs distinctes à échantillonner par champ (1–5) pour identifier les correspondances",
+            },
+            {
+                "name": "confidence",
+                "label": "Seuil de confiance",
+                "type": "select",
+                "options": ["low", "medium", "high"],
+                "default": "medium",
+                "description": "Niveau de confiance minimum pour qu'une relation soit proposée",
+            },
+        ],
+    },
+    {
         "id": "clickhouse-writer",
         "name": "ClickHouse Writer Agent",
         "description": (
@@ -2690,6 +2782,8 @@ def agent_chat(agent_id):
         return _run_data_dictionary_agent()
     if agent_id == "clickhouse-writer":
         return _run_clickhouse_writer_agent()
+    if agent_id == "key-identifier":
+        return _run_key_identifier_agent()
     return jsonify({"error": f"Agent '{agent_id}' introuvable."}), 404
 
 
@@ -3467,6 +3561,212 @@ def _run_clickhouse_writer_agent():
     _writer_sessions[session_id] = session
     result["session_id"] = session_id
     return jsonify(result)
+
+
+def _run_key_identifier_agent():
+    """
+    Key Identifier Agent.
+
+    Scans all tables and columns in ClickHouse, samples up to 5 distinct non-null
+    values per column, then uses the local LLM to identify potential foreign-key
+    relationships by field-name similarity and value-type matching.
+
+    Request body (JSON):
+        params:
+            database    : str  – database name (empty = default)
+            sample_size : int  – distinct values to sample per column (1–5, default 5)
+            confidence  : str  – "low" | "medium" | "high" (default "medium")
+
+    Response (JSON):
+        steps       – per-table analysis log
+        suggestions – list of FK candidates with table_a/field_a/table_b/field_b/direction/confidence/reason
+        total_fields – total fields analysed
+    """
+    data = request.get_json(silent=True) or {}
+    params = data.get("params", {})
+
+    database = (params.get("database") or "").strip() or clickhouse_config.get("database", "default")
+    try:
+        sample_size = max(1, min(int(params.get("sample_size", 5)), 5))
+    except (TypeError, ValueError):
+        sample_size = 5
+    confidence_threshold = params.get("confidence", "medium")
+
+    # ── Connect ──────────────────────────────────────────────────────────────
+    try:
+        client = get_clickhouse_client()
+    except Exception as exc:
+        return jsonify({"error": f"Impossible de se connecter à ClickHouse : {exc}"}), 500
+
+    # ── List tables ──────────────────────────────────────────────────────────
+    try:
+        res = client.query(f"SHOW TABLES FROM `{database}`")
+        table_list = [row[0] for row in res.result_rows]
+    except Exception as exc:
+        return jsonify({"error": f"Impossible de lister les tables de '{database}' : {exc}"}), 500
+
+    if not table_list:
+        return jsonify({"error": f"Aucune table trouvée dans la base '{database}'."}), 404
+
+    # ── Heuristic: field names that often carry key semantics ─────────────────
+    KEY_PATTERNS = (
+        "id", "key", "code", "ref", "fk", "pk", "num", "no", "number",
+        "uuid", "guid", "hash", "token", "identifier",
+    )
+    KEY_TYPES = (
+        "int", "uint", "int8", "int16", "int32", "int64",
+        "uint8", "uint16", "uint32", "uint64",
+        "uuid", "fixedstring", "string",
+    )
+
+    def _is_key_field(name: str, col_type: str) -> bool:
+        n = name.lower()
+        t = col_type.lower().split("(")[0]
+        name_matches = any(p in n for p in KEY_PATTERNS)
+        type_matches = any(t.startswith(k) for k in KEY_TYPES)
+        return name_matches or type_matches
+
+    steps = []
+    # field_catalog: list of {table, field, type, samples}
+    field_catalog = []
+
+    for table_name in table_list:
+        try:
+            schema_res = client.query(f"DESCRIBE TABLE `{database}`.`{table_name}`")
+            columns = [(row[0], row[1]) for row in schema_res.result_rows]
+        except Exception as exc:
+            steps.append({"table": table_name, "ok": False, "error": str(exc)})
+            continue
+
+        # Sample all rows at once to minimise round-trips
+        try:
+            sample_res = client.query(
+                f"SELECT * FROM `{database}`.`{table_name}` LIMIT {sample_size * 3}"
+            )
+            col_names = [c[0] for c in sample_res.column_names] if hasattr(sample_res, 'column_names') else [c[0] for c in columns]
+            rows = sample_res.result_rows
+        except Exception:
+            rows = []
+            col_names = [c[0] for c in columns]
+
+        # Build per-column value sets from sampled rows
+        col_samples: dict[str, set] = {c[0]: set() for c in columns}
+        for row in rows:
+            for i, val in enumerate(row):
+                if i < len(col_names) and val is not None and str(val).strip() != "":
+                    col_samples[col_names[i]].add(str(val))
+
+        kept = 0
+        for col_name, col_type in columns:
+            if not _is_key_field(col_name, col_type):
+                continue
+            samples = sorted(list(col_samples.get(col_name, set())))[:sample_size]
+            field_catalog.append({
+                "table": table_name,
+                "field": col_name,
+                "type": col_type,
+                "samples": samples,
+            })
+            kept += 1
+
+        steps.append({"table": table_name, "ok": True, "fields_kept": kept, "total_fields": len(columns)})
+
+    if len(field_catalog) < 2:
+        return jsonify({
+            "steps": steps,
+            "suggestions": [],
+            "total_fields": len(field_catalog),
+            "message": "Pas assez de champs candidats trouvés pour établir des relations.",
+        })
+
+    # ── Build compact prompt for the LLM ─────────────────────────────────────
+    # Format: TABLE.FIELD [TYPE]: val1, val2, ...
+    lines = []
+    for f in field_catalog:
+        sample_str = ", ".join(f["samples"]) if f["samples"] else "(no sample)"
+        lines.append(f"{f['table']}.{f['field']} [{f['type']}]: {sample_str}")
+
+    fields_block = "\n".join(lines)
+
+    confidence_instruction = {
+        "low": "Include low, medium and high confidence matches.",
+        "medium": "Include only medium and high confidence matches.",
+        "high": "Include only high confidence matches.",
+    }.get(confidence_threshold, "Include only medium and high confidence matches.")
+
+    system_prompt = (
+        "You are a database analyst expert in identifying foreign key relationships. "
+        "Analyse field names, types and sample values to find FK→PK links between tables. "
+        "Reply with valid JSON only — no markdown, no extra text."
+    )
+
+    user_content = (
+        f"Database: {database}\n\n"
+        "Fields (TABLE.FIELD [TYPE]: sample_values):\n"
+        f"{fields_block}\n\n"
+        f"Task: identify potential foreign-key relationships. {confidence_instruction}\n"
+        "For each relationship, determine which field references which (the FK side has values "
+        "that are a subset of the PK side).\n\n"
+        "Return ONLY a JSON array (max 20 items):\n"
+        '[\n'
+        '  {\n'
+        '    "table_a": "source_table",\n'
+        '    "field_a": "fk_field",\n'
+        '    "table_b": "target_table",\n'
+        '    "field_b": "pk_field",\n'
+        '    "direction": "table_a.field_a → table_b.field_b  (field_a references field_b)",\n'
+        '    "confidence": "high|medium|low",\n'
+        '    "reason": "brief explanation (field name similarity / value overlap / type match)"\n'
+        '  }\n'
+        ']'
+    )
+
+    try:
+        llm_raw = _call_llm(
+            system_prompt,
+            [{"role": "user", "content": user_content}],
+            temperature=0.1,
+        )
+        try:
+            suggestions = json.loads(llm_raw)
+            if not isinstance(suggestions, list):
+                suggestions = []
+        except json.JSONDecodeError:
+            # Try to extract JSON array from response
+            import re as _re
+            m = _re.search(r"\[.*\]", llm_raw, _re.DOTALL)
+            suggestions = json.loads(m.group(0)) if m else []
+    except Exception as exc:
+        return jsonify({"error": f"LLM error: {exc}", "steps": steps}), 500
+
+    # Normalise and filter
+    clean_suggestions = []
+    for s in suggestions:
+        if not isinstance(s, dict):
+            continue
+        if not all(k in s for k in ("table_a", "field_a", "table_b", "field_b")):
+            continue
+        # Filter by confidence threshold
+        conf = s.get("confidence", "medium").lower()
+        if confidence_threshold == "high" and conf != "high":
+            continue
+        if confidence_threshold == "medium" and conf == "low":
+            continue
+        clean_suggestions.append({
+            "table_a": str(s.get("table_a", "")),
+            "field_a": str(s.get("field_a", "")),
+            "table_b": str(s.get("table_b", "")),
+            "field_b": str(s.get("field_b", "")),
+            "direction": str(s.get("direction", "")),
+            "confidence": conf,
+            "reason": str(s.get("reason", "")),
+        })
+
+    return jsonify({
+        "steps": steps,
+        "suggestions": clean_suggestions,
+        "total_fields": len(field_catalog),
+    })
 
 
 def _run_data_dictionary_agent():
