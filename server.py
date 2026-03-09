@@ -2836,6 +2836,9 @@ def import_config():
 # In-memory session store for the ClickHouse Writer agent
 _writer_sessions: dict = {}
 
+# In-memory session store for the ETL agent
+_etl_sessions: dict = {}
+
 AGENTS_CATALOG = [
     {
         "id": "data-dictionary",
@@ -2943,6 +2946,47 @@ AGENTS_CATALOG = [
             },
         ],
     },
+    {
+        "id": "etl-agent",
+        "name": "ETL Agent — Import fichiers",
+        "description": (
+            "Agent ETL autonome : parcourt un dossier (csv, excel, parquet, txt…), "
+            "analyse les fichiers, crée des tables BOT_ETL_* dans ClickHouse, insère les données, "
+            "ajoute des champs calculés (C_*) et peut enrichir depuis des tables existantes. "
+            "Jusqu'à 15 actions paramétrables, demande confirmation à l'utilisateur en cas de doute."
+        ),
+        "parameters": [
+            {
+                "name": "folder_path",
+                "label": "Dossier source",
+                "type": "string",
+                "default": "",
+                "description": "Chemin absolu du dossier contenant les fichiers à importer",
+            },
+            {
+                "name": "recursive",
+                "label": "Sous-dossiers",
+                "type": "select",
+                "options": ["non", "oui"],
+                "default": "non",
+                "description": "Explorer aussi les sous-dossiers",
+            },
+            {
+                "name": "database",
+                "label": "Base de données cible",
+                "type": "string",
+                "default": "",
+                "description": "Base ClickHouse cible (vide = base par défaut)",
+            },
+            {
+                "name": "max_actions",
+                "label": "Nombre max d'actions",
+                "type": "number",
+                "default": 15,
+                "description": "Budget maximum d'actions successives (1-30)",
+            },
+        ],
+    },
 ]
 
 
@@ -2961,7 +3005,49 @@ def agent_chat(agent_id):
         return _run_clickhouse_writer_agent()
     if agent_id == "key-identifier":
         return _run_key_identifier_agent()
+    if agent_id == "etl-agent":
+        return _run_etl_agent()
     return jsonify({"error": f"Agent '{agent_id}' introuvable."}), 404
+
+
+@app.route("/api/agents/etl-agent/cleanup", methods=["POST"])
+def etl_agent_cleanup():
+    """Drop all BOT_ETL_ tables for a given ETL session."""
+    data = request.get_json(silent=True) or {}
+    session_id = data.get("session_id", "")
+    session = _etl_sessions.get(session_id, {})
+    created_tables = session.get("created_tables", [])
+    database = session.get("database", clickhouse_config.get("database", "default"))
+    try:
+        client = get_clickhouse_client()
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+    dropped, errors = [], []
+    for table in created_tables:
+        try:
+            client.command(f"DROP TABLE IF EXISTS `{database}`.`{table}`")
+            dropped.append(table)
+        except Exception as exc:
+            errors.append(f"{table}: {str(exc)}")
+    if session_id in _etl_sessions:
+        _etl_sessions[session_id]["created_tables"] = [
+            t for t in created_tables if t not in dropped
+        ]
+    return jsonify({"dropped": dropped, "errors": errors})
+
+
+@app.route("/api/etl/browse", methods=["POST"])
+def etl_browse_files():
+    """List supported data files in a folder."""
+    data = request.get_json(silent=True) or {}
+    folder = data.get("folder_path", "").strip()
+    recursive = data.get("recursive", False)
+    if not folder:
+        return jsonify({"error": "folder_path est requis."}), 400
+    if not os.path.isdir(folder):
+        return jsonify({"error": f"Dossier introuvable: {folder}"}), 404
+    files = _etl_list_files(folder, recursive)
+    return jsonify({"files": files, "count": len(files)})
 
 
 @app.route("/api/agents/clickhouse-writer/cleanup", methods=["POST"])
@@ -4204,6 +4290,1064 @@ def _run_data_dictionary_agent():
         "tables_processed": tables_processed,
         "total_tables": len(table_list),
     })
+
+
+# ===========================================================================
+# ETL Agent — helper functions
+# ===========================================================================
+
+_ETL_EXTENSIONS = {".csv", ".tsv", ".txt", ".xlsx", ".xls", ".parquet", ".json"}
+
+
+def _etl_list_files(folder_path: str, recursive: bool = False) -> list[dict]:
+    """Return a list of supported data files found in the folder."""
+    import pathlib
+    root = pathlib.Path(folder_path)
+    results = []
+    pattern = "**/*" if recursive else "*"
+    for p in sorted(root.glob(pattern)):
+        if p.is_file() and p.suffix.lower() in _ETL_EXTENSIONS:
+            try:
+                size_bytes = p.stat().st_size
+            except Exception:
+                size_bytes = 0
+            results.append({
+                "path": str(p),
+                "name": p.name,
+                "relative": str(p.relative_to(root)),
+                "extension": p.suffix.lower(),
+                "size_bytes": size_bytes,
+                "size_human": _etl_human_size(size_bytes),
+            })
+    return results
+
+
+def _etl_human_size(size: int) -> str:
+    for unit in ("o", "Ko", "Mo", "Go"):
+        if size < 1024:
+            return f"{size:.0f} {unit}"
+        size /= 1024
+    return f"{size:.1f} To"
+
+
+def _etl_parse_file(file_path: str, max_rows: int = 5000) -> tuple[list[str], list[dict], str]:
+    """
+    Parse a data file and return (column_names, sample_rows_as_dicts, error).
+    Supports CSV/TSV/TXT, Excel, Parquet, JSON.
+    Returns up to max_rows rows.
+    """
+    import pathlib
+    ext = pathlib.Path(file_path).suffix.lower()
+    try:
+        import pandas as pd
+        if ext in (".csv", ".tsv", ".txt"):
+            sep = "\t" if ext in (".tsv", ".txt") else ","
+            # Try comma first for txt
+            try:
+                df = pd.read_csv(file_path, sep=sep, nrows=max_rows, low_memory=False)
+                if len(df.columns) == 1 and ext == ".txt":
+                    df = pd.read_csv(file_path, sep=",", nrows=max_rows, low_memory=False)
+            except Exception:
+                df = pd.read_csv(file_path, sep=None, engine="python", nrows=max_rows, low_memory=False)
+        elif ext in (".xlsx", ".xls"):
+            df = pd.read_excel(file_path, nrows=max_rows)
+        elif ext == ".parquet":
+            df = pd.read_parquet(file_path)
+            if len(df) > max_rows:
+                df = df.head(max_rows)
+        elif ext == ".json":
+            df = pd.read_json(file_path, lines=True) if _etl_is_jsonl(file_path) else pd.read_json(file_path)
+            if len(df) > max_rows:
+                df = df.head(max_rows)
+        else:
+            return [], [], f"Extension non supportée: {ext}"
+
+        # Clean column names
+        df.columns = [str(c).strip().replace(" ", "_").replace("-", "_") for c in df.columns]
+        columns = list(df.columns)
+        rows = df.head(5).astype(str).replace("nan", "").to_dict(orient="records")
+        return columns, rows, ""
+    except Exception as exc:
+        return [], [], str(exc)
+
+
+def _etl_parse_file_full(file_path: str) -> tuple[list[str], list[dict], int, str]:
+    """
+    Parse a data file fully and return (column_names, all_rows_as_dicts, row_count, error).
+    """
+    import pathlib
+    ext = pathlib.Path(file_path).suffix.lower()
+    try:
+        import pandas as pd
+        if ext in (".csv", ".tsv", ".txt"):
+            sep = "\t" if ext in (".tsv", ".txt") else ","
+            try:
+                df = pd.read_csv(file_path, sep=sep, low_memory=False)
+                if len(df.columns) == 1 and ext == ".txt":
+                    df = pd.read_csv(file_path, sep=",", low_memory=False)
+            except Exception:
+                df = pd.read_csv(file_path, sep=None, engine="python", low_memory=False)
+        elif ext in (".xlsx", ".xls"):
+            df = pd.read_excel(file_path)
+        elif ext == ".parquet":
+            df = pd.read_parquet(file_path)
+        elif ext == ".json":
+            df = pd.read_json(file_path, lines=True) if _etl_is_jsonl(file_path) else pd.read_json(file_path)
+        else:
+            return [], [], 0, f"Extension non supportée: {ext}"
+
+        df.columns = [str(c).strip().replace(" ", "_").replace("-", "_") for c in df.columns]
+        # Replace NaN with None for JSON serialization
+        df = df.where(df.notna(), None)
+        columns = list(df.columns)
+        rows = df.to_dict(orient="records")
+        return columns, rows, len(rows), ""
+    except Exception as exc:
+        return [], [], 0, str(exc)
+
+
+def _etl_is_jsonl(file_path: str) -> bool:
+    """Check if a JSON file is in JSONL format (one JSON object per line)."""
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            first_line = f.readline().strip()
+            return first_line.startswith("{")
+    except Exception:
+        return False
+
+
+def _etl_infer_ch_type(series_dtype, sample_values: list) -> str:
+    """Infer a ClickHouse column type from a pandas dtype and sample values."""
+    dtype_str = str(series_dtype).lower()
+    if "int" in dtype_str:
+        return "Int64"
+    if "float" in dtype_str:
+        return "Float64"
+    if "bool" in dtype_str:
+        return "UInt8"
+    if "datetime" in dtype_str or "timestamp" in dtype_str:
+        return "DateTime"
+    if "date" in dtype_str:
+        return "Date"
+    # Try to detect from sample values
+    non_null = [v for v in sample_values if v is not None and str(v).strip() not in ("", "nan", "None")]
+    if non_null:
+        # Integer detection
+        try:
+            all(int(str(v)) == float(str(v)) for v in non_null[:10])
+            return "Int64"
+        except (ValueError, TypeError):
+            pass
+        # Float detection
+        try:
+            all(float(str(v)) for v in non_null[:10])
+            return "Float64"
+        except (ValueError, TypeError):
+            pass
+    return "String"
+
+
+def _etl_infer_schema_from_file(file_path: str) -> tuple[list[dict], str]:
+    """
+    Return a list of {name, ch_type, py_dtype} for each column in the file.
+    Returns (schema, error).
+    """
+    import pathlib
+    ext = pathlib.Path(file_path).suffix.lower()
+    try:
+        import pandas as pd
+        if ext in (".csv", ".tsv", ".txt"):
+            sep = "\t" if ext in (".tsv", ".txt") else ","
+            try:
+                df = pd.read_csv(file_path, sep=sep, nrows=200, low_memory=False)
+            except Exception:
+                df = pd.read_csv(file_path, sep=None, engine="python", nrows=200, low_memory=False)
+        elif ext in (".xlsx", ".xls"):
+            df = pd.read_excel(file_path, nrows=200)
+        elif ext == ".parquet":
+            df = pd.read_parquet(file_path).head(200)
+        elif ext == ".json":
+            df = pd.read_json(file_path, lines=True).head(200) if _etl_is_jsonl(file_path) else pd.read_json(file_path).head(200)
+        else:
+            return [], f"Extension non supportée: {ext}"
+
+        df.columns = [str(c).strip().replace(" ", "_").replace("-", "_") for c in df.columns]
+        schema = []
+        for col in df.columns:
+            sample = df[col].dropna().head(10).tolist()
+            ch_type = _etl_infer_ch_type(df[col].dtype, sample)
+            schema.append({"name": col, "ch_type": ch_type, "py_dtype": str(df[col].dtype)})
+        return schema, ""
+    except Exception as exc:
+        return [], str(exc)
+
+
+def _etl_is_bot_etl_table(name: str) -> bool:
+    return name.upper().startswith("BOT_ETL_")
+
+
+def _etl_safe_table_check(table_name: str) -> tuple[bool, str]:
+    """Ensure the table name starts with BOT_ETL_."""
+    if not _etl_is_bot_etl_table(table_name):
+        return False, (
+            f"[SÉCURITÉ ETL] Table '{table_name}' refusée. "
+            "L'agent ETL ne peut créer/modifier que des tables préfixées BOT_ETL_."
+        )
+    return True, ""
+
+
+def _etl_get_db_schema(client, database: str) -> str:
+    """Return a compact schema string (existing tables + column info)."""
+    try:
+        res = client.query(f"SHOW TABLES FROM `{database}`")
+        tables = [row[0] for row in res.result_rows]
+    except Exception as exc:
+        return f"Impossible de lister les tables: {exc}"
+    parts = []
+    for tbl in tables[:40]:
+        try:
+            desc = client.query(f"DESCRIBE TABLE `{database}`.`{tbl}`")
+            cols = ", ".join(f"{r[0]}:{r[1]}" for r in desc.result_rows[:20])
+            parts.append(f"TABLE {tbl}: {cols}")
+        except Exception:
+            parts.append(f"TABLE {tbl}: (erreur schema)")
+    if len(tables) > 40:
+        parts.append(f"... et {len(tables) - 40} autres tables.")
+    return "\n".join(parts)
+
+
+def _etl_get_knowledge_context() -> str:
+    """Return knowledge base content as context string."""
+    global knowledge_base
+    if not knowledge_base:
+        return ""
+    parts = []
+    for folder in knowledge_base[:5]:
+        title = folder.get("title", "")
+        content = folder.get("content", "")[:500]
+        if title or content:
+            parts.append(f"[KB: {title}]\n{content}")
+    return "\n\n".join(parts)
+
+
+def _etl_plan(session: dict, files_info: list[dict], db_schema: str, kb_context: str) -> dict:
+    """LLM generates an ETL plan from files and user request."""
+    user_request = session["user_request"]
+    max_actions = session["max_actions"]
+    database = session["database"]
+
+    files_summary = []
+    for f in files_info[:20]:
+        cols_str = ", ".join(f.get("columns", [])[:10])
+        if len(f.get("columns", [])) > 10:
+            cols_str += f" ... (+{len(f['columns'])-10} autres)"
+        sample_str = json.dumps(f.get("sample_rows", [])[:2], ensure_ascii=False, default=str)[:300]
+        files_summary.append(
+            f"Fichier: {f['relative']} ({f['extension']}, {f.get('row_count','?')} lignes, {f.get('size_human','')})\n"
+            f"  Colonnes ({len(f.get('columns',[]))}): {cols_str}\n"
+            f"  Exemples: {sample_str}"
+        )
+
+    system_prompt = (
+        "Tu es un expert ETL et architecte de données. "
+        "Tu crées des plans d'intégration de données précis et adaptés à la demande. "
+        "Tu réponds UNIQUEMENT avec du JSON valide, sans markdown ni texte supplémentaire."
+    )
+    user_content = (
+        f"Base de données cible: {database}\n\n"
+        f"Schema ClickHouse existant:\n{db_schema}\n\n"
+        f"Fichiers disponibles:\n" + "\n\n".join(files_summary) + "\n\n"
+        + (f"Contexte Knowledge Base:\n{kb_context}\n\n" if kb_context else "")
+        + f"Demande de l'utilisateur: {user_request}\n\n"
+        f"Crée un plan ETL avec AU MAXIMUM {max_actions} étapes.\n\n"
+        "RÈGLES OBLIGATOIRES:\n"
+        "- Toutes les tables créées DOIVENT commencer par BOT_ETL_ (ex: BOT_ETL_clients)\n"
+        "- Tables intermédiaires autorisées (ex: BOT_ETL_tmp_calcul)\n"
+        "- Champs calculés préfixés C_* (ex: C_montant_total, C_client_adresse)\n"
+        "- L'enrichissement depuis des tables existantes est possible via JOIN\n"
+        "- En cas d'ambiguïté (choix de table, clé étrangère, mapping colonne), "
+        "  marque l'étape avec needs_user_input=true\n\n"
+        "Types d'étapes disponibles:\n"
+        "  - browse_files: lister/confirmer les fichiers\n"
+        "  - parse_file: lire un fichier et préparer les données\n"
+        "  - create_table: créer une table BOT_ETL_*\n"
+        "  - insert_data: insérer des données dans une table BOT_ETL_*\n"
+        "  - add_calculated_field: ajouter un champ C_* via ALTER + UPDATE ou CREATE TABLE AS SELECT\n"
+        "  - enrich_from_table: enrichir depuis une table existante via JOIN\n"
+        "  - delete_rows: supprimer des lignes d'une table BOT_ETL_*\n"
+        "  - drop_table: supprimer une table BOT_ETL_* (confirmation user requise)\n"
+        "  - verify: vérification/contrôle qualité\n"
+        "  - ask_user: poser une question à l'utilisateur\n\n"
+        "Réponds UNIQUEMENT avec ce JSON:\n"
+        "{\n"
+        '  "objective": "description de l\'objectif ETL",\n'
+        '  "approach": "approche haut niveau",\n'
+        '  "tables_to_create": ["BOT_ETL_nom1", "BOT_ETL_nom2"],\n'
+        '  "estimated_steps": N,\n'
+        '  "steps": [\n'
+        "    {\n"
+        '      "id": 1,\n'
+        '      "type": "create_table|insert_data|add_calculated_field|...",\n'
+        '      "description": "description de l\'étape",\n'
+        '      "rationale": "pourquoi cette étape",\n'
+        '      "target_table": "BOT_ETL_nom ou null",\n'
+        '      "source_file": "chemin/fichier ou null",\n'
+        '      "needs_user_input": false,\n'
+        '      "question": null\n'
+        "    }\n"
+        "  ]\n"
+        "}"
+    )
+    raw = _call_llm(system_prompt, [{"role": "user", "content": user_content}], temperature=0.1)
+    result = _parse_llm_json(raw)
+    if not result or "steps" not in result:
+        result = {
+            "objective": user_request,
+            "approach": "Import direct des fichiers vers ClickHouse.",
+            "tables_to_create": [],
+            "estimated_steps": 1,
+            "steps": [{"id": 1, "type": "ask_user", "description": "Clarifier la demande",
+                        "rationale": "Plan non généré", "target_table": None,
+                        "source_file": None, "needs_user_input": True, "question": None}],
+        }
+    result["steps"] = result["steps"][:max_actions]
+    return result
+
+
+def _etl_generate_action(session: dict, step: dict, client, database: str) -> dict:
+    """LLM generates the concrete action (SQL or question) for a given ETL step."""
+    plan = session["plan"]
+    action_log = session["action_log"]
+    files_info = session.get("files_info", [])
+
+    prev_summaries = []
+    for entry in action_log[-4:]:
+        status_str = "✓ OK" if entry["ok"] else "✗ ECHEC"
+        prev_summaries.append(
+            f"Étape {entry['step_id']} ({status_str}): {entry['description']}\n"
+            f"  Action: {str(entry.get('action_detail',''))[:200]}\n"
+            f"  Résultat: {str(entry.get('result_preview',''))[:200]}"
+        )
+
+    try:
+        res = client.query(f"SHOW TABLES FROM `{database}`")
+        all_tables = [row[0] for row in res.result_rows]
+    except Exception:
+        all_tables = []
+
+    bot_etl_tables = [t for t in all_tables if t.upper().startswith("BOT_ETL_")]
+
+    files_summary = []
+    for f in files_info[:10]:
+        cols_str = ", ".join(f.get("columns", [])[:8])
+        files_summary.append(f"{f['relative']} → colonnes: {cols_str}")
+
+    system_prompt = (
+        "Tu es un expert ETL ClickHouse. Tu génères les actions concrètes pour chaque étape du plan ETL. "
+        "Tu réponds UNIQUEMENT avec du JSON valide, sans markdown ni texte supplémentaire."
+    )
+    user_content = (
+        f"Base: {database}\n"
+        f"Tables existantes: {', '.join(all_tables[:30])}\n"
+        f"Tables BOT_ETL_ créées: {', '.join(bot_etl_tables)}\n\n"
+        f"Fichiers disponibles:\n" + "\n".join(files_summary) + "\n\n"
+        f"Objectif global: {plan.get('objective','')}\n\n"
+        f"Étape actuelle {step['id']}: {step['description']}\n"
+        f"Type: {step.get('type','')}\n"
+        f"Table cible: {step.get('target_table','')}\n"
+        f"Fichier source: {step.get('source_file','')}\n"
+        f"Raison: {step.get('rationale','')}\n\n"
+        f"Résultats précédents:\n"
+        + ("\n".join(prev_summaries) if prev_summaries else "(première étape)")
+        + "\n\n"
+        "Génère l'action pour cette étape ETL.\n"
+        "RÈGLES:\n"
+        "- CREATE TABLE → uniquement des tables BOT_ETL_*\n"
+        "- INSERT/DELETE/DROP/ALTER → uniquement des tables BOT_ETL_*\n"
+        "- Champs calculés → préfixe C_*\n"
+        "- Pour create_table: utilise ENGINE = MergeTree() ORDER BY tuple()\n"
+        "- Pour insert_data: l'agent va insérer les données via pandas, "
+        "  fournis juste le CREATE TABLE SQL si la table n'existe pas encore\n"
+        "- Pour add_calculated_field: fournis le SQL ALTER TABLE ADD COLUMN + "
+        "  UPDATE ou un CREATE TABLE AS SELECT avec le champ C_* calculé\n"
+        "- Pour enrich_from_table: fournis le SQL INSERT INTO BOT_ETL_... SELECT ... FROM ... JOIN ...\n"
+        "- Pour verify: fournis un SELECT COUNT/DISTINCT pour vérification\n"
+        "- Pour drop_table: needs_user_input doit être true\n"
+        "- Si tu as besoin d'info de l'utilisateur: needs_user_input=true avec choices\n\n"
+        "Réponds UNIQUEMENT avec ce JSON:\n"
+        "{\n"
+        '  "sql": "SQL ClickHouse ou null",\n'
+        '  "explanation": "ce que fait cette action",\n'
+        '  "action_type": "create_table|insert_data|verify|ask_user|...",\n'
+        '  "target_table": "BOT_ETL_nom ou null",\n'
+        '  "needs_user_input": false,\n'
+        '  "question": null\n'
+        "}\n"
+        "Si needs_user_input=true, mets sql=null et question={\n"
+        '  "text": "Question à l\'utilisateur",\n'
+        '  "choices": [{"label": "Option A", "value": "a"}, {"label": "Option B", "value": "b"}]\n'
+        "}"
+    )
+    raw = _call_llm(system_prompt, [{"role": "user", "content": user_content}], temperature=0.05)
+    result = _parse_llm_json(raw)
+    if not result:
+        return {
+            "sql": None,
+            "explanation": "Fallback — parsing LLM échoué",
+            "action_type": step.get("type", "verify"),
+            "target_table": step.get("target_table"),
+            "needs_user_input": False,
+            "question": None,
+        }
+    return result
+
+
+def _etl_execute_sql(client, database: str, sql: str) -> tuple[bool, str, list]:
+    """Execute a SQL statement and return (ok, error, preview_rows)."""
+    if not sql or not sql.strip():
+        return False, "SQL vide.", []
+    # Security: ETL agent can only write to BOT_ETL_* tables
+    ok, reason = _etl_sql_safe(sql)
+    if not ok:
+        return False, reason, []
+    try:
+        sql_upper = sql.strip().upper()
+        if any(sql_upper.startswith(k) for k in ("SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH")):
+            res = client.query(sql)
+            rows = _rows_to_dicts(res)[:10]
+            return True, "", rows
+        else:
+            client.command(sql)
+            return True, "", []
+    except Exception as exc:
+        return False, str(exc), []
+
+
+def _etl_sql_safe(sql: str) -> tuple[bool, str]:
+    """Security guard for ETL agent: writes only allowed on BOT_ETL_* tables."""
+    sql_stripped = sql.strip()
+    sql_upper = sql_stripped.upper()
+
+    # Read-only
+    if any(sql_upper.startswith(k) for k in ("SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH")):
+        return True, ""
+
+    # Never allow DROP DATABASE/SCHEMA
+    if re.match(r"DROP\s+(DATABASE|SCHEMA)\b", sql_stripped, re.IGNORECASE):
+        return False, "DROP DATABASE/SCHEMA non autorisé par l'agent ETL."
+
+    def _require_bot_etl(table_name: str, op: str) -> tuple[bool, str] | None:
+        clean = table_name.strip("`").split(".")[-1].strip("`")
+        if not clean.upper().startswith("BOT_ETL_"):
+            return (
+                False,
+                f"[SÉCURITÉ ETL] {op} refusé : '{table_name}' n'est pas une table BOT_ETL_. "
+                "L'agent ETL ne modifie que ses propres tables BOT_ETL_*.",
+            )
+        return None
+
+    for pattern, op in [
+        (r"DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:(?:`[^`]+`|\w+)\.)?(`?\w+`?)", "DROP TABLE"),
+        (r"ALTER\s+TABLE\s+(?:(?:`[^`]+`|\w+)\.)?(`?\w+`?)", "ALTER TABLE"),
+        (r"TRUNCATE\s+(?:TABLE\s+)?(?:(?:`[^`]+`|\w+)\.)?(`?\w+`?)", "TRUNCATE"),
+        (r"DELETE\s+FROM\s+(?:(?:`[^`]+`|\w+)\.)?(`?\w+`?)", "DELETE FROM"),
+        (r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:(?:`[^`]+`|\w+)\.)?(`?\w+`?)", "CREATE TABLE"),
+        (r"INSERT\s+INTO\s+(?:(?:`[^`]+`|\w+)\.)?(`?\w+`?)", "INSERT INTO"),
+    ]:
+        m = re.match(pattern, sql_stripped, re.IGNORECASE)
+        if m:
+            err = _require_bot_etl(m.group(1), op)
+            if err:
+                return err
+            return True, ""
+
+    return True, ""
+
+
+def _etl_insert_dataframe_to_ch(client, database: str, table: str, file_path: str) -> tuple[bool, int, str]:
+    """
+    Read file_path fully, then insert all rows into database.table via clickhouse-connect.
+    Returns (ok, rows_inserted, error).
+    """
+    cols, rows, row_count, err = _etl_parse_file_full(file_path)
+    if err:
+        return False, 0, err
+    if not rows:
+        return True, 0, ""
+    try:
+        import pandas as pd
+        df = pd.DataFrame(rows)
+        # Get existing table schema from ClickHouse to cast dtypes
+        desc = client.query(f"DESCRIBE TABLE `{database}`.`{table}`")
+        ch_cols = {r[0]: r[1] for r in desc.result_rows}
+        for col in df.columns:
+            if col not in ch_cols:
+                continue
+            ch_type = ch_cols[col].upper()
+            try:
+                if "INT" in ch_type:
+                    df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype("int64")
+                elif "FLOAT" in ch_type or "DOUBLE" in ch_type:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                elif "DATETIME" in ch_type:
+                    df[col] = pd.to_datetime(df[col], errors="coerce")
+                elif "DATE" in ch_type and "DATETIME" not in ch_type:
+                    df[col] = pd.to_datetime(df[col], errors="coerce").dt.date
+                else:
+                    df[col] = df[col].astype(str).replace("None", "").replace("nan", "")
+            except Exception:
+                df[col] = df[col].astype(str).replace("None", "").replace("nan", "")
+        # Only insert columns that exist in the table
+        insert_cols = [c for c in df.columns if c in ch_cols]
+        if not insert_cols:
+            return False, 0, "Aucune colonne commune entre le fichier et la table cible."
+        df_insert = df[insert_cols]
+        client.insert_df(f"`{database}`.`{table}`", df_insert)
+        return True, len(df_insert), ""
+    except Exception as exc:
+        return False, 0, str(exc)
+
+
+def _etl_synthesize(session: dict) -> dict:
+    """LLM generates a synthesis of the ETL operation."""
+    plan = session.get("plan", {})
+    action_log = session.get("action_log", [])
+    created_tables = session.get("created_tables", [])
+
+    log_text = []
+    for entry in action_log:
+        log_text.append(
+            f"Étape {entry['step_id']} ({'OK' if entry['ok'] else 'ECHEC'}): "
+            f"{entry['description']} → {str(entry.get('result_preview',''))[:150]}"
+        )
+
+    system_prompt = (
+        "Tu es un expert ETL. Tu génères une synthèse claire et structurée d'une opération ETL. "
+        "Tu réponds UNIQUEMENT avec du JSON valide."
+    )
+    user_content = (
+        f"Objectif: {plan.get('objective','')}\n\n"
+        f"Log des actions:\n" + "\n".join(log_text) + "\n\n"
+        f"Tables créées: {', '.join(created_tables)}\n\n"
+        "Génère une synthèse de l'opération ETL.\n"
+        "Réponds avec:\n"
+        "{\n"
+        '  "summary": "résumé exécutif de l\'opération",\n'
+        '  "tables_created": [{"name": "BOT_ETL_...", "description": "...", "row_count": N}],\n'
+        '  "key_points": ["point clé 1", "point clé 2"],\n'
+        '  "warnings": ["avertissement éventuel"],\n'
+        '  "next_steps": ["suggestion d\'utilisation 1"]\n'
+        "}"
+    )
+    raw = _call_llm(system_prompt, [{"role": "user", "content": user_content}], temperature=0.2)
+    result = _parse_llm_json(raw)
+    if not result:
+        ok_count = sum(1 for e in action_log if e.get("ok"))
+        result = {
+            "summary": f"Opération ETL terminée: {ok_count}/{len(action_log)} étapes réussies.",
+            "tables_created": [{"name": t, "description": "", "row_count": 0} for t in created_tables],
+            "key_points": [],
+            "warnings": [],
+            "next_steps": [],
+        }
+    return result
+
+
+# ---------------------------------------------------------------------------
+# ETL Agent — main entry point
+# ---------------------------------------------------------------------------
+
+def _run_etl_agent():
+    """Main handler for the ETL agent chat endpoint."""
+    data = request.get_json(silent=True) or {}
+    messages = data.get("messages", [])
+    params = data.get("params", {})
+    session_id = data.get("session_id", "")
+
+    folder_path = str(params.get("folder_path", "")).strip()
+    recursive = str(params.get("recursive", "non")).lower() in ("oui", "true", "1", "yes")
+    database = str(params.get("database", "")).strip() or clickhouse_config.get("database", "default")
+    max_actions = int(params.get("max_actions", 15))
+    max_actions = max(1, min(30, max_actions))
+
+    # Session management
+    if not session_id or session_id not in _etl_sessions:
+        session_id = str(uuid.uuid4())
+        session = {
+            "status": "new",
+            "folder_path": folder_path,
+            "recursive": recursive,
+            "database": database,
+            "max_actions": max_actions,
+            "messages": [],
+            "user_request": "",
+            "plan": None,
+            "action_log": [],
+            "action_index": 0,
+            "created_tables": [],
+            "files_info": [],
+            "pending_question": None,
+            "pending_step_index": None,
+            "user_context": {},
+        }
+        _etl_sessions[session_id] = session
+    else:
+        session = _etl_sessions[session_id]
+        # Update mutable params from UI
+        if folder_path:
+            session["folder_path"] = folder_path
+        if params.get("database"):
+            session["database"] = database
+        session["max_actions"] = max_actions
+        session["recursive"] = recursive
+
+    user_message = messages[-1]["content"].strip() if messages else ""
+    session["messages"] = messages
+
+    status = session["status"]
+    result = {}
+
+    try:
+        # ── Handle user answer to a pending question ──────────────────────────
+        if status == "awaiting_user" and user_message:
+            session["user_context"][f"answer_step_{session.get('pending_step_index', '?')}"] = user_message
+            # Store for cleanup confirmation
+            if session.get("pending_question", {}).get("is_cleanup_confirmation"):
+                if user_message.lower() in ("oui", "yes", "1", "confirmer", "confirm", "drop"):
+                    tables = session.get("pending_drop_tables", [])
+                    try:
+                        client = get_clickhouse_client()
+                        dropped = []
+                        for tbl in tables:
+                            try:
+                                client.command(f"DROP TABLE IF EXISTS `{session['database']}`.`{tbl}`")
+                                dropped.append(tbl)
+                                if tbl in session["created_tables"]:
+                                    session["created_tables"].remove(tbl)
+                            except Exception:
+                                pass
+                        session["status"] = "executing"
+                        session["action_index"] += 1
+                        session["action_log"].append({
+                            "step_id": session.get("pending_step_index", 0),
+                            "description": f"Suppression confirmée: {', '.join(dropped)}",
+                            "action_detail": f"DROP TABLE {', '.join(dropped)}",
+                            "ok": True,
+                            "result_preview": f"{len(dropped)} table(s) supprimée(s).",
+                        })
+                        result = {
+                            "content": f"Tables supprimées: {', '.join(dropped)}.",
+                            "status": "executing",
+                            "action_log": session["action_log"],
+                            "created_tables": session["created_tables"],
+                        }
+                        # Continue execution
+                        session["status"] = "executing"
+                    except Exception as exc:
+                        result = {"content": f"Erreur suppression: {exc}", "status": "error"}
+                else:
+                    session["action_index"] += 1
+                    session["status"] = "executing"
+                    result = {
+                        "content": "Suppression annulée. L'agent continue.",
+                        "status": "executing",
+                        "action_log": session["action_log"],
+                    }
+                session["pending_question"] = None
+                session["pending_drop_tables"] = []
+            else:
+                session["status"] = "executing"
+                session["pending_question"] = None
+
+        # ── New session: browse files first ───────────────────────────────────
+        if status == "new":
+            if not folder_path:
+                session["status"] = "awaiting_user"
+                session["pending_question"] = {
+                    "text": "Quel est le chemin du dossier contenant les fichiers à importer ?",
+                    "choices": [],
+                }
+                _etl_sessions[session_id] = session
+                return jsonify({
+                    "content": "Veuillez spécifier le chemin du dossier source dans les paramètres.",
+                    "status": "awaiting_user",
+                    "question": session["pending_question"],
+                    "session_id": session_id,
+                })
+
+            if not os.path.isdir(folder_path):
+                _etl_sessions[session_id] = session
+                return jsonify({
+                    "content": f"Dossier introuvable: `{folder_path}`. Vérifiez le chemin dans les paramètres.",
+                    "status": "error",
+                    "session_id": session_id,
+                })
+
+            # List files
+            files = _etl_list_files(folder_path, recursive)
+            if not files:
+                _etl_sessions[session_id] = session
+                return jsonify({
+                    "content": f"Aucun fichier de données trouvé dans `{folder_path}` (extensions supportées: csv, xlsx, parquet, txt, json).",
+                    "status": "error",
+                    "session_id": session_id,
+                })
+
+            # Infer schema for each file
+            files_info = []
+            for f in files[:20]:  # limit to 20 files
+                cols, sample_rows, parse_err = _etl_parse_file(f["path"])
+                schema, schema_err = _etl_infer_schema_from_file(f["path"])
+                # Get approximate row count
+                try:
+                    import pandas as pd
+                    import pathlib
+                    ext = pathlib.Path(f["path"]).suffix.lower()
+                    if ext == ".parquet":
+                        import pyarrow.parquet as pq
+                        meta = pq.read_metadata(f["path"])
+                        row_count = meta.num_rows
+                    elif ext in (".csv", ".tsv", ".txt"):
+                        row_count = sum(1 for _ in open(f["path"], "r", encoding="utf-8", errors="ignore")) - 1
+                    else:
+                        row_count = "?"
+                except Exception:
+                    row_count = "?"
+
+                files_info.append({
+                    **f,
+                    "columns": cols,
+                    "sample_rows": sample_rows,
+                    "schema": schema,
+                    "parse_error": parse_err or schema_err,
+                    "row_count": row_count,
+                })
+
+            session["files_info"] = files_info
+            session["user_request"] = user_message
+
+            # Display files found and ask for confirmation/instruction
+            files_display = []
+            for fi in files_info:
+                err_note = f" ⚠ {fi['parse_error']}" if fi.get("parse_error") else ""
+                files_display.append(
+                    f"• {fi['relative']} — {len(fi.get('columns', []))} colonnes, "
+                    f"~{fi['row_count']} lignes, {fi['size_human']}{err_note}"
+                )
+
+            content = (
+                f"J'ai trouvé **{len(files_info)} fichier(s)** dans `{folder_path}`:\n\n"
+                + "\n".join(files_display)
+                + "\n\nQue souhaitez-vous faire avec ces fichiers ? Décrivez votre besoin "
+                "(ex: *importer dans une table clients, enrichir avec la table t_ref sur le champ id*, etc.)"
+            )
+
+            session["status"] = "awaiting_request"
+            _etl_sessions[session_id] = session
+            return jsonify({
+                "content": content,
+                "status": "awaiting_request",
+                "files_found": files_info,
+                "session_id": session_id,
+            })
+
+        # ── User described what they want — generate plan ─────────────────────
+        if status == "awaiting_request":
+            session["user_request"] = user_message
+            try:
+                client = get_clickhouse_client()
+                db_schema = _etl_get_db_schema(client, database)
+            except Exception as exc:
+                db_schema = f"Impossible de se connecter à ClickHouse: {exc}"
+                client = None
+
+            kb_context = _etl_get_knowledge_context()
+            plan = _etl_plan(session, session["files_info"], db_schema, kb_context)
+            session["plan"] = plan
+            session["status"] = "plan_ready"
+            _etl_sessions[session_id] = session
+
+            steps_display = []
+            for s in plan.get("steps", []):
+                needs_input = " ❓ (confirmation requise)" if s.get("needs_user_input") else ""
+                steps_display.append(f"  {s['id']}. [{s['type']}] {s['description']}{needs_input}")
+
+            content = (
+                f"Plan ETL généré — **{len(plan.get('steps', []))} étapes** :\n\n"
+                f"**Objectif:** {plan.get('objective','')}\n"
+                f"**Approche:** {plan.get('approach','')}\n\n"
+                + "\n".join(steps_display)
+                + "\n\nRépondez **oui** pour démarrer l'exécution, ou précisez des ajustements."
+            )
+            return jsonify({
+                "content": content,
+                "status": "plan_ready",
+                "plan": plan,
+                "session_id": session_id,
+            })
+
+        # ── User confirmed plan — start execution ─────────────────────────────
+        if status == "plan_ready":
+            if user_message.lower() in ("oui", "yes", "ok", "go", "start", "démarrer", "lancer", "valider", "continuer"):
+                session["status"] = "executing"
+                session["action_index"] = 0
+            else:
+                # User wants to adjust — replan
+                session["user_request"] = user_message
+                try:
+                    client = get_clickhouse_client()
+                    db_schema = _etl_get_db_schema(client, database)
+                except Exception:
+                    db_schema = ""
+                kb_context = _etl_get_knowledge_context()
+                plan = _etl_plan(session, session["files_info"], db_schema, kb_context)
+                session["plan"] = plan
+                _etl_sessions[session_id] = session
+                steps_display = [
+                    f"  {s['id']}. [{s['type']}] {s['description']}"
+                    for s in plan.get("steps", [])
+                ]
+                return jsonify({
+                    "content": (
+                        f"Plan mis à jour — {len(plan.get('steps', []))} étapes :\n"
+                        + "\n".join(steps_display)
+                        + "\n\nRépondez **oui** pour démarrer."
+                    ),
+                    "status": "plan_ready",
+                    "plan": plan,
+                    "session_id": session_id,
+                })
+
+        # ── Execution loop ────────────────────────────────────────────────────
+        if status in ("executing",):
+            try:
+                client = get_clickhouse_client()
+            except Exception as exc:
+                _etl_sessions[session_id] = session
+                return jsonify({
+                    "content": f"Impossible de se connecter à ClickHouse: {exc}",
+                    "status": "error",
+                    "session_id": session_id,
+                }), 500
+
+            plan = session.get("plan", {})
+            steps = plan.get("steps", [])
+            action_index = session.get("action_index", 0)
+
+            # Execute remaining steps
+            while action_index < len(steps) and len(session["action_log"]) < max_actions:
+                step = steps[action_index]
+                action_index += 1
+                session["action_index"] = action_index
+
+                step_type = step.get("type", "")
+
+                # ask_user step
+                if step_type == "ask_user" or step.get("needs_user_input"):
+                    question = step.get("question") or {
+                        "text": step.get("description", "Que souhaitez-vous faire ?"),
+                        "choices": [],
+                    }
+                    session["status"] = "awaiting_user"
+                    session["pending_question"] = question
+                    session["pending_step_index"] = step["id"]
+                    _etl_sessions[session_id] = session
+                    return jsonify({
+                        "content": f"Question étape {step['id']}: {question.get('text','')}",
+                        "status": "awaiting_user",
+                        "question": question,
+                        "action_log": session["action_log"],
+                        "created_tables": session["created_tables"],
+                        "session_id": session_id,
+                    })
+
+                # Generate action
+                action = _etl_generate_action(session, step, client, database)
+
+                if action.get("needs_user_input"):
+                    question = action.get("question") or {"text": step["description"], "choices": []}
+                    session["status"] = "awaiting_user"
+                    session["pending_question"] = question
+                    session["pending_step_index"] = step["id"]
+                    _etl_sessions[session_id] = session
+                    return jsonify({
+                        "content": f"Étape {step['id']} — {question.get('text', step['description'])}",
+                        "status": "awaiting_user",
+                        "question": question,
+                        "action_log": session["action_log"],
+                        "created_tables": session["created_tables"],
+                        "plan": plan,
+                        "session_id": session_id,
+                    })
+
+                # drop_table requires user confirmation
+                if step_type == "drop_table" or (action.get("sql", "") or "").upper().strip().startswith("DROP TABLE"):
+                    target = action.get("target_table") or step.get("target_table", "")
+                    session["status"] = "awaiting_user"
+                    session["pending_question"] = {
+                        "text": f"Confirmez-vous la suppression de la table `{target}` ? Cette action est irréversible.",
+                        "choices": [
+                            {"label": "Oui, supprimer", "value": "oui"},
+                            {"label": "Non, annuler", "value": "non"},
+                        ],
+                        "is_cleanup_confirmation": True,
+                    }
+                    session["pending_drop_tables"] = [target] if target else []
+                    session["pending_step_index"] = step["id"]
+                    _etl_sessions[session_id] = session
+                    return jsonify({
+                        "content": f"Confirmation requise avant suppression de `{target}`.",
+                        "status": "awaiting_user",
+                        "question": session["pending_question"],
+                        "action_log": session["action_log"],
+                        "session_id": session_id,
+                    })
+
+                # Handle insert_data: use pandas to insert
+                if step_type == "insert_data" and action.get("sql", "").upper().strip().startswith("CREATE TABLE"):
+                    # Create table first
+                    ok, err, rows = _etl_execute_sql(client, database, action["sql"])
+                    if ok:
+                        tbl_name = action.get("target_table") or step.get("target_table", "")
+                        tbl_clean = tbl_name.strip("`").split(".")[-1].strip("`")
+                        if _etl_is_bot_etl_table(tbl_clean) and tbl_clean not in session["created_tables"]:
+                            session["created_tables"].append(tbl_clean)
+                        # Now insert data from file
+                        source_file = step.get("source_file") or ""
+                        if source_file:
+                            ins_ok, ins_count, ins_err = _etl_insert_dataframe_to_ch(
+                                client, database, tbl_clean, source_file
+                            )
+                            entry = {
+                                "step_id": step["id"],
+                                "description": step["description"],
+                                "action_detail": f"CREATE TABLE + INSERT {ins_count} lignes depuis {os.path.basename(source_file)}",
+                                "ok": ins_ok,
+                                "result_preview": f"{ins_count} lignes insérées." if ins_ok else ins_err,
+                                "rows_affected": ins_count,
+                            }
+                        else:
+                            entry = {
+                                "step_id": step["id"],
+                                "description": step["description"],
+                                "action_detail": action["sql"][:150],
+                                "ok": True,
+                                "result_preview": "Table créée.",
+                                "rows_affected": None,
+                            }
+                    else:
+                        entry = {
+                            "step_id": step["id"],
+                            "description": step["description"],
+                            "action_detail": action.get("sql", "")[:150],
+                            "ok": False,
+                            "result_preview": err,
+                            "rows_affected": None,
+                        }
+                    session["action_log"].append(entry)
+                    continue
+
+                # Standard SQL execution
+                sql = action.get("sql", "")
+                if sql:
+                    ok, err, rows = _etl_execute_sql(client, database, sql)
+
+                    # Track created tables
+                    if ok and sql.strip().upper().startswith("CREATE TABLE"):
+                        m = re.search(
+                            r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:(?:`[^`]+`|\w+)\.)?`?(\w+)`?",
+                            sql, re.IGNORECASE
+                        )
+                        if m:
+                            tbl = m.group(1)
+                            if _etl_is_bot_etl_table(tbl) and tbl not in session["created_tables"]:
+                                session["created_tables"].append(tbl)
+
+                    # If it's insert_data and we also have source file, insert via pandas
+                    if step_type == "insert_data" and not sql.strip().upper().startswith("CREATE TABLE"):
+                        source_file = step.get("source_file") or ""
+                        target_table = action.get("target_table") or step.get("target_table", "")
+                        tbl_clean = target_table.strip("`").split(".")[-1].strip("`")
+                        if source_file and _etl_is_bot_etl_table(tbl_clean):
+                            ins_ok, ins_count, ins_err = _etl_insert_dataframe_to_ch(
+                                client, database, tbl_clean, source_file
+                            )
+                            entry = {
+                                "step_id": step["id"],
+                                "description": step["description"],
+                                "action_detail": f"INSERT pandas {ins_count} lignes depuis {os.path.basename(source_file)}",
+                                "ok": ins_ok,
+                                "result_preview": f"{ins_count} lignes insérées." if ins_ok else ins_err,
+                                "rows_affected": ins_count,
+                            }
+                            session["action_log"].append(entry)
+                            continue
+
+                    preview = rows if rows else (f"Erreur: {err}" if not ok else "OK")
+                    entry = {
+                        "step_id": step["id"],
+                        "description": step["description"],
+                        "action_detail": sql[:200] if sql else action.get("explanation", "")[:200],
+                        "ok": ok,
+                        "result_preview": preview,
+                        "rows_affected": None,
+                    }
+                else:
+                    # No SQL — informational step
+                    entry = {
+                        "step_id": step["id"],
+                        "description": step["description"],
+                        "action_detail": action.get("explanation", "Étape informative")[:200],
+                        "ok": True,
+                        "result_preview": action.get("explanation", "")[:200],
+                        "rows_affected": None,
+                    }
+                session["action_log"].append(entry)
+
+            # All steps done → synthesize
+            session["status"] = "done"
+            synthesis = _etl_synthesize(session)
+            session["synthesis"] = synthesis
+            _etl_sessions[session_id] = session
+
+            tables_created = session.get("created_tables", [])
+            ok_count = sum(1 for e in session["action_log"] if e.get("ok"))
+            result = {
+                "content": (
+                    f"ETL terminé — {ok_count}/{len(session['action_log'])} actions réussies. "
+                    f"{len(tables_created)} table(s) créée(s): {', '.join(tables_created)}."
+                ),
+                "status": "done",
+                "plan": plan,
+                "action_log": session["action_log"],
+                "created_tables": tables_created,
+                "synthesis": synthesis,
+                "session_id": session_id,
+            }
+            _etl_sessions[session_id] = session
+            return jsonify(result)
+
+        # Fallback if in an unexpected state
+        _etl_sessions[session_id] = session
+        result["content"] = result.get("content", "En attente de votre réponse.")
+        result["status"] = session.get("status", "unknown")
+        result["session_id"] = session_id
+        result["action_log"] = session.get("action_log", [])
+        result["created_tables"] = session.get("created_tables", [])
+        if session.get("plan"):
+            result["plan"] = session["plan"]
+        if session.get("pending_question"):
+            result["question"] = session["pending_question"]
+        return jsonify(result)
+
+    except Exception as exc:
+        session["status"] = "error"
+        _etl_sessions[session_id] = session
+        return jsonify({
+            "error": f"Erreur interne agent ETL: {str(exc)}",
+            "session_id": session_id,
+            "status": "error",
+        }), 500
 
 
 # ---------------------------------------------------------------------------

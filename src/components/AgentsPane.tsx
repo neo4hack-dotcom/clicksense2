@@ -5,6 +5,7 @@ import {
   MessageSquare, Play, RefreshCw, Zap, AlertTriangle, Info,
   RotateCcw, Trash2, BookOpen, TrendingUp, Star, Code2, Download,
   GitFork, ArrowRight, ArrowLeftRight, ThumbsUp, ThumbsDown,
+  FolderOpen, Upload, Layers, Calculator,
 } from 'lucide-react';
 import clsx from 'clsx';
 import { useAppStore } from '../store';
@@ -129,6 +130,62 @@ interface ReplanEntry {
   checked_after_step?: number;
 }
 
+// ── ETL Agent Types ─────────────────────────────────────────────────────────
+
+interface EtlFileInfo {
+  path: string;
+  name: string;
+  relative: string;
+  extension: string;
+  size_bytes: number;
+  size_human: string;
+  columns?: string[];
+  sample_rows?: Record<string, string>[];
+  row_count?: number | string;
+  parse_error?: string;
+}
+
+interface EtlStep {
+  id: number;
+  type: string;
+  description: string;
+  rationale: string;
+  target_table?: string | null;
+  source_file?: string | null;
+  needs_user_input?: boolean;
+}
+
+interface EtlPlan {
+  objective: string;
+  approach: string;
+  tables_to_create: string[];
+  estimated_steps: number;
+  steps: EtlStep[];
+}
+
+interface EtlActionEntry {
+  step_id: number;
+  description: string;
+  action_detail: string;
+  ok: boolean;
+  result_preview: unknown;
+  rows_affected?: number | null;
+}
+
+interface EtlSynthesisTable {
+  name: string;
+  description: string;
+  row_count?: number;
+}
+
+interface EtlSynthesis {
+  summary: string;
+  tables_created: EtlSynthesisTable[];
+  key_points: string[];
+  warnings: string[];
+  next_steps: string[];
+}
+
 interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
@@ -154,6 +211,11 @@ interface ChatMessage {
   session_id?: string;
   cleanup_done?: boolean;
   tables_dropped?: string[];
+  // ETL Agent fields
+  files_found?: EtlFileInfo[];
+  etl_plan?: EtlPlan;
+  etl_action_log?: EtlActionEntry[];
+  etl_synthesis?: EtlSynthesis;
 }
 
 // ── Data Dictionary Sub-components ─────────────────────────────────────────
@@ -161,35 +223,42 @@ interface ChatMessage {
 function AgentCard({ agent, selected, onClick }: { agent: Agent; selected: boolean; onClick: () => void }) {
   const isWriter = agent.id === 'clickhouse-writer';
   const isKeyId = agent.id === 'key-identifier';
-  const activeColor = isWriter ? 'violet' : isKeyId ? 'indigo' : 'emerald';
+  const isEtl = agent.id === 'etl-agent';
+
+  const iconEl = isWriter ? <Zap size={16} /> : isKeyId ? <GitFork size={16} /> : isEtl ? <Upload size={16} /> : <Cpu size={16} />;
+
+  const selectedBg = isWriter ? 'border-violet-500 bg-violet-500/10'
+    : isKeyId ? 'border-indigo-500 bg-indigo-500/10'
+    : isEtl ? 'border-orange-500 bg-orange-500/10'
+    : 'border-emerald-500 bg-emerald-500/10';
+  const hoverBg = isWriter ? 'hover:border-violet-300' : isKeyId ? 'hover:border-indigo-300'
+    : isEtl ? 'hover:border-orange-300' : 'hover:border-emerald-300';
+  const iconSelected = isWriter ? 'bg-violet-500 text-white' : isKeyId ? 'bg-indigo-500 text-white'
+    : isEtl ? 'bg-orange-500 text-white' : 'bg-emerald-500 text-white';
+  const iconHover = isWriter ? 'group-hover:bg-violet-100 group-hover:text-violet-600'
+    : isKeyId ? 'group-hover:bg-indigo-100 group-hover:text-indigo-600'
+    : isEtl ? 'group-hover:bg-orange-100 group-hover:text-orange-600'
+    : 'group-hover:bg-emerald-100 group-hover:text-emerald-600';
+  const textColor = isWriter ? 'text-violet-700' : isKeyId ? 'text-indigo-700'
+    : isEtl ? 'text-orange-700' : 'text-emerald-700';
+
   return (
     <button
       onClick={onClick}
       className={clsx(
         'w-full text-left p-4 rounded-xl border transition-all duration-200 group',
-        selected
-          ? `border-${activeColor}-500 bg-${activeColor}-500/10`
-          : `border-slate-200 bg-white hover:border-${activeColor}-300 hover:shadow-sm`,
+        selected ? selectedBg : `border-slate-200 bg-white ${hoverBg} hover:shadow-sm`,
       )}
     >
       <div className="flex items-start gap-3">
         <div className={clsx(
           'p-2 rounded-lg flex-shrink-0 transition-colors',
-          selected
-            ? isWriter ? 'bg-violet-500 text-white' : isKeyId ? 'bg-indigo-500 text-white' : 'bg-emerald-500 text-white'
-            : isWriter
-              ? 'bg-slate-100 text-slate-500 group-hover:bg-violet-100 group-hover:text-violet-600'
-              : isKeyId
-                ? 'bg-slate-100 text-slate-500 group-hover:bg-indigo-100 group-hover:text-indigo-600'
-                : 'bg-slate-100 text-slate-500 group-hover:bg-emerald-100 group-hover:text-emerald-600',
+          selected ? iconSelected : `bg-slate-100 text-slate-500 ${iconHover}`,
         )}>
-          {isWriter ? <Zap size={16} /> : isKeyId ? <GitFork size={16} /> : <Cpu size={16} />}
+          {iconEl}
         </div>
         <div className="min-w-0">
-          <p className={clsx('text-sm font-semibold truncate',
-            selected
-              ? isWriter ? 'text-violet-700' : isKeyId ? 'text-indigo-700' : 'text-emerald-700'
-              : 'text-slate-800')}>
+          <p className={clsx('text-sm font-semibold truncate', selected ? textColor : 'text-slate-800')}>
             {agent.name}
           </p>
           <p className="text-xs text-slate-500 mt-0.5 line-clamp-2 leading-relaxed">
@@ -1695,6 +1764,477 @@ function WriterMessageView({
   );
 }
 
+// ── ETL Agent Sub-components ────────────────────────────────────────────────
+
+const ETL_STEP_TYPE_COLOR: Record<string, string> = {
+  browse_files: 'bg-sky-100 text-sky-700',
+  parse_file: 'bg-blue-100 text-blue-700',
+  create_table: 'bg-orange-100 text-orange-700',
+  insert_data: 'bg-amber-100 text-amber-700',
+  add_calculated_field: 'bg-purple-100 text-purple-700',
+  enrich_from_table: 'bg-teal-100 text-teal-700',
+  delete_rows: 'bg-red-100 text-red-700',
+  drop_table: 'bg-rose-100 text-rose-700',
+  verify: 'bg-emerald-100 text-emerald-700',
+  ask_user: 'bg-amber-100 text-amber-700',
+};
+
+function EtlFilesView({ files }: { files: EtlFileInfo[] }) {
+  const [open, setOpen] = useState(true);
+  const [expandedIdx, setExpandedIdx] = useState<Record<number, boolean>>({});
+
+  const extBadge = (ext: string) => {
+    const colors: Record<string, string> = {
+      '.csv': 'bg-green-100 text-green-700',
+      '.xlsx': 'bg-emerald-100 text-emerald-700',
+      '.xls': 'bg-emerald-100 text-emerald-700',
+      '.parquet': 'bg-blue-100 text-blue-700',
+      '.json': 'bg-yellow-100 text-yellow-700',
+      '.txt': 'bg-slate-100 text-slate-600',
+      '.tsv': 'bg-slate-100 text-slate-600',
+    };
+    return colors[ext] || 'bg-slate-100 text-slate-600';
+  };
+
+  return (
+    <div className="mt-3 border border-orange-200 rounded-xl overflow-hidden">
+      <button
+        onClick={() => setOpen(o => !o)}
+        className="w-full flex items-center gap-2 px-4 py-3 bg-orange-50 hover:bg-orange-100 transition-colors text-left"
+      >
+        {open ? <ChevronDown size={13} className="text-orange-500" /> : <ChevronRight size={13} className="text-orange-500" />}
+        <FolderOpen size={14} className="text-orange-600" />
+        <span className="text-sm font-bold text-orange-800">
+          {files.length} fichier{files.length > 1 ? 's' : ''} trouvé{files.length > 1 ? 's' : ''}
+        </span>
+        <span className="ml-auto text-xs text-orange-500">
+          {files.filter(f => !f.parse_error).length} lisibles
+        </span>
+      </button>
+      {open && (
+        <div className="bg-white divide-y divide-slate-100 max-h-72 overflow-y-auto">
+          {files.map((f, i) => (
+            <div key={i}>
+              <button
+                onClick={() => setExpandedIdx(prev => ({ ...prev, [i]: !prev[i] }))}
+                className="w-full flex items-center gap-3 px-4 py-2.5 hover:bg-slate-50 transition-colors text-left"
+              >
+                <span className={clsx('px-1.5 py-0.5 rounded text-[9px] font-bold uppercase flex-shrink-0', extBadge(f.extension))}>
+                  {f.extension.slice(1)}
+                </span>
+                <div className="flex-1 min-w-0">
+                  <p className="text-xs font-medium text-slate-800 truncate">{f.relative}</p>
+                  <p className="text-[10px] text-slate-400">
+                    {f.size_human}
+                    {f.columns && f.columns.length > 0 && ` · ${f.columns.length} colonnes`}
+                    {f.row_count !== undefined && ` · ~${f.row_count} lignes`}
+                  </p>
+                </div>
+                {f.parse_error ? (
+                  <AlertTriangle size={12} className="text-amber-400 flex-shrink-0" />
+                ) : (
+                  <CheckCircle2 size={12} className="text-emerald-400 flex-shrink-0" />
+                )}
+                {expandedIdx[i] ? <ChevronDown size={12} className="text-slate-300" /> : <ChevronRight size={12} className="text-slate-300" />}
+              </button>
+              {expandedIdx[i] && (
+                <div className="px-4 pb-3 bg-slate-50 border-t border-slate-100">
+                  {f.parse_error && (
+                    <p className="text-xs text-amber-600 mt-2 mb-1">⚠ {f.parse_error}</p>
+                  )}
+                  {f.columns && f.columns.length > 0 && (
+                    <div className="mt-2">
+                      <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-1">Colonnes</p>
+                      <div className="flex flex-wrap gap-1">
+                        {f.columns.map((col, ci) => (
+                          <span key={ci} className="px-1.5 py-0.5 bg-white border border-slate-200 rounded text-[9px] font-mono text-slate-600">
+                            {col}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {f.sample_rows && f.sample_rows.length > 0 && (
+                    <div className="mt-2">
+                      <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-1">Aperçu</p>
+                      <div className="overflow-x-auto rounded-lg border border-slate-200">
+                        <table className="text-[9px] w-full">
+                          <thead className="bg-slate-100">
+                            <tr>
+                              {Object.keys(f.sample_rows[0]).map(col => (
+                                <th key={col} className="px-2 py-1 text-left font-semibold text-slate-500 whitespace-nowrap">{col}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {f.sample_rows.map((row, ri) => (
+                              <tr key={ri} className="border-t border-slate-100">
+                                {Object.values(row).map((val, vi) => (
+                                  <td key={vi} className="px-2 py-1 text-slate-600 font-mono max-w-[100px] truncate">{String(val ?? '')}</td>
+                                ))}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function EtlPlanView({ plan, actionCount }: { plan: EtlPlan; actionCount?: number }) {
+  const [open, setOpen] = useState(true);
+  return (
+    <div className="mt-3 border border-orange-200 rounded-xl overflow-hidden">
+      <button
+        onClick={() => setOpen(o => !o)}
+        className="w-full flex items-center gap-2 px-4 py-3 bg-orange-50 hover:bg-orange-100 transition-colors text-left"
+      >
+        {open ? <ChevronDown size={13} className="text-orange-500" /> : <ChevronRight size={13} className="text-orange-500" />}
+        <Layers size={14} className="text-orange-600" />
+        <span className="text-sm font-bold text-orange-800">Plan ETL</span>
+        {plan.tables_to_create?.length > 0 && (
+          <span className="ml-2 px-2 py-0.5 text-[10px] font-bold rounded-full bg-orange-100 text-orange-600 border border-orange-200">
+            {plan.tables_to_create.length} table{plan.tables_to_create.length > 1 ? 's' : ''}
+          </span>
+        )}
+        <span className="ml-auto text-xs text-orange-600 font-medium">
+          {actionCount !== undefined ? `${actionCount}/${plan.steps.length}` : plan.steps.length} étape{plan.steps.length > 1 ? 's' : ''}
+        </span>
+      </button>
+      {open && (
+        <div className="p-4 bg-white space-y-3">
+          <div className="p-3 bg-orange-50 rounded-lg border border-orange-100">
+            <p className="text-[10px] font-bold text-orange-500 uppercase tracking-wide mb-1">Objectif</p>
+            <p className="text-sm text-orange-900 font-medium">{plan.objective}</p>
+          </div>
+          <div>
+            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-1">Approche</p>
+            <p className="text-xs text-slate-600 leading-relaxed">{plan.approach}</p>
+          </div>
+          {plan.tables_to_create?.length > 0 && (
+            <div>
+              <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-1">Tables à créer</p>
+              <div className="flex flex-wrap gap-1">
+                {plan.tables_to_create.map((t, i) => (
+                  <span key={i} className="px-2 py-0.5 bg-orange-50 border border-orange-200 rounded text-[9px] font-mono font-bold text-orange-700">
+                    {t}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+          <div className="space-y-1.5">
+            {plan.steps.map((step) => {
+              const isDone = actionCount !== undefined && step.id <= actionCount;
+              const isActive = actionCount !== undefined && step.id === actionCount + 1;
+              return (
+                <div
+                  key={step.id}
+                  className={clsx(
+                    'flex items-start gap-3 p-2.5 rounded-lg border transition-colors',
+                    isDone ? 'bg-emerald-50 border-emerald-200' :
+                    isActive ? 'bg-orange-50 border-orange-300 shadow-sm' :
+                    'bg-slate-50 border-slate-100',
+                  )}
+                >
+                  <div className={clsx(
+                    'flex-shrink-0 w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold mt-0.5',
+                    isDone ? 'bg-emerald-500 text-white' :
+                    isActive ? 'bg-orange-500 text-white' :
+                    'bg-slate-200 text-slate-500',
+                  )}>
+                    {isDone ? '✓' : step.id}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 mb-0.5 flex-wrap">
+                      <span className={clsx(
+                        'px-1.5 py-0.5 rounded text-[9px] font-bold uppercase',
+                        ETL_STEP_TYPE_COLOR[step.type] || 'bg-slate-100 text-slate-600',
+                      )}>
+                        {step.type}
+                      </span>
+                      {step.target_table && (
+                        <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-orange-100 text-orange-700 font-mono">
+                          → {step.target_table}
+                        </span>
+                      )}
+                      {step.needs_user_input && (
+                        <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-amber-100 text-amber-700">
+                          ❓ confirmation
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-xs font-medium text-slate-800">{step.description}</p>
+                    <p className="text-[10px] text-slate-400 mt-0.5 italic">{step.rationale}</p>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function EtlActionLogView({ log }: { log: EtlActionEntry[] }) {
+  const [expandedIdx, setExpandedIdx] = useState<Record<number, boolean>>({});
+  return (
+    <div className="mt-3 border border-slate-200 rounded-xl overflow-hidden">
+      <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-200 flex items-center gap-2">
+        <Code2 size={13} className="text-orange-500" />
+        <span className="text-xs font-bold text-slate-700">Journal ETL</span>
+        <span className="ml-auto flex gap-2 text-xs">
+          <span className="text-emerald-600 font-medium">{log.filter(e => e.ok).length} OK</span>
+          {log.filter(e => !e.ok).length > 0 && (
+            <span className="text-red-500 font-medium">{log.filter(e => !e.ok).length} Erreur</span>
+          )}
+        </span>
+      </div>
+      <div className="divide-y divide-slate-100 max-h-80 overflow-y-auto">
+        {log.map((entry, i) => (
+          <div key={i} className="bg-white">
+            <button
+              onClick={() => setExpandedIdx(prev => ({ ...prev, [i]: !prev[i] }))}
+              className="w-full flex items-center gap-3 px-4 py-2.5 hover:bg-slate-50 transition-colors text-left"
+            >
+              {entry.ok
+                ? <CheckCircle2 size={13} className="text-emerald-500 flex-shrink-0" />
+                : <XCircle size={13} className="text-red-400 flex-shrink-0" />
+              }
+              <div className="flex-shrink-0 w-5 h-5 rounded-full bg-orange-50 border border-orange-200 flex items-center justify-center text-[9px] font-bold text-orange-600">
+                {entry.step_id}
+              </div>
+              <div className="flex-1 min-w-0">
+                <p className="text-xs font-medium text-slate-800 truncate">{entry.description}</p>
+                <p className="text-[10px] text-slate-400 truncate">{String(entry.action_detail || '').slice(0, 80)}</p>
+              </div>
+              <div className="flex items-center gap-2 flex-shrink-0">
+                {entry.rows_affected != null && (
+                  <span className="text-[10px] text-orange-500 font-medium">{entry.rows_affected} lignes</span>
+                )}
+                {expandedIdx[i] ? <ChevronDown size={12} className="text-slate-400" /> : <ChevronRight size={12} className="text-slate-400" />}
+              </div>
+            </button>
+            {expandedIdx[i] && (
+              <div className="px-4 pb-3 space-y-2">
+                {entry.action_detail && (
+                  <div>
+                    <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-1">Action</p>
+                    <pre className="text-[10px] bg-slate-900 text-orange-300 rounded-lg p-3 overflow-x-auto whitespace-pre-wrap font-mono leading-relaxed">
+                      {entry.action_detail}
+                    </pre>
+                  </div>
+                )}
+                {entry.result_preview != null && (
+                  <div>
+                    <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-1">Résultat</p>
+                    {typeof entry.result_preview === 'string' ? (
+                      <p className={clsx(
+                        'text-xs p-2 rounded-lg',
+                        entry.ok ? 'bg-emerald-50 text-emerald-700' : 'bg-red-50 text-red-700',
+                      )}>
+                        {entry.result_preview}
+                      </p>
+                    ) : Array.isArray(entry.result_preview) && (entry.result_preview as unknown[]).length > 0 ? (
+                      <div className="overflow-x-auto rounded-lg border border-slate-100">
+                        <table className="w-full text-[10px]">
+                          <thead className="bg-slate-50">
+                            <tr>
+                              {Object.keys((entry.result_preview as Record<string, unknown>[])[0]).map(col => (
+                                <th key={col} className="text-left px-2 py-1 text-slate-500 font-semibold border-b border-slate-100">{col}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {(entry.result_preview as Record<string, unknown>[]).map((row, ri) => (
+                              <tr key={ri} className="hover:bg-slate-50">
+                                {Object.values(row).map((val, vi) => (
+                                  <td key={vi} className="px-2 py-1 text-slate-700 font-mono border-b border-slate-50">{String(val)}</td>
+                                ))}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : null}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function EtlSynthesisView({ synthesis }: { synthesis: EtlSynthesis }) {
+  return (
+    <div className="mt-3 border border-orange-200 rounded-xl overflow-hidden">
+      <div className="px-4 py-3 bg-gradient-to-r from-orange-500 to-amber-500">
+        <div className="flex items-center gap-2">
+          <Star size={14} className="text-orange-100" />
+          <h3 className="text-sm font-bold text-white">Synthèse ETL</h3>
+        </div>
+      </div>
+      <div className="bg-white p-4 space-y-4">
+        {/* Summary */}
+        <div className="p-3 bg-orange-50 rounded-xl border border-orange-100">
+          <p className="text-sm text-orange-900 font-medium leading-relaxed">{synthesis.summary}</p>
+        </div>
+
+        {/* Tables created */}
+        {synthesis.tables_created?.length > 0 && (
+          <div>
+            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-2">Tables créées (BOT_ETL_*)</p>
+            <div className="space-y-1.5">
+              {synthesis.tables_created.map((tbl, i) => (
+                <div key={i} className="flex items-start gap-3 p-2.5 bg-orange-50 rounded-lg border border-orange-100">
+                  <Database size={12} className="text-orange-600 mt-0.5 flex-shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-xs font-bold font-mono text-orange-800">{tbl.name}</p>
+                    {tbl.description && <p className="text-[10px] text-slate-500 mt-0.5">{tbl.description}</p>}
+                  </div>
+                  {tbl.row_count !== undefined && tbl.row_count > 0 && (
+                    <span className="text-[10px] text-orange-500 font-medium flex-shrink-0">{tbl.row_count} lignes</span>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Key points */}
+        {synthesis.key_points?.length > 0 && (
+          <div>
+            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-2">Points clés</p>
+            <div className="space-y-1.5">
+              {synthesis.key_points.map((pt, i) => (
+                <div key={i} className="flex items-start gap-2 p-2 bg-slate-50 rounded-lg border border-slate-100">
+                  <CheckCircle2 size={11} className="text-emerald-500 mt-0.5 flex-shrink-0" />
+                  <p className="text-xs text-slate-700">{pt}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Warnings */}
+        {synthesis.warnings?.length > 0 && (
+          <div>
+            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-2">Avertissements</p>
+            <div className="space-y-1.5">
+              {synthesis.warnings.map((w, i) => (
+                <div key={i} className="flex items-start gap-2 p-2 bg-amber-50 rounded-lg border border-amber-100">
+                  <AlertTriangle size={11} className="text-amber-500 mt-0.5 flex-shrink-0" />
+                  <p className="text-xs text-amber-700">{w}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Next steps */}
+        {synthesis.next_steps?.length > 0 && (
+          <div>
+            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-2">Prochaines étapes suggérées</p>
+            <div className="space-y-1.5">
+              {synthesis.next_steps.map((ns, i) => (
+                <div key={i} className="flex items-start gap-2 p-2 bg-blue-50 rounded-lg border border-blue-100">
+                  <ArrowRight size={11} className="text-blue-500 mt-0.5 flex-shrink-0" />
+                  <p className="text-xs text-blue-700">{ns}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function EtlMessageView({
+  msg,
+  onChoice,
+  isLast,
+}: {
+  msg: ChatMessage;
+  onChoice: (value: string) => void;
+  isLast: boolean;
+}) {
+  const hasEtlData = !!(msg.files_found || msg.etl_plan || msg.etl_action_log || msg.etl_synthesis);
+  if (!hasEtlData) return null;
+
+  const actionCount = msg.etl_action_log?.length ?? 0;
+
+  return (
+    <div className="mt-2 space-y-1">
+      {/* Progress bar */}
+      {msg.etl_plan && actionCount > 0 && (
+        <div className="flex items-center gap-2 text-xs text-slate-500">
+          <div className="flex-1 bg-slate-100 rounded-full h-1.5 overflow-hidden">
+            <div
+              className="h-full bg-gradient-to-r from-orange-400 to-amber-500 rounded-full transition-all duration-500"
+              style={{ width: `${Math.min(100, (actionCount / (msg.etl_plan.steps?.length || 1)) * 100)}%` }}
+            />
+          </div>
+          <span className="flex-shrink-0 font-medium text-orange-600">
+            {actionCount}/{msg.etl_plan.steps?.length ?? '?'} actions
+          </span>
+        </div>
+      )}
+
+      {/* Files found */}
+      {msg.files_found && msg.files_found.length > 0 && (
+        <EtlFilesView files={msg.files_found} />
+      )}
+
+      {/* ETL Plan */}
+      {msg.etl_plan && (
+        <EtlPlanView plan={msg.etl_plan} actionCount={actionCount > 0 ? actionCount : undefined} />
+      )}
+
+      {/* ETL Action log */}
+      {msg.etl_action_log && msg.etl_action_log.length > 0 && (
+        <EtlActionLogView log={msg.etl_action_log} />
+      )}
+
+      {/* Tables created badge */}
+      {msg.created_tables && msg.created_tables.length > 0 && !msg.etl_synthesis && (
+        <div className="flex flex-wrap gap-1.5 mt-2">
+          {msg.created_tables.map((t, i) => (
+            <span key={i} className="flex items-center gap-1 px-2 py-1 bg-orange-50 border border-orange-200 rounded-full text-[10px] font-mono font-bold text-orange-700">
+              <Database size={9} />
+              {t}
+            </span>
+          ))}
+        </div>
+      )}
+
+      {/* ETL Synthesis */}
+      {msg.etl_synthesis && <EtlSynthesisView synthesis={msg.etl_synthesis} />}
+
+      {/* Question / choices */}
+      {msg.question && isLast && (
+        <ChoicesPanel
+          question={msg.question as WriterQuestion}
+          onChoice={onChoice}
+          disabled={!isLast}
+        />
+      )}
+    </div>
+  );
+}
+
 // ── Generic AssistantMessage ────────────────────────────────────────────────
 
 function AssistantMessage({
@@ -1720,27 +2260,34 @@ function AssistantMessage({
   }
 
   const isWriter = !!(msg.plan || msg.action_log || msg.synthesis
-    || msg.question || msg.status);
+    || (msg.question && !msg.etl_plan && !msg.files_found) || (msg.status && !msg.etl_plan && !msg.files_found));
   const isKeyId = msg.suggestions !== undefined;
+  const isEtl = !!(msg.files_found || msg.etl_plan || msg.etl_action_log || msg.etl_synthesis
+    || (msg.status && (msg.files_found || msg.etl_plan)));
 
   return (
     <div className="flex gap-3 justify-start">
       <div className={clsx(
         'p-2 rounded-full flex-shrink-0 self-start mt-1',
-        isWriter ? 'bg-violet-100' : isKeyId ? 'bg-indigo-100' : 'bg-emerald-100',
+        isWriter ? 'bg-violet-100' : isKeyId ? 'bg-indigo-100' : isEtl ? 'bg-orange-100' : 'bg-emerald-100',
       )}>
         {isWriter
           ? <Zap size={14} className="text-violet-600" />
           : isKeyId
             ? <GitFork size={14} className="text-indigo-600" />
-            : <Cpu size={14} className="text-emerald-600" />}
+            : isEtl
+              ? <Upload size={14} className="text-orange-600" />
+              : <Cpu size={14} className="text-emerald-600" />}
       </div>
       <div className="flex-1 max-w-full overflow-hidden">
         <div className={clsx(
           'border rounded-xl px-4 py-3 shadow-sm',
-          isWriter ? 'bg-white border-violet-100' : isKeyId ? 'bg-white border-indigo-100' : 'bg-white border-slate-200',
+          isWriter ? 'bg-white border-violet-100'
+            : isKeyId ? 'bg-white border-indigo-100'
+            : isEtl ? 'bg-white border-orange-100'
+            : 'bg-white border-slate-200',
         )}>
-          <p className="text-sm text-slate-700">{msg.content}</p>
+          <p className="text-sm text-slate-700 whitespace-pre-wrap">{msg.content}</p>
           {/* Data dictionary summary */}
           {msg.tables_processed !== undefined && (
             <div className="flex items-center gap-2 mt-2">
@@ -1756,6 +2303,15 @@ function AssistantMessage({
               <GitFork size={13} className="text-indigo-500" />
               <span className="text-xs text-indigo-700 font-medium">
                 {msg.suggestions.length} relation{msg.suggestions.length !== 1 ? 's' : ''} potentielle{msg.suggestions.length !== 1 ? 's' : ''} · {msg.total_fields ?? '?'} champs analysés
+              </span>
+            </div>
+          )}
+          {/* ETL summary badge */}
+          {isEtl && msg.created_tables && msg.created_tables.length > 0 && msg.etl_synthesis && (
+            <div className="flex items-center gap-2 mt-2">
+              <Database size={13} className="text-orange-500" />
+              <span className="text-xs text-orange-700 font-medium">
+                {msg.created_tables.length} table{msg.created_tables.length > 1 ? 's' : ''} BOT_ETL_ créée{msg.created_tables.length > 1 ? 's' : ''}
               </span>
             </div>
           )}
@@ -1778,6 +2334,11 @@ function AssistantMessage({
         {/* Writer agent views */}
         {isWriter && (
           <WriterMessageView msg={msg} onChoice={onChoice} isLast={isLast} />
+        )}
+
+        {/* ETL agent views */}
+        {isEtl && (
+          <EtlMessageView msg={msg} onChoice={onChoice} isLast={isLast} />
         )}
       </div>
     </div>
@@ -1872,6 +2433,20 @@ export function AgentsPane() {
           total_fields: totalFields,
           steps: data.steps,
         }]);
+      } else if (selectedAgent.id === 'etl-agent') {
+        // ETL Agent: rich message
+        setMessages(prev => [...prev, {
+          role: 'assistant',
+          content: data.content ?? '',
+          status: data.status,
+          files_found: data.files_found,
+          etl_plan: data.plan,
+          etl_action_log: data.action_log,
+          etl_synthesis: data.synthesis,
+          created_tables: data.created_tables,
+          question: data.question,
+          session_id: data.session_id,
+        }]);
       } else {
         // Data dictionary agent
         const processed = data.tables_processed ?? 0;
@@ -1906,6 +2481,7 @@ export function AgentsPane() {
 
   const isWriter = selectedAgent?.id === 'clickhouse-writer';
   const isKeyId = selectedAgent?.id === 'key-identifier';
+  const isEtl = selectedAgent?.id === 'etl-agent';
 
   // ── Render ────────────────────────────────────────────────────────────
 
@@ -1959,17 +2535,23 @@ export function AgentsPane() {
           {/* Agent header */}
           <div className={clsx(
             'bg-white border-b px-6 py-3 flex items-center gap-3 flex-shrink-0',
-            isWriter ? 'border-violet-100' : isKeyId ? 'border-indigo-100' : 'border-slate-200',
+            isWriter ? 'border-violet-100' : isKeyId ? 'border-indigo-100' : isEtl ? 'border-orange-100' : 'border-slate-200',
           )}>
-            <div className={clsx('p-2 rounded-lg', isWriter ? 'bg-violet-600' : isKeyId ? 'bg-indigo-500' : 'bg-emerald-500')}>
-              {isWriter ? <Zap size={16} className="text-white" /> : isKeyId ? <GitFork size={16} className="text-white" /> : <Cpu size={16} className="text-white" />}
+            <div className={clsx('p-2 rounded-lg', isWriter ? 'bg-violet-600' : isKeyId ? 'bg-indigo-500' : isEtl ? 'bg-orange-500' : 'bg-emerald-500')}>
+              {isWriter ? <Zap size={16} className="text-white" />
+                : isKeyId ? <GitFork size={16} className="text-white" />
+                : isEtl ? <Upload size={16} className="text-white" />
+                : <Cpu size={16} className="text-white" />}
             </div>
             <div className="flex-1 min-w-0">
               <h2 className="text-sm font-bold text-slate-800">{selectedAgent.name}</h2>
               <p className="text-xs text-slate-400 truncate">{selectedAgent.description}</p>
             </div>
-            {isWriter && sessionId && (
-              <span className="px-2 py-1 bg-violet-50 border border-violet-200 rounded-full text-[9px] font-mono text-violet-600">
+            {(isWriter || isEtl) && sessionId && (
+              <span className={clsx(
+                'px-2 py-1 rounded-full text-[9px] font-mono border',
+                isEtl ? 'bg-orange-50 border-orange-200 text-orange-600' : 'bg-violet-50 border-violet-200 text-violet-600',
+              )}>
                 Session active
               </span>
             )}
@@ -2092,6 +2674,37 @@ export function AgentsPane() {
                       ))}
                     </div>
                   </>
+                ) : isEtl ? (
+                  <>
+                    <div className="p-4 bg-orange-50 rounded-2xl mb-4">
+                      <Upload size={36} className="text-orange-400" />
+                    </div>
+                    <p className="text-sm text-slate-600 font-semibold mb-1">
+                      Agent ETL — Import fichiers
+                    </p>
+                    <p className="text-xs text-slate-400 max-w-sm leading-relaxed mb-4">
+                      Renseignez le <strong>dossier source</strong> dans les paramètres.
+                      L'agent listera les fichiers (CSV, Excel, Parquet, JSON, TXT),
+                      générera un plan d'import et créera des tables <span className="font-mono">BOT_ETL_*</span> dans ClickHouse.
+                      Les champs calculés seront préfixés <span className="font-mono">C_*</span>.
+                    </p>
+                    <div className="flex flex-wrap gap-2 justify-center">
+                      {[
+                        'Importe tous les fichiers dans une seule table clients',
+                        'Crée une table par fichier avec enrichissement depuis t_ref',
+                        'Importe les données et ajoute le champ C_montant_total calculé',
+                        'Répartis les données dans plusieurs tables selon le type',
+                      ].map(s => (
+                        <button
+                          key={s}
+                          onClick={() => setInput(s)}
+                          className="px-3 py-1.5 text-xs bg-white border border-orange-200 rounded-full text-orange-700 hover:border-orange-400 hover:bg-orange-50 transition-colors text-left"
+                        >
+                          {s}
+                        </button>
+                      ))}
+                    </div>
+                  </>
                 ) : (
                   <>
                     <MessageSquare size={32} className="text-slate-300 mb-3" />
@@ -2125,7 +2738,7 @@ export function AgentsPane() {
                   <div className="flex justify-end">
                     <div className={clsx(
                       'text-white rounded-xl px-4 py-2.5 max-w-md text-sm',
-                      isWriter ? 'bg-violet-600' : 'bg-emerald-500',
+                      isWriter ? 'bg-violet-600' : isEtl ? 'bg-orange-500' : 'bg-emerald-500',
                     )}>
                       {msg.content}
                     </div>
@@ -2144,32 +2757,32 @@ export function AgentsPane() {
               <div className="flex gap-3 justify-start">
                 <div className={clsx(
                   'p-2 rounded-full flex-shrink-0',
-                  isWriter ? 'bg-violet-100' : 'bg-emerald-100',
+                  isWriter ? 'bg-violet-100' : isEtl ? 'bg-orange-100' : 'bg-emerald-100',
                 )}>
                   <Loader2 size={14} className={clsx(
                     'animate-spin',
-                    isWriter ? 'text-violet-600' : 'text-emerald-600',
+                    isWriter ? 'text-violet-600' : isEtl ? 'text-orange-600' : 'text-emerald-600',
                   )} />
                 </div>
                 <div className="bg-white border border-slate-200 rounded-xl px-4 py-3 shadow-sm">
                   <div className="flex items-center gap-2 text-sm text-slate-400">
-                    <span>{isWriter ? "L'agent planifie et exécute" : 'Analyse en cours'}</span>
+                    <span>{isWriter ? "L'agent planifie et exécute" : isEtl ? "L'agent ETL analyse et importe" : 'Analyse en cours'}</span>
                     <span className="flex gap-0.5">
                       {[0, 150, 300].map(d => (
                         <span
                           key={d}
                           className={clsx(
                             'w-1 h-1 rounded-full animate-bounce',
-                            isWriter ? 'bg-violet-400' : 'bg-emerald-400',
+                            isWriter ? 'bg-violet-400' : isEtl ? 'bg-orange-400' : 'bg-emerald-400',
                           )}
                           style={{ animationDelay: `${d}ms` }}
                         />
                       ))}
                     </span>
                   </div>
-                  {isWriter && (
+                  {(isWriter || isEtl) && (
                     <p className="text-[10px] text-slate-300 mt-1">
-                      Cela peut prendre quelques instants selon la complexité…
+                      Cela peut prendre quelques instants selon la taille des fichiers…
                     </p>
                   )}
                 </div>
@@ -2189,7 +2802,9 @@ export function AgentsPane() {
                 placeholder={
                   isWriter
                     ? 'Décrivez votre analyse en langage naturel…'
-                    : `Interrogez l'agent "${selectedAgent.name}"…`
+                    : isEtl
+                      ? 'Décrivez comment importer vos données, tables à créer, champs calculés…'
+                      : `Interrogez l'agent "${selectedAgent.name}"…`
                 }
                 rows={2}
                 disabled={loading}
@@ -2197,7 +2812,9 @@ export function AgentsPane() {
                   'flex-1 resize-none px-4 py-3 text-sm border rounded-xl bg-slate-50 focus:outline-none focus:ring-2 focus:border-transparent disabled:opacity-50 transition-colors',
                   isWriter
                     ? 'border-violet-200 focus:ring-violet-400'
-                    : 'border-slate-200 focus:ring-emerald-400',
+                    : isEtl
+                      ? 'border-orange-200 focus:ring-orange-400'
+                      : 'border-slate-200 focus:ring-emerald-400',
                 )}
               />
               <button
@@ -2207,7 +2824,9 @@ export function AgentsPane() {
                   'p-3 disabled:bg-slate-200 disabled:cursor-not-allowed text-white rounded-xl transition-colors flex-shrink-0',
                   isWriter
                     ? 'bg-violet-600 hover:bg-violet-700'
-                    : 'bg-emerald-500 hover:bg-emerald-600',
+                    : isEtl
+                      ? 'bg-orange-500 hover:bg-orange-600'
+                      : 'bg-emerald-500 hover:bg-emerald-600',
                 )}
               >
                 {loading ? <Loader2 size={18} className="animate-spin" /> : <Send size={18} />}
@@ -2218,6 +2837,11 @@ export function AgentsPane() {
               {isWriter && sessionId && (
                 <span className="ml-2 text-violet-400 font-medium">
                   · Session en cours
+                </span>
+              )}
+              {isEtl && sessionId && (
+                <span className="ml-2 text-orange-400 font-medium">
+                  · Session ETL active
                 </span>
               )}
             </p>
