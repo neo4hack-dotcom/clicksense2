@@ -190,7 +190,7 @@ const SortableItem: React.FC<{ id: string, item: any, onRemove: () => void }> = 
   );
 }
 
-type VisualType = 'table' | 'matrix' | 'bar' | 'line' | 'area' | 'pie' | 'scatter' | 'radar';
+type VisualType = 'table' | 'matrix' | 'bar' | 'bar_stacked' | 'line' | 'area' | 'pie' | 'scatter' | 'radar';
 
 interface DrillThroughState {
   visible: boolean;
@@ -270,6 +270,10 @@ export function BuilderPane() {
   const [showHistory, setShowHistory] = useState(false);
   const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
+  const [showTableSearchPopup, setShowTableSearchPopup] = useState(false);
+  const [tableSearchPopupQuery, setTableSearchPopupQuery] = useState('');
+  const chartContainerRef = useRef<HTMLDivElement>(null);
+  const [chartOverflows, setChartOverflows] = useState(false);
 
   // Drill-through state
   const [drillThrough, setDrillThrough] = useState<DrillThroughState>({
@@ -329,6 +333,17 @@ export function BuilderPane() {
       setColumnOrder([]);
     }
   }, [queryResult]);
+
+  // Detect chart overflow
+  useEffect(() => {
+    if (!chartContainerRef.current) return;
+    const el = chartContainerRef.current;
+    const check = () => setChartOverflows(el.scrollWidth > el.clientWidth || el.scrollHeight > el.clientHeight);
+    check();
+    const ro = new ResizeObserver(check);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [queryResult, visualType]);
 
   const tables = Object.keys(schema).sort((a, b) => {
     const favA = tableMetadata[a]?.is_favorite ? 1 : 0;
@@ -1038,6 +1053,26 @@ export function BuilderPane() {
           </div>
         );
 
+      case 'bar_stacked':
+        return (
+          <div className="overflow-x-auto overflow-y-hidden min-h-0 flex-1 min-w-0">
+            <div style={{ minWidth: Math.max(600, processedData.length * 40) }}>
+              <ResponsiveContainer width="100%" height={400}>
+                <BarChart data={processedData}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                  <XAxis dataKey={dimKey} axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
+                  <YAxis axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
+                  <RechartsTooltip cursor={{ fill: '#f1f5f9' }} contentStyle={tooltipStyle} />
+                  <Legend iconType="circle" wrapperStyle={{ fontSize: '12px' }} />
+                  {measureKeys.map((key, i) => (
+                    <Bar key={key} dataKey={key} fill={CHART_COLORS[i % CHART_COLORS.length]} stackId="stack" radius={i === measureKeys.length - 1 ? [4, 4, 0, 0] : [0, 0, 0, 0]} />
+                  ))}
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+        );
+
       case 'line':
         return (
           <div className="overflow-x-auto overflow-y-hidden min-h-0 flex-1 min-w-0">
@@ -1511,17 +1546,6 @@ export function BuilderPane() {
           >
             <Plus size={12} /> Filter
           </button>
-          <div className="ml-auto flex items-center gap-2 shrink-0">
-            <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">LIMIT</span>
-            <input
-              type="number"
-              min="1"
-              value={queryLimit}
-              onChange={e => setQueryLimit(e.target.value)}
-              placeholder="∞"
-              className="text-xs w-20 px-2 py-1 border border-slate-200 rounded-lg focus:ring-1 focus:ring-emerald-500 outline-none bg-white text-slate-700"
-            />
-          </div>
         </div>
       </div>
 
@@ -1533,14 +1557,23 @@ export function BuilderPane() {
           <div className="p-4 border-b border-slate-200 shrink-0">
             <div className="flex items-center justify-between mb-2">
               <h3 className="text-sm font-semibold text-slate-800">Select Table</h3>
-              <button
-                onClick={handleRefreshSchema}
-                disabled={isRefreshingSchema}
-                className="p-1.5 text-slate-400 hover:text-emerald-600 hover:bg-emerald-50 rounded-md transition-colors disabled:opacity-50"
-                title="Refresh tables"
-              >
-                <RefreshCw size={14} className={isRefreshingSchema ? "animate-spin" : ""} />
-              </button>
+              <div className="flex items-center gap-1">
+                <button
+                  onClick={() => { setTableSearchPopupQuery(''); setShowTableSearchPopup(true); }}
+                  className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors"
+                  title="Browse tables & columns"
+                >
+                  <Telescope size={14} />
+                </button>
+                <button
+                  onClick={handleRefreshSchema}
+                  disabled={isRefreshingSchema}
+                  className="p-1.5 text-slate-400 hover:text-emerald-600 hover:bg-emerald-50 rounded-md transition-colors disabled:opacity-50"
+                  title="Refresh tables"
+                >
+                  <RefreshCw size={14} className={isRefreshingSchema ? "animate-spin" : ""} />
+                </button>
+              </div>
             </div>
             {/* Table search */}
             <div className="relative mb-2">
@@ -1744,14 +1777,15 @@ export function BuilderPane() {
                   <h3 className="text-sm font-semibold text-slate-800 shrink-0">Results</h3>
                   <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg shrink-0">
                     {[
-                      { id: 'table',  icon: Table,       title: 'Table' },
-                      { id: 'matrix', icon: LayoutGrid,   title: 'Matrix / Pivot' },
-                      { id: 'bar',    icon: BarChart2,    title: 'Bar Chart' },
-                      { id: 'line',   icon: LineChart,    title: 'Line Chart' },
-                      { id: 'area',   icon: Activity,     title: 'Area Chart' },
-                      { id: 'pie',    icon: PieChart,     title: 'Pie Chart' },
-                      { id: 'scatter',icon: ScatterChart, title: 'Scatter Plot' },
-                      { id: 'radar',  icon: Grid3X3,      title: 'Radar Chart' },
+                      { id: 'table',      icon: Table,       title: 'Table' },
+                      { id: 'matrix',     icon: LayoutGrid,   title: 'Matrix / Pivot' },
+                      { id: 'bar',        icon: BarChart2,    title: 'Bar Chart' },
+                      { id: 'bar_stacked',icon: Layers,       title: 'Stacked Bar Chart' },
+                      { id: 'line',       icon: LineChart,    title: 'Line Chart' },
+                      { id: 'area',       icon: Activity,     title: 'Area Chart' },
+                      { id: 'pie',        icon: PieChart,     title: 'Pie Chart' },
+                      { id: 'scatter',    icon: ScatterChart, title: 'Scatter Plot' },
+                      { id: 'radar',      icon: Grid3X3,      title: 'Radar Chart' },
                     ].map((v) => (
                       <button
                         key={v.id}
@@ -1765,6 +1799,25 @@ export function BuilderPane() {
                         <v.icon size={16} />
                       </button>
                     ))}
+                  </div>
+                  <div className="w-px h-6 bg-slate-200 mx-1 shrink-0"></div>
+                  <button
+                    onClick={() => setIsFullscreen(!isFullscreen)}
+                    className="p-1.5 text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-md transition-colors shrink-0"
+                    title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
+                  >
+                    {isFullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
+                  </button>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">LIMIT</span>
+                    <input
+                      type="number"
+                      min="1"
+                      value={queryLimit}
+                      onChange={e => setQueryLimit(e.target.value)}
+                      placeholder="∞"
+                      className="text-xs w-16 px-2 py-1 border border-slate-200 rounded-lg focus:ring-1 focus:ring-emerald-500 outline-none bg-white text-slate-700"
+                    />
                   </div>
                   <div className="flex items-center gap-2 ml-auto shrink-0">
                     {queryResult && queryResult.length > 0 && (
@@ -1806,17 +1859,16 @@ export function BuilderPane() {
                         </div>
                       </>
                     )}
-                    <div className="w-px h-6 bg-slate-200 mx-1"></div>
-                    <button
-                      onClick={() => setIsFullscreen(!isFullscreen)}
-                      className="p-1.5 text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-md transition-colors"
-                      title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
-                    >
-                      {isFullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
-                    </button>
                   </div>
                 </div>
-                <div className="p-4 flex-1 flex flex-col min-h-0 min-w-0 overflow-auto">
+                <div ref={chartContainerRef} className="p-4 flex-1 flex flex-col min-h-0 min-w-0 overflow-auto relative">
+                  {chartOverflows && !isFullscreen && (
+                    <div className="absolute top-2 left-1/2 -translate-x-1/2 z-10 pointer-events-none">
+                      <span className="text-[10px] font-medium text-white bg-slate-700/80 px-2 py-1 rounded-full shadow backdrop-blur-sm animate-pulse">
+                        Click on full screen for better visibility
+                      </span>
+                    </div>
+                  )}
                   {renderVisual()}
                 </div>
               </div>
@@ -1876,6 +1928,88 @@ export function BuilderPane() {
             </div>
             <div className="p-3 border-t border-slate-100 bg-slate-50 text-xs text-slate-400 shrink-0 font-mono">
               SELECT * FROM {selectedTable} … — {drillThrough.data.length} rows
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {/* ------------------------------------------------------------------ */}
+      {/* Table Search Popup                                                   */}
+      {/* ------------------------------------------------------------------ */}
+      {showTableSearchPopup && createPortal(
+        <div className="fixed inset-0 z-[350] flex items-center justify-center bg-black/50 backdrop-blur-sm p-4" onClick={() => setShowTableSearchPopup(false)}>
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[80vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+            <div className="p-4 border-b border-slate-200 flex items-center justify-between shrink-0">
+              <div className="flex items-center gap-2">
+                <Database size={16} className="text-blue-600" />
+                <h3 className="text-sm font-bold text-slate-800">Browse Tables & Columns</h3>
+                <span className="text-xs text-slate-400 bg-slate-100 px-2 py-0.5 rounded-full">{tables.length} tables</span>
+              </div>
+              <button onClick={() => setShowTableSearchPopup(false)} className="text-slate-400 hover:text-slate-600 p-1.5 hover:bg-slate-100 rounded-md">
+                <X size={16} />
+              </button>
+            </div>
+            <div className="p-3 border-b border-slate-100 shrink-0">
+              <div className="relative">
+                <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
+                <input
+                  type="text"
+                  autoFocus
+                  placeholder="Search tables or columns…"
+                  value={tableSearchPopupQuery}
+                  onChange={e => setTableSearchPopupQuery(e.target.value)}
+                  className="w-full text-sm pl-9 pr-4 py-2 border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none bg-slate-50"
+                />
+              </div>
+            </div>
+            <div className="flex-1 overflow-y-auto p-3 space-y-2">
+              {tables
+                .filter(t => {
+                  const q = tableSearchPopupQuery.toLowerCase();
+                  if (!q) return true;
+                  if (t.toLowerCase().includes(q)) return true;
+                  return schema[t]?.some((col: any) => col.name.toLowerCase().includes(q) || col.type.toLowerCase().includes(q));
+                })
+                .map(t => {
+                  const q = tableSearchPopupQuery.toLowerCase();
+                  const cols: any[] = schema[t] || [];
+                  const matchedCols = q ? cols.filter((c: any) => c.name.toLowerCase().includes(q) || c.type.toLowerCase().includes(q)) : cols;
+                  return (
+                    <div key={t} className="border border-slate-200 rounded-xl overflow-hidden">
+                      <div
+                        className={clsx("flex items-center gap-2 px-4 py-2.5 cursor-pointer transition-colors", selectedTable === t ? "bg-emerald-50 border-b border-emerald-100" : "bg-slate-50 border-b border-slate-100 hover:bg-slate-100")}
+                        onClick={() => { handleTableSelect(t); setShowTableSearchPopup(false); }}
+                      >
+                        <Table size={14} className={selectedTable === t ? "text-emerald-600" : "text-slate-400"} />
+                        <span className={clsx("text-sm font-semibold", selectedTable === t ? "text-emerald-700" : "text-slate-700")}>{t}</span>
+                        <span className="ml-auto text-xs text-slate-400">{cols.length} cols</span>
+                        {tableMetadata[t]?.description && (
+                          <span className="text-xs text-slate-400 italic truncate max-w-[200px]">{tableMetadata[t].description}</span>
+                        )}
+                        {tableMetadata[t]?.is_favorite && <Star size={12} className="text-amber-400 shrink-0" fill="currentColor" />}
+                      </div>
+                      {matchedCols.length > 0 && (
+                        <div className="divide-y divide-slate-50">
+                          {matchedCols.slice(0, tableSearchPopupQuery ? matchedCols.length : 8).map((col: any) => {
+                            const isNumeric = col.type.includes('Int') || col.type.includes('Float') || col.type.includes('Decimal');
+                            const isDate = col.type.includes('Date') || col.type.includes('Time');
+                            return (
+                              <div key={col.name} className="flex items-center gap-3 px-6 py-1.5 hover:bg-blue-50 cursor-pointer transition-colors" onClick={() => { handleTableSelect(t); setShowTableSearchPopup(false); }}>
+                                <div className={clsx("w-2 h-2 rounded-full shrink-0", isDate ? "bg-amber-400" : isNumeric ? "bg-blue-400" : "bg-emerald-400")} />
+                                <span className="text-xs text-slate-700 font-mono font-medium">{col.name}</span>
+                                <span className="text-xs text-slate-400 ml-auto font-mono">{col.type}</span>
+                              </div>
+                            );
+                          })}
+                          {!tableSearchPopupQuery && cols.length > 8 && (
+                            <div className="px-6 py-1.5 text-xs text-slate-400 italic">+{cols.length - 8} more columns…</div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
             </div>
           </div>
         </div>,

@@ -1438,6 +1438,12 @@ CLICKHOUSE INSTRUCTIONS:
 - For response times: quantilesTiming(). For JSON: JSONExtract(). For conditionals: sumIf(), countIf().
 - Always write highly optimized SQL.
 
+DATE HANDLING — CRITICAL:
+- Do NOT use complex date functions such as toStartOfMonth(), toStartOfWeek(), toStartOfYear(), toStartOfQuarter(), year(), month(), day(), toDayOfMonth(), dateDiff(), addDays(), subtractDays() or any similar helper.
+- For date filtering, ALWAYS use simple BETWEEN syntax: column BETWEEN '2024-01-01' AND '2024-03-31'
+- For date grouping/truncation, use toYYYYMM() or formatDateTime() only if strictly necessary; prefer BETWEEN ranges.
+- Never wrap date columns in transformation functions inside WHERE clauses.
+
 When NOT ambiguous, return ONLY this JSON:
 {
   "sql": "SELECT ...",
@@ -1500,6 +1506,12 @@ CLICKHOUSE INSTRUCTIONS:
 - For latest status: argMax(). For top-K: topK(). For unique counts: uniqHLL12().
 - For response times: quantilesTiming(). For JSON: JSONExtract(). For conditionals: sumIf(), countIf().
 - Always write highly optimized SQL.
+
+DATE HANDLING — CRITICAL:
+- Do NOT use complex date functions such as toStartOfMonth(), toStartOfWeek(), toStartOfYear(), toStartOfQuarter(), year(), month(), day(), toDayOfMonth(), dateDiff(), addDays(), subtractDays() or any similar helper.
+- For date filtering, ALWAYS use simple BETWEEN syntax: column BETWEEN '2024-01-01' AND '2024-03-31'
+- For date grouping/truncation, use toYYYYMM() or formatDateTime() only if strictly necessary; prefer BETWEEN ranges.
+- Never wrap date columns in transformation functions inside WHERE clauses.
 
 When NOT ambiguous, return ONLY this JSON:
 {{
@@ -1648,6 +1660,12 @@ CLICKHOUSE INSTRUCTIONS:
 - Use advanced ClickHouse functions when appropriate (windowFunnel, retention, argMax, topK, uniqHLL12, quantilesTiming, JSONExtract, sumIf, countIf …).
 - Always write highly optimised SQL with a LIMIT where appropriate.
 - Each query must explore a genuinely distinct angle (different aggregation, filter, dimension, or sub-question).
+
+DATE HANDLING — CRITICAL:
+- Do NOT use complex date functions such as toStartOfMonth(), toStartOfWeek(), toStartOfYear(), toStartOfQuarter(), year(), month(), day(), toDayOfMonth(), dateDiff(), addDays(), subtractDays() or any similar helper.
+- For date filtering, ALWAYS use simple BETWEEN syntax: column BETWEEN '2024-01-01' AND '2024-03-31'
+- For date grouping/truncation, use toYYYYMM() or formatDateTime() only if strictly necessary; prefer BETWEEN ranges.
+- Never wrap date columns in transformation functions inside WHERE clauses.
 
 CURRENT ANALYSIS PROGRESS ({len(steps_so_far)}/{MAX_AGENT_STEPS} steps used):
 {steps_context if steps_context else "None yet — this is the first step."}
@@ -2861,6 +2879,8 @@ def _cw_plan(user_request: str, database: str, schema_info: str) -> dict:
         "RÈGLE DE SÉCURITÉ ABSOLUE: tu n'as JAMAIS le droit de DROP, ALTER, TRUNCATE, DELETE, "
         "INSERT ou CREATE sur des tables existantes. Seules les tables préfixées BOT_ peuvent être "
         "créées ou modifiées. Tout écart sera bloqué côté serveur.\n"
+        "RÈGLE DATES: Dans ton plan, n'utilise JAMAIS de fonctions complexes sur les dates "
+        "(toStartOfMonth, year, month, day, etc.). Utilise systématiquement BETWEEN pour les filtres temporels.\n"
         "Sois stratégique: identifie les données nécessaires, les transformations requises, "
         "les vérifications à faire.\n\n"
         "Réponds UNIQUEMENT avec ce JSON:\n"
@@ -2943,6 +2963,11 @@ def _cw_generate_sql(session: dict, step: dict, client, database: str) -> dict:
         "- Tables temporaires: TOUJOURS préfixées BOT_ (ex: BOT_aggreg_results)\n"
         "- Syntaxe ClickHouse valide uniquement\n"
         "- Pour grandes tables: utilise LIMIT ou SAMPLE pour les explorations\n"
+        "- DATES — CRITIQUE: N'utilise JAMAIS toStartOfMonth(), toStartOfWeek(), toStartOfYear(), "
+        "toStartOfQuarter(), year(), month(), day(), toDayOfMonth(), dateDiff(), addDays(), subtractDays() "
+        "ou fonctions similaires. Pour filtrer sur des dates, utilise TOUJOURS la syntaxe BETWEEN: "
+        "colonne BETWEEN '2024-01-01' AND '2024-03-31'. "
+        "Pour grouper par période, utilise toYYYYMM() ou formatDateTime() seulement si strictement nécessaire.\n"
         "- CREATE TABLE: utilise ENGINE = MergeTree() ORDER BY tuple() si pas d'ordre naturel\n"
         "- Pour INSERT: INSERT INTO `db`.`BOT_table` SELECT ...\n"
         "- Si tu dois choisir entre plusieurs options et que l'utilisateur doit décider: "
