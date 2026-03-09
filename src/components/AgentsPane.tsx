@@ -1163,6 +1163,149 @@ function ChoicesPanel({
   );
 }
 
+// ── Writer Synthesis PDF Export ───────────────────────────────────────────
+
+function generateSynthesisPDF(synthesis: Synthesis) {
+  const genDate = new Date().toLocaleDateString('fr-FR', {
+    year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit',
+  });
+
+  const statusIcon = (s: string) =>
+    s === 'success' ? '✅' : s === 'failed' ? '❌' : '⚠️';
+  const statusColor = (s: string) =>
+    s === 'success' ? '#064e3b;background:#ecfdf5;border-color:#a7f3d0'
+      : s === 'failed' ? '#7f1d1d;background:#fef2f2;border-color:#fecaca'
+      : '#78350f;background:#fffbeb;border-color:#fde68a';
+
+  const findingsHtml = (synthesis.key_findings || []).map((f, i) => `
+    <div style="display:flex;align-items:flex-start;gap:12px;padding:12px 14px;background:#faf5ff;border:1px solid #e9d5ff;border-radius:10px;margin-bottom:8px;">
+      <div style="width:22px;height:22px;border-radius:50%;background:#7c3aed;color:white;font-size:10px;font-weight:900;display:flex;align-items:center;justify-content:center;flex-shrink:0;">${i + 1}</div>
+      <p style="font-size:12px;line-height:1.7;color:#3b0764;margin:0;">${f}</p>
+    </div>`).join('');
+
+  const stepsHtml = (synthesis.step_reflections || []).map((r) => `
+    <div style="padding:12px 14px;border-radius:10px;border:1px solid;margin-bottom:8px;${statusColor(r.status)}">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+        <span style="font-size:13px;">${statusIcon(r.status)}</span>
+        <span style="font-size:12px;font-weight:700;color:#1e293b;">Étape ${r.step_id} — ${r.description}</span>
+      </div>
+      <p style="font-size:11px;color:#334155;margin:0 0 4px;"><strong>Résultat :</strong> ${r.outcome}</p>
+      ${r.insight ? `<p style="font-size:10px;color:#64748b;font-style:italic;margin:0;">${r.insight}</p>` : ''}
+    </div>`).join('');
+
+  const recsHtml = (synthesis.recommendations || []).map((rec, i) => `
+    <div style="display:flex;align-items:flex-start;gap:12px;padding:12px 14px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:10px;margin-bottom:8px;">
+      <div style="width:22px;height:22px;border-radius:50%;background:#2563eb;color:white;font-size:10px;font-weight:900;display:flex;align-items:center;justify-content:center;flex-shrink:0;">${i + 1}</div>
+      <p style="font-size:12px;line-height:1.7;color:#1e3a8a;margin:0;">${rec}</p>
+    </div>`).join('');
+
+  const tablesHtml = (synthesis.tables_created || []).map((t) => `
+    <div style="padding:12px 14px;background:#f5f3ff;border:1px solid #ddd6fe;border-radius:10px;margin-bottom:8px;">
+      <p style="font-size:12px;font-weight:700;font-family:'Courier New',monospace;color:#5b21b6;margin:0 0 4px;">📊 ${t.name}</p>
+      <p style="font-size:11px;color:#334155;margin:0 0 2px;"><strong>Contenu :</strong> ${t.purpose}</p>
+      ${t.useful_for ? `<p style="font-size:10px;color:#64748b;font-style:italic;margin:0;">Utile pour : ${t.useful_for}</p>` : ''}
+    </div>`).join('');
+
+  function section(num: number, title: string, color: string, content: string) {
+    return `
+    <div style="background:white;border:1px solid #e2e8f0;border-radius:14px;overflow:hidden;margin-bottom:20px;page-break-inside:avoid;">
+      <div style="display:flex;align-items:center;gap:10px;padding:12px 18px;background:#f8fafc;border-bottom:1px solid #f1f5f9;">
+        <div style="width:24px;height:24px;border-radius:8px;background:${color};color:white;font-size:11px;font-weight:900;display:flex;align-items:center;justify-content:center;flex-shrink:0;">${num}</div>
+        <span style="font-size:12px;font-weight:700;color:#0f172a;">${title}</span>
+      </div>
+      <div style="padding:18px 20px;">${content}</div>
+    </div>`;
+  }
+
+  const html = `<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8"/>
+<title>Synthèse Agent ClickHouse Writer — ClickSense</title>
+<style>
+* { box-sizing:border-box; margin:0; padding:0; }
+body { font-family:'Segoe UI',system-ui,-apple-system,sans-serif; color:#0f172a; background:#f8fafc; -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+strong { font-weight:700; }
+@media print {
+  body { background:white; }
+  @page { margin:14mm 13mm; size:A4; }
+  .no-print { display:none !important; }
+}
+</style>
+</head>
+<body style="max-width:880px;margin:0 auto;padding:28px 22px;">
+
+  <!-- Cover -->
+  <div style="border-radius:18px;overflow:hidden;margin-bottom:28px;background:linear-gradient(135deg,#6d28d9 0%,#7c3aed 50%,#0891b2 100%);">
+    <div style="padding:36px 40px 26px;">
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:18px;">
+        <div>
+          <span style="display:inline-block;background:rgba(255,255,255,0.18);color:rgba(255,255,255,0.92);font-size:9px;font-weight:700;letter-spacing:0.14em;text-transform:uppercase;padding:3px 12px;border-radius:20px;margin-bottom:12px;">ClickHouse Writer Agent · Rapport de synthèse</span>
+          <h1 style="font-size:26px;font-weight:900;color:white;line-height:1.2;margin-bottom:6px;">Synthèse finale</h1>
+          <p style="font-size:13px;color:rgba(255,255,255,0.72);">Analyse approfondie multi-étapes · ClickSense AI</p>
+        </div>
+        <div style="padding:14px;border-radius:16px;background:rgba(255,255,255,0.12);flex-shrink:0;">
+          <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.9)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+          </svg>
+        </div>
+      </div>
+      <div style="display:flex;gap:24px;padding-top:16px;border-top:1px solid rgba(255,255,255,0.18);">
+        <div><div style="font-size:9px;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:.08em;">Généré le</div><div style="font-size:12px;font-weight:600;color:rgba(255,255,255,0.9);margin-top:2px;">${genDate}</div></div>
+        <div><div style="font-size:9px;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:.08em;">Découvertes</div><div style="font-size:12px;font-weight:600;color:rgba(255,255,255,0.9);margin-top:2px;">${synthesis.key_findings?.length ?? 0}</div></div>
+        <div><div style="font-size:9px;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:.08em;">Recommandations</div><div style="font-size:12px;font-weight:600;color:rgba(255,255,255,0.9);margin-top:2px;">${synthesis.recommendations?.length ?? 0}</div></div>
+        <div><div style="font-size:9px;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:.08em;">Tables créées</div><div style="font-size:12px;font-weight:600;color:rgba(255,255,255,0.9);margin-top:2px;">${synthesis.tables_created?.length ?? 0}</div></div>
+      </div>
+    </div>
+    <div style="padding:8px 40px;background:rgba(0,0,0,0.2);font-size:9px;color:rgba(255,255,255,0.5);letter-spacing:.04em;">
+      Document généré automatiquement par ClickSense ClickHouse Writer Agent
+    </div>
+  </div>
+
+  <!-- Executive summary -->
+  ${section(1, 'Résumé exécutif', '#7c3aed',
+    `<div style="padding:16px;background:#faf5ff;border:1px solid #e9d5ff;border-radius:10px;margin-bottom:${synthesis.data_insights || synthesis.conclusion ? '14px' : '0'};">
+      <p style="font-size:13px;line-height:1.75;color:#3b0764;font-weight:500;">${synthesis.executive_summary || '—'}</p>
+    </div>
+    ${synthesis.data_insights ? `<div style="margin-bottom:${synthesis.conclusion ? '12px' : '0'};"><p style="font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px;">Insights analytiques</p><p style="font-size:12px;line-height:1.7;color:#334155;">${synthesis.data_insights}</p></div>` : ''}
+    ${synthesis.conclusion ? `<div style="padding:12px 14px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;"><p style="font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;">Conclusion</p><p style="font-size:12px;line-height:1.7;color:#334155;">${synthesis.conclusion}</p></div>` : ''}`
+  )}
+
+  <!-- Key findings -->
+  ${synthesis.key_findings?.length ? section(2, 'Découvertes clés', '#0891b2', findingsHtml) : ''}
+
+  <!-- Recommendations -->
+  ${synthesis.recommendations?.length ? section(3, 'Recommandations', '#2563eb', recsHtml) : ''}
+
+  <!-- Step reflections -->
+  ${synthesis.step_reflections?.length ? section(4, 'Réflexion par étape', '#d97706', stepsHtml) : ''}
+
+  <!-- Tables created -->
+  ${synthesis.tables_created?.length ? section(5, 'Tables temporaires créées', '#059669', tablesHtml) : ''}
+
+  <!-- Footer -->
+  <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 18px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;font-size:9px;color:#94a3b8;margin-top:8px;">
+    <span>ClickSense · ClickHouse Writer Agent · Synthèse</span>
+    <span>${genDate}</span>
+  </div>
+
+  <!-- Print button -->
+  <div class="no-print" style="text-align:center;margin-top:20px;">
+    <button onclick="window.print()" style="padding:10px 28px;background:linear-gradient(135deg,#6d28d9,#7c3aed);color:white;border:none;border-radius:10px;font-size:13px;font-weight:600;cursor:pointer;box-shadow:0 2px 12px rgba(109,40,217,0.3);">
+      Imprimer / Enregistrer en PDF
+    </button>
+  </div>
+
+</body>
+</html>`;
+
+  const win = window.open('', '_blank');
+  if (!win) return;
+  win.document.write(html);
+  win.document.close();
+  setTimeout(() => { try { win.print(); } catch { /* ignore */ } }, 900);
+}
+
 function SynthesisView({ synthesis }: { synthesis: Synthesis }) {
   const [activeSection, setActiveSection] = useState<string>('summary');
 
@@ -1181,6 +1324,14 @@ function SynthesisView({ synthesis }: { synthesis: Synthesis }) {
         <div className="flex items-center gap-2">
           <Star size={15} className="text-violet-200" />
           <h3 className="text-sm font-bold text-white">Synthèse finale de l'agent</h3>
+          <button
+            onClick={() => generateSynthesisPDF(synthesis)}
+            title="Exporter en PDF — présentation soignée"
+            className="ml-auto flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/15 hover:bg-white/25 text-white text-[11px] font-semibold transition-colors border border-white/20"
+          >
+            <Download size={12} />
+            Export PDF
+          </button>
         </div>
       </div>
 
