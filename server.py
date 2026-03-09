@@ -2596,8 +2596,9 @@ Return ONLY valid JSON with this exact structure:
   "recommendations": ["<global recommendation 1>", "<global recommendation 2>"]
 }"""
 
+        scan_desc = "full scan" if sample_size is None else f"sample of {sample_size:,} rows"
         user_msg = (
-            f"Analyze data quality for table `{table}` (sample of {sample_size:,} rows{filter_note}).\n\n"
+            f"Analyze data quality for table `{table}` ({scan_desc}{filter_note}).\n\n"
             f"Column Statistics:\n{stats_json}{volume_note}\n\n"
             "Provide a thorough analysis identifying all data quality issues with specific numbers."
         )
