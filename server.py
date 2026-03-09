@@ -2058,6 +2058,7 @@ def _dq_column_stats(
     filter_col: str | None = None,
     filter_op: str | None = None,
     filter_val: str | None = None,
+    filter_val2: str | None = None,
 ) -> dict:
     """Collect a statistical profile for one column using ClickHouse queries.
 
@@ -2068,6 +2069,7 @@ def _dq_column_stats(
 
     If filter_col/filter_op/filter_val are provided, only rows matching that
     condition are included in the analysis (applied inside the bounding subquery).
+    BETWEEN operator uses filter_val (start) and filter_val2 (end).
     """
     import re as _re
     stats: dict = {"column": column, "type": col_type}
@@ -2081,10 +2083,15 @@ def _dq_column_stats(
         safe_fcol = _re.sub(r"[^\w]", "", filter_col)
         # Escape single quotes in the filter value
         escaped_val = str(filter_val).replace("'", "''")
-        op_map = {"=": "=", "!=": "!=", "<": "<", ">": ">", "<=": "<=", ">=": ">=", "LIKE": "LIKE"}
-        op = op_map.get(filter_op, "=")
-        where_clause = f" WHERE `{safe_fcol}` {op} '{escaped_val}'"
-        stats["filter_applied"] = f"`{safe_fcol}` {op} '{escaped_val}'"
+        if filter_op == "BETWEEN" and filter_val2 is not None:
+            escaped_val2 = str(filter_val2).replace("'", "''")
+            where_clause = f" WHERE `{safe_fcol}` BETWEEN '{escaped_val}' AND '{escaped_val2}'"
+            stats["filter_applied"] = f"`{safe_fcol}` BETWEEN '{escaped_val}' AND '{escaped_val2}'"
+        else:
+            op_map = {"=": "=", "!=": "!=", "<": "<", ">": ">", "<=": "<=", ">=": ">=", "LIKE": "LIKE"}
+            op = op_map.get(filter_op, "=")
+            where_clause = f" WHERE `{safe_fcol}` {op} '{escaped_val}'"
+            stats["filter_applied"] = f"`{safe_fcol}` {op} '{escaped_val}'"
 
     # Subquery that limits input rows — this is the correct way to bound scans
     # on large tables in ClickHouse.  Every aggregate below queries this sub.
@@ -2261,6 +2268,10 @@ def analyze_data_quality():
     filter_val = data.get("filter_value")
     if filter_val is not None:
         filter_val = str(filter_val)
+    # Second value for BETWEEN operator
+    filter_val2 = data.get("filter_value2")
+    if filter_val2 is not None:
+        filter_val2 = str(filter_val2)
     # Optional time series column for temporal/volume analysis
     time_col = (data.get("time_column") or "").strip() or None
 
@@ -2276,7 +2287,7 @@ def analyze_data_quality():
             return jsonify({"error": f"Invalid column name: {col}"}), 400
     if filter_col and not _re.match(r"^\w+$", filter_col):
         return jsonify({"error": "Invalid filter column name"}), 400
-    allowed_ops = {"=", "!=", "<", ">", "<=", ">=", "LIKE"}
+    allowed_ops = {"=", "!=", "<", ">", "<=", ">=", "LIKE", "BETWEEN"}
     if filter_op not in allowed_ops:
         filter_op = "="
 
@@ -2287,9 +2298,13 @@ def analyze_data_quality():
     if filter_col and filter_op and filter_val is not None:
         safe_fcol = _re.sub(r"[^\w]", "", filter_col)
         escaped_val = str(filter_val).replace("'", "''")
-        op_map = {"=": "=", "!=": "!=", "<": "<", ">": ">", "<=": "<=", ">=": ">=", "LIKE": "LIKE"}
-        op = op_map.get(filter_op, "=")
-        where_clause = f" WHERE `{safe_fcol}` {op} '{escaped_val}'"
+        if filter_op == "BETWEEN" and filter_val2 is not None:
+            escaped_val2 = str(filter_val2).replace("'", "''")
+            where_clause = f" WHERE `{safe_fcol}` BETWEEN '{escaped_val}' AND '{escaped_val2}'"
+        else:
+            op_map = {"=": "=", "!=": "!=", "<": "<", ">": ">", "<=": "<=", ">=": ">=", "LIKE": "LIKE"}
+            op = op_map.get(filter_op, "=")
+            where_clause = f" WHERE `{safe_fcol}` {op} '{escaped_val}'"
 
     try:
         client = get_clickhouse_client()
@@ -2305,6 +2320,7 @@ def analyze_data_quality():
             cs = _dq_column_stats(
                 client, table, col, col_type, sample_size,
                 filter_col=filter_col, filter_op=filter_op, filter_val=filter_val,
+                filter_val2=filter_val2,
             )
             column_stats.append(cs)
 
@@ -2370,7 +2386,10 @@ def analyze_data_quality():
 
         filter_note = ""
         if filter_col and filter_val is not None:
-            filter_note = f" (filtered to rows where `{filter_col}` {filter_op} '{filter_val}')"
+            if filter_op == "BETWEEN" and filter_val2 is not None:
+                filter_note = f" (filtered to rows where `{filter_col}` BETWEEN '{filter_val}' AND '{filter_val2}')"
+            else:
+                filter_note = f" (filtered to rows where `{filter_col}` {filter_op} '{filter_val}')"
 
         volume_note = ""
         if volume_analysis and "error" not in volume_analysis:
@@ -3138,7 +3157,16 @@ def _cw_execute_steps(session: dict, client, database: str, preview_rows: int = 
         step = steps[session["action_index"]]
 
         # ── Generate SQL via LLM ──────────────────────────────────────────
-        sql_result = _cw_generate_sql(session, step, client, database)
+        try:
+            sql_result = _cw_generate_sql(session, step, client, database)
+        except Exception as exc:
+            sql_result = {
+                "sql": "",
+                "explanation": f"Erreur LLM lors de la génération SQL: {str(exc)}",
+                "creates_table": None,
+                "needs_user_input": False,
+                "question": None,
+            }
 
         # ── Agent needs user input: pause and return question ─────────────
         if sql_result.get("needs_user_input"):
@@ -3352,77 +3380,89 @@ def _run_clickhouse_writer_agent():
     db = session["database"]
 
     # ── State machine ─────────────────────────────────────────────────────
-    if status == "new":
-        # Phase 1: explore schema & generate plan
-        session["status"] = "executing"
-        try:
-            schema_info = _cw_get_schema_info(client, db)
-        except Exception as exc:
-            schema_info = f"Erreur lors de la récupération du schéma: {exc}"
+    try:
+        if status == "new":
+            # Phase 1: explore schema & generate plan
+            session["status"] = "executing"
+            try:
+                schema_info = _cw_get_schema_info(client, db)
+            except Exception as exc:
+                schema_info = f"Erreur lors de la récupération du schéma: {exc}"
 
-        plan = _cw_plan(user_message, db, schema_info)
-        session["plan"] = plan
+            plan = _cw_plan(user_message, db, schema_info)
+            session["plan"] = plan
 
-        result = _cw_execute_steps(session, client, db, preview_rows)
+            result = _cw_execute_steps(session, client, db, preview_rows)
 
-    elif status in ("executing",):
-        result = _cw_execute_steps(session, client, db, preview_rows)
+        elif status in ("executing",):
+            result = _cw_execute_steps(session, client, db, preview_rows)
 
-    elif status == "asking_user":
-        # User answered a question: store answer and resume
-        step_idx = session.get("pending_step_index", session["action_index"])
-        session["user_context"][f"answer_step_{step_idx}"] = user_message
-        session["status"] = "executing"
-        result = _cw_execute_steps(session, client, db, preview_rows)
+        elif status == "asking_user":
+            # User answered a question: store answer and resume
+            step_idx = session.get("pending_step_index", session["action_index"])
+            session["user_context"][f"answer_step_{step_idx}"] = user_message
+            session["status"] = "executing"
+            result = _cw_execute_steps(session, client, db, preview_rows)
 
-    elif status == "awaiting_cleanup":
-        affirmative = any(w in user_message.lower()
-                          for w in ["oui", "yes", "delete", "supprimer", "ok", "confirme", "1"])
-        if affirmative:
-            dropped, errors = [], []
-            for table in list(session["created_tables"]):
-                try:
-                    client.command(f"DROP TABLE IF EXISTS `{db}`.`{table}`")
-                    dropped.append(table)
-                except Exception as exc:
-                    errors.append(f"{table}: {str(exc)}")
-            session["status"] = "done"
-            session["created_tables"] = [t for t in session["created_tables"]
-                                          if t not in dropped]
-            dropped_txt = ", ".join(dropped) if dropped else "aucune"
-            error_txt = f" (erreurs: {'; '.join(errors)})" if errors else ""
-            result = {
-                "content": (
-                    f"🗑️ Tables supprimées: {dropped_txt}{error_txt}. "
-                    "La session est terminée."
-                ),
-                "status": "done",
-                "cleanup_done": True,
-                "tables_dropped": dropped,
-                "synthesis": session.get("synthesis"),
-                "plan": session.get("plan"),
-                "action_log": session["action_log"],
-            }
+        elif status == "awaiting_cleanup":
+            affirmative = any(w in user_message.lower()
+                              for w in ["oui", "yes", "delete", "supprimer", "ok", "confirme", "1"])
+            if affirmative:
+                dropped, errors = [], []
+                for table in list(session["created_tables"]):
+                    try:
+                        client.command(f"DROP TABLE IF EXISTS `{db}`.`{table}`")
+                        dropped.append(table)
+                    except Exception as exc:
+                        errors.append(f"{table}: {str(exc)}")
+                session["status"] = "done"
+                session["created_tables"] = [t for t in session["created_tables"]
+                                              if t not in dropped]
+                dropped_txt = ", ".join(dropped) if dropped else "aucune"
+                error_txt = f" (erreurs: {'; '.join(errors)})" if errors else ""
+                result = {
+                    "content": (
+                        f"🗑️ Tables supprimées: {dropped_txt}{error_txt}. "
+                        "La session est terminée."
+                    ),
+                    "status": "done",
+                    "cleanup_done": True,
+                    "tables_dropped": dropped,
+                    "synthesis": session.get("synthesis"),
+                    "plan": session.get("plan"),
+                    "action_log": session["action_log"],
+                }
+            else:
+                session["status"] = "done"
+                result = {
+                    "content": (
+                        "✅ Tables BOT_ conservées. Vous pouvez les utiliser pour des analyses futures. "
+                        "La session est terminée."
+                    ),
+                    "status": "done",
+                    "cleanup_done": False,
+                    "created_tables": session["created_tables"],
+                    "synthesis": session.get("synthesis"),
+                    "plan": session.get("plan"),
+                    "action_log": session["action_log"],
+                }
+
         else:
-            session["status"] = "done"
             result = {
-                "content": (
-                    "✅ Tables BOT_ conservées. Vous pouvez les utiliser pour des analyses futures. "
-                    "La session est terminée."
-                ),
+                "content": "Session terminée. Démarrez une nouvelle conversation.",
                 "status": "done",
-                "cleanup_done": False,
-                "created_tables": session["created_tables"],
-                "synthesis": session.get("synthesis"),
-                "plan": session.get("plan"),
-                "action_log": session["action_log"],
             }
 
-    else:
-        result = {
-            "content": "Session terminée. Démarrez une nouvelle conversation.",
-            "status": "done",
-        }
+    except Exception as exc:
+        # Any unhandled exception (LLM failure, JSON parse error, etc.) must return
+        # a proper JSON error so the frontend doesn't show a generic "Erreur de connexion".
+        session["status"] = "error"
+        _writer_sessions[session_id] = session
+        return jsonify({
+            "error": f"Erreur interne de l'agent: {str(exc)}",
+            "session_id": session_id,
+            "status": "error",
+        }), 500
 
     _writer_sessions[session_id] = session
     result["session_id"] = session_id

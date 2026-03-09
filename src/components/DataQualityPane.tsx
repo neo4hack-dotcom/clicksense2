@@ -226,6 +226,7 @@ export function DataQualityPane() {
   const [filterColumn, setFilterColumn] = useState('');
   const [filterOperator, setFilterOperator] = useState('=');
   const [filterValue, setFilterValue] = useState('');
+  const [filterValue2, setFilterValue2] = useState('');
 
   const allTables = Object.keys(schema).sort();
   const filteredTables = tableSearch.trim()
@@ -268,6 +269,9 @@ export function DataQualityPane() {
       body.filter_column = filterColumn;
       body.filter_operator = filterOperator;
       body.filter_value = filterValue;
+      if (filterOperator === 'BETWEEN' && filterValue2 !== '') {
+        body.filter_value2 = filterValue2;
+      }
     }
     if (timeColumn) {
       body.time_column = timeColumn;
@@ -452,7 +456,7 @@ export function DataQualityPane() {
                 filteredTables.map(t => (
                   <button
                     key={t}
-                    onClick={() => { setSelectedTable(t); setSelectedColumns([]); setResult(null); setFilterColumn(''); setFilterValue(''); setTimeColumn(''); }}
+                    onClick={() => { setSelectedTable(t); setSelectedColumns([]); setResult(null); setFilterColumn(''); setFilterValue(''); setFilterValue2(''); setTimeColumn(''); }}
                     className={clsx(
                       'w-full text-left flex items-center gap-2 px-3 py-2 text-xs transition-colors',
                       selectedTable === t
@@ -554,37 +558,58 @@ export function DataQualityPane() {
                 <div className="space-y-1.5">
                   <select
                     value={filterColumn}
-                    onChange={e => setFilterColumn(e.target.value)}
+                    onChange={e => { setFilterColumn(e.target.value); setFilterValue(''); setFilterValue2(''); }}
                     className="w-full text-xs bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 focus:ring-2 focus:ring-violet-500/20 focus:border-violet-500 transition-all font-mono"
                   >
                     <option value="">— select column —</option>
                     {tableColumns.map(col => (
-                      <option key={col.name} value={col.name}>{col.name}</option>
+                      <option key={col.name} value={col.name}>{col.name} ({col.type})</option>
                     ))}
                   </select>
-                  <div className="flex gap-1.5">
-                    <select
-                      value={filterOperator}
-                      onChange={e => setFilterOperator(e.target.value)}
-                      className="w-20 shrink-0 text-xs bg-slate-50 border border-slate-200 rounded-lg px-2 py-2 focus:ring-2 focus:ring-violet-500/20 focus:border-violet-500 transition-all"
-                    >
-                      {['=', '!=', '<', '>', '<=', '>=', 'LIKE'].map(op => (
-                        <option key={op} value={op}>{op}</option>
-                      ))}
-                    </select>
-                    <input
-                      type="text"
-                      value={filterValue}
-                      onChange={e => setFilterValue(e.target.value)}
-                      placeholder="value…"
-                      className="flex-1 text-xs bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 focus:ring-2 focus:ring-violet-500/20 focus:border-violet-500 transition-all font-mono"
-                    />
-                  </div>
-                  {filterColumn && filterValue && (
-                    <p className="text-[10px] text-violet-600 bg-violet-50 border border-violet-200 rounded-lg px-2 py-1 font-mono">
-                      WHERE {filterColumn} {filterOperator} '{filterValue}'
-                    </p>
-                  )}
+                  {filterColumn && (() => {
+                    const colInfo = tableColumns.find(c => c.name === filterColumn);
+                    const isDateCol = colInfo ? ['DATE', 'DATETIME', 'TIMESTAMP'].some(t => colInfo.type.toUpperCase().includes(t)) : false;
+                    const inputType = isDateCol ? 'date' : 'text';
+                    return (
+                      <div className="space-y-1.5">
+                        <div className="flex gap-1.5">
+                          <select
+                            value={filterOperator}
+                            onChange={e => { setFilterOperator(e.target.value); setFilterValue2(''); }}
+                            className="w-24 shrink-0 text-xs bg-slate-50 border border-slate-200 rounded-lg px-2 py-2 focus:ring-2 focus:ring-violet-500/20 focus:border-violet-500 transition-all"
+                          >
+                            {['=', '!=', '<', '>', '<=', '>=', 'LIKE', ...(isDateCol ? ['BETWEEN'] : [])].map(op => (
+                              <option key={op} value={op}>{op}</option>
+                            ))}
+                          </select>
+                          <input
+                            type={inputType}
+                            value={filterValue}
+                            onChange={e => setFilterValue(e.target.value)}
+                            placeholder={filterOperator === 'BETWEEN' ? 'from…' : 'value…'}
+                            className="flex-1 text-xs bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 focus:ring-2 focus:ring-violet-500/20 focus:border-violet-500 transition-all font-mono"
+                          />
+                        </div>
+                        {filterOperator === 'BETWEEN' && (
+                          <input
+                            type={inputType}
+                            value={filterValue2}
+                            onChange={e => setFilterValue2(e.target.value)}
+                            placeholder="to…"
+                            className="w-full text-xs bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 focus:ring-2 focus:ring-violet-500/20 focus:border-violet-500 transition-all font-mono"
+                          />
+                        )}
+                        {filterColumn && filterValue && (
+                          <p className="text-[10px] text-violet-600 bg-violet-50 border border-violet-200 rounded-lg px-2 py-1 font-mono">
+                            {filterOperator === 'BETWEEN' && filterValue2
+                              ? `WHERE ${filterColumn} BETWEEN '${filterValue}' AND '${filterValue2}'`
+                              : `WHERE ${filterColumn} ${filterOperator} '${filterValue}'`
+                            }
+                          </p>
+                        )}
+                      </div>
+                    );
+                  })()}
                 </div>
               )}
             </div>
