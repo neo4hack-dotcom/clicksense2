@@ -633,6 +633,8 @@ function ClarificationPanel({
 export function ChatPane() {
   const {
     chatHistory, addChatMessage, clearChatHistory,
+    chatConversationId,
+    chatSqlHistory, addChatSqlEntry,
     schema, setQueryResult, queryHistory, setQueryHistory,
     tableMetadata, chatPaneSize, setChatPaneSize,
     tableMappings, selectedTableMappings, setSelectedTableMappings,
@@ -640,6 +642,7 @@ export function ChatPane() {
   } = useAppStore();
 
   const [filterOpen, setFilterOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
 
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -685,6 +688,7 @@ export function ChatPane() {
           schema,
           tableMetadata,
           tableMappingFilter: selectedTableMappings,
+          conversation_id: chatConversationId,
         }),
       });
 
@@ -709,6 +713,13 @@ export function ChatPane() {
           sql: data.sql,
           visual: data.suggestedVisual
         });
+        if (data.sql) {
+          addChatSqlEntry({
+            question: text,
+            sql: data.sql,
+            ts: new Date().toISOString(),
+          });
+        }
       }
     } catch (error: any) {
       addChatMessage({ role: 'assistant', content: `Failed to connect to AI: ${error.message}` });
@@ -872,6 +883,23 @@ export function ChatPane() {
             </div>
           </div>
           <div className="flex items-center gap-1">
+            {chatSqlHistory.length > 0 && (
+              <button
+                onClick={() => { setHistoryOpen(o => !o); setFilterOpen(false); }}
+                className={clsx(
+                  "p-1.5 rounded-lg transition-colors relative",
+                  historyOpen
+                    ? "text-emerald-600 bg-emerald-50 hover:bg-emerald-100"
+                    : "text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+                )}
+                title="Query history"
+              >
+                <History size={15} />
+                <span className="absolute -top-1 -right-1 w-4 h-4 bg-emerald-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center">
+                  {chatSqlHistory.length}
+                </span>
+              </button>
+            )}
             {mappedTables.length > 0 && (
               <button
                 onClick={() => setFilterOpen(o => !o)}
@@ -895,7 +923,7 @@ export function ChatPane() {
               <button
                 onClick={clearChatHistory}
                 className="p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"
-                title="Clear conversation"
+                title="Clear conversation (new session)"
               >
                 <Trash2 size={15} />
               </button>
@@ -966,6 +994,74 @@ export function ChatPane() {
                     AI will only search in {selectedTableMappings.length} selected table{selectedTableMappings.length > 1 ? 's' : ''}.
                   </p>
                 )}
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* History panel */}
+        <AnimatePresence>
+          {historyOpen && chatSqlHistory.length > 0 && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: 'auto', opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              className="overflow-hidden border-t border-slate-100"
+            >
+              <div className="px-4 py-3 max-h-72 overflow-y-auto">
+                <div className="flex items-center justify-between mb-2">
+                  <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide flex items-center gap-1.5">
+                    <History size={11} />
+                    Recent SQL queries
+                  </p>
+                  <button
+                    onClick={() => setHistoryOpen(false)}
+                    className="text-xs text-slate-400 hover:text-slate-600"
+                  >
+                    <X size={12} />
+                  </button>
+                </div>
+                <div className="space-y-2">
+                  {chatSqlHistory.map((entry, idx) => (
+                    <div key={idx} className="bg-slate-50 border border-slate-200 rounded-lg overflow-hidden">
+                      <div className="flex items-center justify-between px-3 py-1.5 bg-slate-100 border-b border-slate-200">
+                        <span className="text-[10px] text-slate-500 truncate flex-1 pr-2">{entry.question}</span>
+                        <div className="flex gap-1 shrink-0">
+                          <button
+                            onClick={() => { handleSend(entry.question); setHistoryOpen(false); }}
+                            className="flex items-center gap-1 text-[10px] bg-emerald-500 hover:bg-emerald-600 text-white px-2 py-0.5 rounded transition-colors"
+                            title="Re-run this query"
+                          >
+                            <Play size={9} />
+                            Re-run
+                          </button>
+                          <button
+                            onClick={async () => {
+                              try {
+                                const res = await fetch('/api/query', {
+                                  method: 'POST',
+                                  headers: { 'Content-Type': 'application/json' },
+                                  body: JSON.stringify({ query: entry.sql }),
+                                });
+                                const data = await res.json();
+                                if (!data.error) setQueryResult(data.data);
+                              } catch {}
+                              setHistoryOpen(false);
+                            }}
+                            className="flex items-center gap-1 text-[10px] bg-blue-500 hover:bg-blue-600 text-white px-2 py-0.5 rounded transition-colors"
+                            title="Execute SQL directly"
+                          >
+                            <Zap size={9} />
+                            SQL
+                          </button>
+                        </div>
+                      </div>
+                      <pre className="px-3 py-1.5 text-[10px] font-mono text-emerald-700 overflow-x-auto whitespace-pre-wrap">
+                        {entry.sql}
+                      </pre>
+                    </div>
+                  ))}
+                </div>
               </div>
             </motion.div>
           )}

@@ -9,7 +9,6 @@ const navGroups = [
     items: [
       { id: 'chat', icon: MessageSquare, label: 'AI Assistant' },
       { id: 'agents', icon: Cpu, label: 'Agents' },
-      { id: 'data-quality', icon: ShieldCheck, label: 'AI Data Quality' },
       { id: 'rag', icon: Layers, label: 'RAG' },
     ],
   },

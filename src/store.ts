@@ -63,6 +63,13 @@ interface AppState {
   activeTab: 'chat' | 'builder' | 'dashboard' | 'settings' | 'knowledge' | 'rag' | 'data-quality' | 'agents';
   setActiveTab: (tab: 'chat' | 'builder' | 'dashboard' | 'settings' | 'knowledge' | 'rag' | 'data-quality' | 'agents') => void;
 
+  chatConversationId: string;
+  resetChatConversationId: () => void;
+
+  chatSqlHistory: { question: string; sql: string; ts: string }[];
+  addChatSqlEntry: (entry: { question: string; sql: string; ts: string }) => void;
+  clearChatSqlHistory: () => void;
+
   chatHistory: {
     role: 'user' | 'assistant';
     content: string;
@@ -110,6 +117,7 @@ interface AppState {
     }[];
   }) => void;
   clearChatHistory: () => void;
+  // clearChatHistory also resets conversationId automatically
 
   chatPaneSize: 'normal' | 'expanded' | 'minimized';
   setChatPaneSize: (size: 'normal' | 'expanded' | 'minimized') => void;
@@ -162,9 +170,18 @@ export const useAppStore = create<AppState>((set) => ({
   activeTab: 'chat',
   setActiveTab: (activeTab) => set({ activeTab }),
 
+  chatConversationId: crypto.randomUUID(),
+  resetChatConversationId: () => set({ chatConversationId: crypto.randomUUID() }),
+
+  chatSqlHistory: [],
+  addChatSqlEntry: (entry) => set((state) => ({
+    chatSqlHistory: [entry, ...state.chatSqlHistory].slice(0, 30),
+  })),
+  clearChatSqlHistory: () => set({ chatSqlHistory: [] }),
+
   chatHistory: [],
   addChatMessage: (msg) => set((state) => ({ chatHistory: [...state.chatHistory, msg] })),
-  clearChatHistory: () => set({ chatHistory: [] }),
+  clearChatHistory: () => set({ chatHistory: [], chatConversationId: crypto.randomUUID() }),
 
   chatPaneSize: 'normal',
   setChatPaneSize: (chatPaneSize) => set({ chatPaneSize }),
