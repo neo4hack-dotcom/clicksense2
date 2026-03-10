@@ -1,10 +1,11 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, type ReactNode } from 'react';
 import {
   Send, Bot, Loader2, Sparkles, Play, Save, History, Trash2,
   Maximize2, Minimize2, Minus, CheckSquare, Filter, X,
   Brain, ChevronDown, ChevronRight, CheckCircle2, XCircle, Database,
   AlertTriangle, Info, Lightbulb, TrendingUp, TrendingDown, BarChart2, BookOpen,
   Download, FolderOpen, FileText, Zap, ShieldAlert, ShieldCheck,
+  Tag, Calculator, Calendar, Layers, Search, Table2, HelpCircle,
 } from 'lucide-react';
 import { useAppStore } from '../store';
 import clsx from 'clsx';
@@ -489,6 +490,146 @@ function ExecSummaryActions({ content, dismissed, onDismiss }: {
   );
 }
 
+// ── Clarification Panel ─────────────────────────────────────────────────────
+
+type ClarificationType = 'field_selection' | 'table_selection' | 'value_selection' | 'metric_selection' | 'period_selection' | 'dimension_selection';
+
+const clarificationConfig: Record<ClarificationType, {
+  label: string;
+  icon: ReactNode;
+  color: string;
+  pillColor: string;
+}> = {
+  table_selection: {
+    label: 'Choose a table',
+    icon: <Table2 size={12} />,
+    color: 'text-blue-700 bg-blue-50 border-blue-200',
+    pillColor: 'bg-blue-50 hover:bg-blue-100 text-blue-700 border-blue-200',
+  },
+  field_selection: {
+    label: 'Choose a field',
+    icon: <Layers size={12} />,
+    color: 'text-violet-700 bg-violet-50 border-violet-200',
+    pillColor: 'bg-violet-50 hover:bg-violet-100 text-violet-700 border-violet-200',
+  },
+  value_selection: {
+    label: 'Choose a value',
+    icon: <Tag size={12} />,
+    color: 'text-amber-700 bg-amber-50 border-amber-200',
+    pillColor: 'bg-amber-50 hover:bg-amber-100 text-amber-700 border-amber-200',
+  },
+  metric_selection: {
+    label: 'Choose a calculation',
+    icon: <Calculator size={12} />,
+    color: 'text-emerald-700 bg-emerald-50 border-emerald-200',
+    pillColor: 'bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border-emerald-200',
+  },
+  period_selection: {
+    label: 'Choose a period',
+    icon: <Calendar size={12} />,
+    color: 'text-sky-700 bg-sky-50 border-sky-200',
+    pillColor: 'bg-sky-50 hover:bg-sky-100 text-sky-700 border-sky-200',
+  },
+  dimension_selection: {
+    label: 'Choose a grouping',
+    icon: <BarChart2 size={12} />,
+    color: 'text-indigo-700 bg-indigo-50 border-indigo-200',
+    pillColor: 'bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border-indigo-200',
+  },
+};
+
+function ClarificationPanel({
+  type, options, context, onSelect,
+}: {
+  type: ClarificationType;
+  options: string[];
+  context?: { table?: string; field?: string };
+  onSelect: (value: string) => void;
+}) {
+  const [search, setSearch] = useState('');
+  const cfg = clarificationConfig[type] ?? clarificationConfig.field_selection;
+
+  const filtered = search.trim()
+    ? options.filter(o => o.toLowerCase().includes(search.toLowerCase()))
+    : options;
+
+  const showSearch = options.length > 8;
+
+  if (options.length === 0 && type === 'value_selection') {
+    // No values could be fetched — show a free-text input hint
+    return (
+      <div className="mt-3 space-y-2">
+        <div className={clsx('flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-semibold', cfg.color)}>
+          {cfg.icon}
+          <span>{cfg.label}</span>
+          {context?.field && (
+            <span className="font-mono text-[10px] opacity-70">({context.field})</span>
+          )}
+        </div>
+        <p className="text-xs text-slate-400 italic">Type the value directly in your message below.</p>
+      </div>
+    );
+  }
+
+  if (options.length === 0) return null;
+
+  return (
+    <div className="mt-3 space-y-2">
+      {/* Header badge */}
+      <div className={clsx('inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-semibold', cfg.color)}>
+        {cfg.icon}
+        <span>{cfg.label}</span>
+        {context?.table && <span className="font-mono text-[10px] opacity-70">· {context.table}</span>}
+        {context?.field && <span className="font-mono text-[10px] opacity-70">· {context.field}</span>}
+      </div>
+
+      {/* Search bar for long lists */}
+      {showSearch && (
+        <div className="relative">
+          <Search size={11} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
+          <input
+            type="text"
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            placeholder="Filter…"
+            className="w-full pl-7 pr-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-emerald-400"
+          />
+        </div>
+      )}
+
+      {/* Options pills — two-column grid for value_selection with many items */}
+      <div className={clsx(
+        'flex gap-1.5',
+        type === 'value_selection' && options.length > 6
+          ? 'flex-wrap max-h-48 overflow-y-auto pr-1'
+          : 'flex-wrap'
+      )}>
+        {filtered.map((opt, j) => (
+          <button
+            key={j}
+            onClick={() => onSelect(opt)}
+            className={clsx(
+              'flex items-center gap-1.5 px-3 py-1.5 border rounded-lg text-xs font-medium transition-colors',
+              cfg.pillColor
+            )}
+          >
+            <CheckSquare size={11} />
+            {opt}
+          </button>
+        ))}
+        {filtered.length === 0 && (
+          <p className="text-xs text-slate-400 italic">No match for "{search}"</p>
+        )}
+      </div>
+
+      {/* Footer hint: user can also type freely */}
+      <p className="text-[10px] text-slate-400 italic">
+        Click an option or type your answer below.
+      </p>
+    </div>
+  );
+}
+
 export function ChatPane() {
   const {
     chatHistory, addChatMessage, clearChatHistory,
@@ -559,6 +700,7 @@ export function ChatPane() {
           question: data.question,
           options: data.options || [],
           clarification_type: data.type || 'field_selection',
+          clarification_context: data.context,
         });
       } else {
         addChatMessage({
@@ -691,6 +833,14 @@ export function ChatPane() {
     : defaultSuggestions;
 
   if (suggestions.length === 0) suggestions.push(...defaultSuggestions);
+
+  // Schema-based starters: one suggestion per known table
+  const schemaTableNames = Object.keys(schema);
+  const schemaSuggestions = schemaTableNames.slice(0, 6).map(t => {
+    const mapping = tableMappings.find(m => m.table_name === t);
+    const label = mapping?.mapping_name ?? t;
+    return { label, table: t };
+  });
 
   const toggleSize = () => {
     if (chatPaneSize === 'normal') setChatPaneSize('expanded');
@@ -845,27 +995,55 @@ export function ChatPane() {
       {/* Messages */}
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
         {chatHistory.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-full text-center space-y-5">
+          <div className="flex flex-col items-center justify-center h-full text-center space-y-5 py-6">
             <div className="w-14 h-14 bg-emerald-100 rounded-full flex items-center justify-center text-emerald-500">
               <Bot size={28} />
             </div>
             <div>
               <h3 className="text-lg font-medium text-slate-800 mb-1">How can I help you analyze your data?</h3>
               <p className="text-slate-500 text-sm max-w-md mx-auto">
-                I can write ClickHouse queries, build charts, and find insights automatically.
+                Ask me anything in plain language — I will guide you step by step, propose choices, and generate the right SQL query.
               </p>
             </div>
-            <div className="flex flex-wrap gap-2 justify-center max-w-lg">
-              {suggestions.map((s, i) => (
-                <button
-                  key={i}
-                  onClick={() => setInput(s)}
-                  className="bg-white border border-slate-200 px-3 py-1.5 rounded-full text-xs text-slate-600 hover:border-emerald-500 hover:text-emerald-600 transition-colors shadow-sm flex items-center gap-1.5"
-                >
-                  <History size={12} className="opacity-50" />
-                  {s}
-                </button>
-              ))}
+
+            {/* Schema-based table starters */}
+            {schemaSuggestions.length > 0 && (
+              <div className="w-full max-w-lg">
+                <p className="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2 flex items-center justify-center gap-1.5">
+                  <Table2 size={11} /> Available tables
+                </p>
+                <div className="flex flex-wrap gap-2 justify-center">
+                  {schemaSuggestions.map((s, i) => (
+                    <button
+                      key={i}
+                      onClick={() => handleSend(`Tell me about the table ${s.table} and suggest some analyses`)}
+                      className="bg-white border border-slate-200 px-3 py-1.5 rounded-full text-xs text-slate-600 hover:border-emerald-500 hover:text-emerald-600 transition-colors shadow-sm flex items-center gap-1.5"
+                    >
+                      <Database size={11} className="text-emerald-500" />
+                      {s.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Quick idea starters */}
+            <div className="w-full max-w-lg">
+              <p className="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2 flex items-center justify-center gap-1.5">
+                <Lightbulb size={11} /> Quick ideas
+              </p>
+              <div className="flex flex-wrap gap-2 justify-center">
+                {suggestions.map((s, i) => (
+                  <button
+                    key={i}
+                    onClick={() => setInput(s)}
+                    className="bg-white border border-slate-200 px-3 py-1.5 rounded-full text-xs text-slate-600 hover:border-emerald-500 hover:text-emerald-600 transition-colors shadow-sm flex items-center gap-1.5"
+                  >
+                    <History size={12} className="opacity-50" />
+                    {s}
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
         ) : (
@@ -907,25 +1085,14 @@ export function ChatPane() {
                 )}
                 <MarkdownContent text={msg.content} isUser={msg.role === 'user'} />
 
-                {/* Clarification options */}
-                {msg.needs_clarification && msg.options && msg.options.length > 0 && (
-                  <div className="mt-3 space-y-2">
-                    <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">
-                      {msg.clarification_type === 'table_selection' ? 'Select a table:' : 'Select a field:'}
-                    </p>
-                    <div className="flex flex-wrap gap-2">
-                      {msg.options.map((opt, j) => (
-                        <button
-                          key={j}
-                          onClick={() => handleSend(opt)}
-                          className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded-lg text-xs font-medium transition-colors"
-                        >
-                          <CheckSquare size={12} />
-                          {opt}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
+                {/* Clarification options — rich per-type UI */}
+                {msg.needs_clarification && (
+                  <ClarificationPanel
+                    type={msg.clarification_type ?? 'field_selection'}
+                    options={msg.options ?? []}
+                    context={msg.clarification_context}
+                    onSelect={handleSend}
+                  />
                 )}
 
                 {/* SQL block */}

@@ -71,7 +71,8 @@ interface AppState {
     needs_clarification?: boolean;
     question?: string;
     options?: string[];
-    clarification_type?: 'field_selection' | 'table_selection';
+    clarification_type?: 'field_selection' | 'table_selection' | 'value_selection' | 'metric_selection' | 'period_selection' | 'dimension_selection';
+    clarification_context?: { table?: string; field?: string };
     is_agent?: boolean;
     agent_steps?: {
       step: number;
@@ -93,7 +94,8 @@ interface AppState {
     needs_clarification?: boolean;
     question?: string;
     options?: string[];
-    clarification_type?: 'field_selection' | 'table_selection';
+    clarification_type?: 'field_selection' | 'table_selection' | 'value_selection' | 'metric_selection' | 'period_selection' | 'dimension_selection';
+    clarification_context?: { table?: string; field?: string };
     is_agent?: boolean;
     agent_steps?: {
       step: number;
