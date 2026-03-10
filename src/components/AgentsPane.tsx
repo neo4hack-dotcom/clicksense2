@@ -5,10 +5,11 @@ import {
   MessageSquare, Play, RefreshCw, Zap, AlertTriangle, Info,
   RotateCcw, Trash2, BookOpen, TrendingUp, Star, Code2, Download,
   GitFork, ArrowRight, ArrowLeftRight, ThumbsUp, ThumbsDown,
-  FolderOpen, Upload, Layers, Calculator,
+  FolderOpen, Upload, Layers, Calculator, ShieldCheck,
 } from 'lucide-react';
 import clsx from 'clsx';
 import { useAppStore } from '../store';
+import { DataQualityPane } from './DataQualityPane';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -216,6 +217,8 @@ interface ChatMessage {
   etl_plan?: EtlPlan;
   etl_action_log?: EtlActionEntry[];
   etl_synthesis?: EtlSynthesis;
+  // Optional suggestions (non-blocking)
+  optional_suggestions?: { label: string; value: string }[];
 }
 
 // ── Data Dictionary Sub-components ─────────────────────────────────────────
@@ -2336,6 +2339,27 @@ function AssistantMessage({
           <WriterMessageView msg={msg} onChoice={onChoice} isLast={isLast} />
         )}
 
+        {/* Optional suggestions from Writer agent */}
+        {msg.optional_suggestions && msg.optional_suggestions.length > 0 && isLast && (
+          <div className="mt-3 p-3 bg-violet-50 border border-violet-200 rounded-xl">
+            <p className="text-[10px] font-bold text-violet-500 uppercase tracking-wide mb-2 flex items-center gap-1.5">
+              <Star size={10} />
+              Suggested follow-ups
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {msg.optional_suggestions.map((s, i) => (
+                <button
+                  key={i}
+                  onClick={() => onChoice(s.value)}
+                  className="px-3 py-1.5 text-xs bg-white border border-violet-300 rounded-full text-violet-700 hover:border-violet-500 hover:bg-violet-100 transition-colors text-left"
+                >
+                  {s.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
         {/* ETL agent views */}
         {isEtl && (
           <EtlMessageView msg={msg} onChoice={onChoice} isLast={isLast} />
@@ -2351,6 +2375,7 @@ export function AgentsPane() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [loadingAgents, setLoadingAgents] = useState(true);
   const [selectedAgent, setSelectedAgent] = useState<Agent | null>(null);
+  const [activeView, setActiveView] = useState<'agents' | 'data-quality'>('agents');
   const [params, setParams] = useState<Record<string, string | number>>({});
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
@@ -2417,6 +2442,7 @@ export function AgentsPane() {
         setMessages(prev => [...prev, {
           role: 'assistant',
           content: data.content ?? 'Operation complete.',
+          optional_suggestions: data.optional_suggestions,
           ...data,
         }]);
       } else if (selectedAgent.id === 'key-identifier') {
@@ -2499,27 +2525,54 @@ export function AgentsPane() {
         </div>
 
         <div className="flex-1 overflow-y-auto p-3 space-y-2">
-          {loadingAgents ? (
-            <div className="flex items-center justify-center py-10">
-              <Loader2 size={20} className="animate-spin text-slate-400" />
+          {/* Data Quality entry */}
+          <button
+            onClick={() => { setActiveView('data-quality'); setSelectedAgent(null); }}
+            className={clsx(
+              'w-full text-left p-3 rounded-xl border transition-all',
+              activeView === 'data-quality'
+                ? 'border-emerald-300 bg-emerald-50'
+                : 'border-slate-200 bg-white hover:border-slate-300 hover:bg-slate-50',
+            )}
+          >
+            <div className="flex items-center gap-2 mb-1">
+              <div className={clsx('p-1.5 rounded-lg', activeView === 'data-quality' ? 'bg-emerald-500' : 'bg-slate-100')}>
+                <ShieldCheck size={13} className={activeView === 'data-quality' ? 'text-white' : 'text-slate-500'} />
+              </div>
+              <span className="text-xs font-bold text-slate-800">AI Data Quality</span>
             </div>
-          ) : agents.length === 0 ? (
-            <p className="text-xs text-slate-400 text-center py-10">No agents available</p>
-          ) : (
-            agents.map(agent => (
-              <AgentCard
-                key={agent.id}
-                agent={agent}
-                selected={selectedAgent?.id === agent.id}
-                onClick={() => selectAgent(agent)}
-              />
-            ))
-          )}
+            <p className="text-[10px] text-slate-400 leading-snug">
+              Automated analysis of column quality, anomalies and recommendations.
+            </p>
+          </button>
+
+          <div className="border-t border-slate-100 pt-2">
+            {loadingAgents ? (
+              <div className="flex items-center justify-center py-10">
+                <Loader2 size={20} className="animate-spin text-slate-400" />
+              </div>
+            ) : agents.length === 0 ? (
+              <p className="text-xs text-slate-400 text-center py-10">No agents available</p>
+            ) : (
+              agents.map(agent => (
+                <AgentCard
+                  key={agent.id}
+                  agent={agent}
+                  selected={activeView === 'agents' && selectedAgent?.id === agent.id}
+                  onClick={() => { setActiveView('agents'); selectAgent(agent); }}
+                />
+              ))
+            )}
+          </div>
         </div>
       </div>
 
       {/* ── Right panel: chat ───────────────────────────────────────────── */}
-      {!selectedAgent ? (
+      {activeView === 'data-quality' ? (
+        <div className="flex-1 h-full overflow-hidden">
+          <DataQualityPane />
+        </div>
+      ) : !selectedAgent ? (
         <div className="flex-1 flex flex-col items-center justify-center text-center p-8">
           <div className="p-5 bg-emerald-50 rounded-2xl mb-4">
             <Cpu size={40} className="text-emerald-400" />

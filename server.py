@@ -2668,9 +2668,7 @@ def analyze_data_quality():
             except Exception as ve:
                 volume_analysis = {"error": str(ve), "time_column": time_col}
 
-        # ── LLM analysis ─────────────────────────────────────────────────────
-        stats_json = json.dumps(column_stats, indent=2, default=str)
-
+        # ── LLM analysis (batched when many columns) ─────────────────────────
         filter_note = ""
         if filter_col and filter_val is not None:
             if filter_op == "BETWEEN" and filter_val2 is not None:
@@ -2682,7 +2680,7 @@ def analyze_data_quality():
         if volume_analysis and "error" not in volume_analysis:
             volume_note = f"\n\nVOLUME CONSISTENCY (by {volume_analysis['granularity']}):\n{json.dumps(volume_analysis, indent=2, default=str)}"
 
-        system_prompt = """You are an expert data quality analyst specializing in database analytics and anomaly detection.
+        _dq_system_prompt = """You are an expert data quality analyst specializing in database analytics and anomaly detection.
 Analyze the statistical profiles of the provided columns and identify all data quality issues.
 
 Evaluate each column for:
@@ -2726,22 +2724,68 @@ Return ONLY valid JSON with this exact structure:
 }"""
 
         scan_desc = "full scan" if sample_size is None else f"sample of {sample_size:,} rows"
-        user_msg = (
-            f"Analyze data quality for table `{table}` ({scan_desc}{filter_note}).\n\n"
-            f"Column Statistics:\n{stats_json}{volume_note}\n\n"
-            "Provide a thorough analysis identifying all data quality issues with specific numbers."
-        )
 
-        llm_response = _call_llm(system_prompt, [{"role": "user", "content": user_msg}], temperature=0.1)
+        # Batch columns into at most 5 LLM calls to avoid token overflow
+        MAX_DQ_BATCHES = 5
+        BATCH_THRESHOLD = 8  # no batching below this count
 
-        try:
-            analysis = _parse_llm_json(llm_response)
-        except Exception:
+        def _dq_call_batch(batch_stats, batch_idx, total_batches, include_volume=False):
+            """Call LLM for a batch of column stats. Returns parsed analysis dict."""
+            batch_json = json.dumps(batch_stats, indent=2, default=str)
+            vol_section = volume_note if (include_volume and volume_note) else ""
+            batch_note = f" [batch {batch_idx}/{total_batches}]" if total_batches > 1 else ""
+            user_msg = (
+                f"Analyze data quality for table `{table}` ({scan_desc}{filter_note}){batch_note}.\n\n"
+                f"Column Statistics:\n{batch_json}{vol_section}\n\n"
+                "Provide a thorough analysis identifying all data quality issues with specific numbers."
+            )
+            raw = _call_llm(_dq_system_prompt, [{"role": "user", "content": user_msg}], temperature=0.1)
+            result = _parse_llm_json(raw)
+            if not result:
+                return {
+                    "summary": raw,
+                    "quality_score": None,
+                    "columns": [{"column": s["column"], "quality_score": None, "issues": [], "insights": ""}
+                                for s in batch_stats],
+                    "recommendations": [],
+                }
+            return result
+
+        if len(column_stats) <= BATCH_THRESHOLD:
+            # Single LLM call
+            analysis = _dq_call_batch(column_stats, 1, 1, include_volume=True)
+        else:
+            # Split into batches (max MAX_DQ_BATCHES)
+            import math as _math
+            n_batches = min(MAX_DQ_BATCHES, len(column_stats))
+            batch_size = _math.ceil(len(column_stats) / n_batches)
+            batches = [column_stats[i:i + batch_size] for i in range(0, len(column_stats), batch_size)]
+
+            batch_results = []
+            for idx, batch in enumerate(batches):
+                # Only include volume analysis in the first batch
+                br = _dq_call_batch(batch, idx + 1, len(batches), include_volume=(idx == 0))
+                batch_results.append(br)
+
+            # Merge batch results
+            all_columns = []
+            all_recs = []
+            scores = []
+            for br in batch_results:
+                all_columns.extend(br.get("columns") or [])
+                all_recs.extend(br.get("recommendations") or [])
+                if br.get("quality_score") is not None:
+                    scores.append(br["quality_score"])
+
+            merged_score = round(sum(scores) / len(scores)) if scores else None
+            # Build merged summary
+            merged_summary = f"Analysis of {len(column_stats)} columns in {len(batches)} batches. " + \
+                             " ".join(br.get("summary", "") for br in batch_results[:2])
             analysis = {
-                "summary": llm_response,
-                "quality_score": None,
-                "columns": [],
-                "recommendations": [],
+                "summary": merged_summary[:500],
+                "quality_score": merged_score,
+                "columns": all_columns,
+                "recommendations": list(dict.fromkeys(all_recs))[:10],  # deduplicate, keep 10
             }
 
         return jsonify({
@@ -3309,6 +3353,12 @@ def _cw_plan(user_request: str, database: str, schema_info: str) -> dict:
         "créées ou modifiées. Tout écart sera bloqué côté serveur.\n"
         "RÈGLE DATES: Dans ton plan, n'utilise JAMAIS de fonctions complexes sur les dates "
         "(toStartOfMonth, year, month, day, etc.). Utilise systématiquement BETWEEN pour les filtres temporels.\n"
+        "RÈGLE DÉCOMPOSITION: Décompose les opérations complexes en sous-requêtes simples enchaînées. "
+        "Pour les agrégations multi-niveaux: étape 1 = SELECT simple avec GROUP BY, "
+        "étape 2 = INSERT dans table BOT_, étape 3 = vérification. "
+        "Ne jamais tenter de faire en une seule requête ce qui nécessite plusieurs passes.\n"
+        "RÈGLE FONCTIONS: Évite les fonctions ClickHouse avancées (windowFunnel, retention, argMax, "
+        "topK, uniqHLL12, etc.). Préfère COUNT, SUM, AVG, MIN, MAX, groupArray si nécessaire.\n"
         "Sois stratégique: identifie les données nécessaires, les transformations requises, "
         "les vérifications à faire.\n\n"
         "Réponds UNIQUEMENT avec ce JSON:\n"
@@ -3396,8 +3446,13 @@ def _cw_generate_sql(session: dict, step: dict, client, database: str) -> dict:
         "ou fonctions similaires. Pour filtrer sur des dates, utilise TOUJOURS la syntaxe BETWEEN: "
         "colonne BETWEEN '2024-01-01' AND '2024-03-31'. "
         "Pour grouper par période, utilise toYYYYMM() ou formatDateTime() seulement si strictement nécessaire.\n"
-        "- CREATE TABLE: utilise ENGINE = MergeTree() ORDER BY tuple() si pas d'ordre naturel\n"
+        "- CREATE TABLE: utilise ENGINE = MergeTree() ORDER BY tuple() si pas d'ordre naturel. "
+        "Crée la table et l'INSERT dans des SQL séparés — ne jamais combiner CREATE + INSERT.\n"
         "- Pour INSERT: INSERT INTO `db`.`BOT_table` SELECT ...\n"
+        "- DÉCOMPOSITION: si le calcul est complexe (multi-niveaux, jointures multiples), "
+        "génère la PREMIÈRE étape simple uniquement. Les étapes suivantes du plan feront le reste.\n"
+        "- FONCTIONS INTERDITES: windowFunnel, retention, argMax, topK, uniqHLL12, uniqExact (utilise COUNT DISTINCT), "
+        "runningAccumulate, neighbor, and toRelativeXNum functions.\n"
         "- Si tu dois choisir entre plusieurs options et que l'utilisateur doit décider: "
         "pose une question avec des choix\n\n"
         "Réponds UNIQUEMENT avec ce JSON:\n"
@@ -3610,6 +3665,97 @@ def _cw_generate_simple_sql(session: dict, step: dict, client, database: str,
     return (result.get("sql") or "").strip()
 
 
+def _cw_rethink_strategy(session: dict, step: dict, client, database: str,
+                          failed_sql: str, error_msg: str) -> str:
+    """When both original SQL and the simplified retry fail, force the LLM to devise
+    a completely different strategy for the step.  This call costs one credit.
+
+    Returns the rethought SQL string, or empty string if generation failed.
+    """
+    plan = session["plan"]
+    action_log = session["action_log"]
+
+    prev_summaries = []
+    for entry in action_log[-6:]:
+        status_str = "✓ SUCCÈS" if entry["ok"] else "✗ ECHEC"
+        prev_summaries.append(
+            f"Étape {entry['step_id']} ({status_str}): {entry['description']}\n"
+            f"  SQL: {str(entry.get('sql', ''))[:200]}\n"
+            f"  Résultat: {str(entry.get('result_preview', ''))[:200]}"
+        )
+
+    try:
+        res = client.query(f"SHOW TABLES FROM `{database}`")
+        all_tables = [row[0] for row in res.result_rows]
+    except Exception:
+        all_tables = []
+
+    system_prompt = (
+        "Tu es un expert ClickHouse devant résoudre un problème persistant. "
+        "Deux tentatives de SQL ont échoué pour cette étape. Tu DOIS proposer une NOUVELLE STRATÉGIE "
+        "complètement différente — ne répète pas les approches qui ont déjà échoué. "
+        "Décompose l'opération en étapes plus simples si nécessaire. "
+        "Tu réponds UNIQUEMENT avec du JSON valide, sans markdown."
+    )
+    user_content = (
+        f"Base: {database} | Tables disponibles: {', '.join(all_tables)}\n\n"
+        f"Objectif global: {plan.get('objective', '')}\n\n"
+        f"Étape {step['id']}: {step['description']}\n"
+        f"Type: {step.get('type', 'compute')}\n\n"
+        f"SQL original qui a échoué:\n{failed_sql}\n\n"
+        f"Erreur: {error_msg}\n\n"
+        f"Contexte des étapes précédentes:\n"
+        + ("\n".join(prev_summaries) if prev_summaries else "  (première étape)\n")
+        + "\n\nNOUVELLE STRATÉGIE REQUISE — règles:\n"
+        "- Utilise UNIQUEMENT SELECT, COUNT, SUM, MIN, MAX, AVG avec GROUP BY simple\n"
+        "- Si CREATE TABLE nécessaire: utilise ENGINE = MergeTree() ORDER BY tuple(), "
+        "puis un INSERT séparé dans un second SQL\n"
+        "- Évite toute fonction complexe (window functions, CTEs imbriquées, argMax, topK, etc.)\n"
+        "- Préfère plusieurs requêtes simples enchaînées plutôt qu'une seule requête complexe\n"
+        "- DATES: utilise UNIQUEMENT BETWEEN '2024-01-01' AND '2024-12-31'\n"
+        "- Ajoute LIMIT 1000 pour les explorations\n"
+        "- Si l'objectif ne peut pas être atteint simplement, propose l'approximation la plus proche\n\n"
+        "Réponds UNIQUEMENT avec:\n"
+        "{\n"
+        '  "sql": "ta nouvelle requête SQL ici",\n'
+        '  "explanation": "en quoi cette nouvelle approche est différente"\n'
+        "}"
+    )
+    raw = _call_llm(system_prompt, [{"role": "user", "content": user_content}], temperature=0.1)
+    result = _parse_llm_json(raw)
+    if not result:
+        return ""
+    return (result.get("sql") or "").strip()
+
+
+def _cw_generate_suggestions(user_request: str, schema_info: str, plan: dict) -> list:
+    """Generate optional follow-up suggestions for the user based on the plan and schema.
+
+    Returns a list of {label, value} dicts (max 5).
+    """
+    system_prompt = (
+        "Tu es un conseiller data expert. En regardant un plan d'exécution ClickHouse, "
+        "tu suggères des analyses complémentaires pertinentes que l'utilisateur pourrait vouloir réaliser. "
+        "Tu réponds UNIQUEMENT avec du JSON valide, sans markdown."
+    )
+    # Extract table names from schema info (first line mentions table names)
+    user_content = (
+        f"Demande originale: {user_request}\n\n"
+        f"Schéma disponible:\n{schema_info[:800]}\n\n"
+        f"Plan généré:\n{json.dumps({'objective': plan.get('objective'), 'steps': [s['description'] for s in plan.get('steps', [])]}, ensure_ascii=False)}\n\n"
+        "Génère 4 à 5 suggestions de suivi pertinentes que l'utilisateur pourrait vouloir faire après cette analyse. "
+        "Pense à: tables connexes à explorer, métriques complémentaires, calculs dérivés, comparaisons temporelles, "
+        "vérifications de cohérence, agrégations par dimension, création de tables de synthèse.\n\n"
+        "Réponds UNIQUEMENT avec:\n"
+        '{"suggestions": [{"label": "Courte description action", "value": "Demande complète à envoyer à l\'agent"}]}'
+    )
+    raw = _call_llm(system_prompt, [{"role": "user", "content": user_content}], temperature=0.3)
+    result = _parse_llm_json(raw)
+    if not result:
+        return []
+    return (result.get("suggestions") or [])[:5]
+
+
 def _cw_execute_steps(session: dict, client, database: str, preview_rows: int = 5) -> dict:
     """
     Core execution loop: runs plan steps until done, needs user input, or max actions reached.
@@ -3737,11 +3883,80 @@ def _cw_execute_steps(session: dict, client, database: str, preview_rows: int = 
                                     if bot_table and bot_table not in session["created_tables"]:
                                         session["created_tables"].append(bot_table)
                             except Exception as alt_exc:
-                                # Both attempts failed — keep original error, append retry note
+                                # Both attempts failed — try a completely different strategy (uses 1 credit)
                                 entry["result_preview"] = (
                                     f"Erreur: {original_error}"
                                     f" | Alternative simplifiée aussi échouée: {str(alt_exc)}"
                                 )
+                                remaining_after_current = max_actions - session["action_count"] - 1
+                                if remaining_after_current > 0:
+                                    rethink_sql = _cw_rethink_strategy(
+                                        session, step, client, database, sql, original_error
+                                    )
+                                    if rethink_sql:
+                                        rethink_is_safe, _ = _cw_is_sql_safe(rethink_sql)
+                                        if rethink_is_safe:
+                                            # Log the failed original entry first (consume its credit)
+                                            entry["explanation"] = (
+                                                entry.get("explanation", "")
+                                                + " [échec — nouvelle stratégie en cours]"
+                                            )
+                                            session["action_log"].append(entry)
+                                            session["action_index"] += 1
+                                            session["action_count"] += 1
+                                            # Now try the rethought strategy (uses one more credit)
+                                            rethink_entry = {
+                                                "step_id": step["id"],
+                                                "description": f"[Stratégie alternative] {step['description']}",
+                                                "sql": rethink_sql,
+                                                "ok": False,
+                                                "result_preview": None,
+                                                "rows_affected": None,
+                                                "explanation": "Nouvelle stratégie après deux échecs consécutifs",
+                                            }
+                                            try:
+                                                rt_upper = rethink_sql.lstrip().upper()
+                                                rt_is_read = any(rt_upper.startswith(k) for k in
+                                                                  ("SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH"))
+                                                if rt_is_read:
+                                                    rt_res = client.query(rethink_sql)
+                                                    rt_rows = _rows_to_dicts(rt_res)
+                                                    rethink_entry["ok"] = True
+                                                    rethink_entry["result_preview"] = rt_rows[:preview_rows]
+                                                    rethink_entry["rows_affected"] = len(rt_rows)
+                                                else:
+                                                    client.command(rethink_sql)
+                                                    rethink_entry["ok"] = True
+                                                    rethink_entry["result_preview"] = "Commande exécutée (stratégie alternative)."
+                                                    bot_t = _cw_detect_bot_table(rethink_sql)
+                                                    if bot_t and bot_t not in session["created_tables"]:
+                                                        session["created_tables"].append(bot_t)
+                                            except Exception as rt_exc:
+                                                rethink_entry["result_preview"] = (
+                                                    f"Échec stratégie alternative: {str(rt_exc)}"
+                                                )
+                                            session["action_log"].append(rethink_entry)
+                                            session["action_index"] += 1
+                                            session["action_count"] += 1
+                                            # Skip normal end-of-loop append/increment
+                                            remaining_credits = max_actions - session["action_count"]
+                                            if (session["action_count"] % 3 == 0
+                                                    and session["action_index"] < len(steps)
+                                                    and remaining_credits > 0):
+                                                replan = _cw_replan(session, remaining_credits)
+                                                replan["checked_after_step"] = session["action_count"]
+                                                session["replan_log"].append(replan)
+                                                if replan.get("should_replan") and replan.get("new_remaining_steps"):
+                                                    completed_steps = [s for s in steps if s["id"] <= step["id"]]
+                                                    new_rem = replan["new_remaining_steps"][:remaining_credits]
+                                                    plan["steps"] = completed_steps + new_rem
+                                                    plan["replan_note"] = (
+                                                        f"Réévalué après étape {session['action_count']}: "
+                                                        + replan.get("reason", "")
+                                                    )
+                                                    session["plan"] = plan
+                                                    steps = plan["steps"]
+                                            continue
 
         session["action_log"].append(entry)
         session["action_index"] += 1
@@ -3903,7 +4118,16 @@ def _run_clickhouse_writer_agent():
             plan = _cw_plan(user_message, db, schema_info)
             session["plan"] = plan
 
+            # Generate optional follow-up suggestions (non-blocking)
+            try:
+                optional_suggestions = _cw_generate_suggestions(user_message, schema_info, plan)
+            except Exception:
+                optional_suggestions = []
+
             result = _cw_execute_steps(session, client, db, preview_rows)
+            # Attach suggestions to the first response
+            if optional_suggestions:
+                result["optional_suggestions"] = optional_suggestions
 
         elif status in ("executing",):
             result = _cw_execute_steps(session, client, db, preview_rows)
