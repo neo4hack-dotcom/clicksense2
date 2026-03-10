@@ -235,11 +235,11 @@ export function KnowledgeBasePane() {
                   type="text"
                   value={newFolder.title}
                   onChange={e => setNewFolder({ ...newFolder, title: e.target.value })}
-                  placeholder="Ex: Description de la table orders"
+                  placeholder="Ex: Description of the orders table"
                   className="w-full bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all"
                   autoFocus
                 />
-                <p className="mt-1 text-xs text-slate-400">Used for similarity search — be descriptive (e.g., "Description de la table orders")</p>
+                <p className="mt-1 text-xs text-slate-400">Used for similarity search — be descriptive (e.g., "Description of the orders table")</p>
               </div>
               <div>
                 <label className="text-xs font-semibold text-slate-600 uppercase tracking-wide mb-1 block">Content</label>
@@ -453,7 +453,7 @@ export function KnowledgeBasePane() {
                         value={currentEditValue}
                         onChange={e => setEditingMappings(prev => ({ ...prev, [tableName]: e.target.value }))}
                         onKeyDown={e => { if (e.key === 'Enter') handleSaveMapping(tableName); }}
-                        placeholder="Ex: Ventes des produits Maison"
+                        placeholder="Ex: Home product sales"
                         className="w-full bg-slate-50 border border-slate-200 rounded-lg px-3 py-1.5 text-sm focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all"
                       />
                       <div className="flex items-center gap-1.5 shrink-0 w-20 justify-end">
@@ -503,13 +503,13 @@ interface FkRelationsTabProps {
 
 function FkRelationsTab({ fkRelations, setFkRelations, deletingFkId, setDeletingFkId }: FkRelationsTabProps) {
   const handleDelete = async (id: number) => {
-    if (!confirm('Supprimer cette relation FK ?')) return;
+    if (!confirm('Delete this FK relationship?')) return;
     setDeletingFkId(id);
     try {
       await fetch(`/api/fk-relations/${id}`, { method: 'DELETE' });
       setFkRelations(fkRelations.filter(r => r.id !== id));
     } catch {
-      alert('Erreur lors de la suppression.');
+      alert('Error during deletion.');
     } finally {
       setDeletingFkId(null);
     }
@@ -526,8 +526,8 @@ function FkRelationsTab({ fkRelations, setFkRelations, deletingFkId, setDeleting
       <div className="mb-4 flex items-start justify-between">
         <div>
           <p className="text-slate-500 text-sm max-w-2xl">
-            Relations de clé étrangère identifiées par l'<strong>Agent Key Identifier</strong> et confirmées par vous.
-            Ces relations sont automatiquement injectées dans le contexte de l'IA pour améliorer la génération de requêtes SQL (JOINs).
+            Foreign key relationships identified by the <strong>Key Identifier Agent</strong> and confirmed by you.
+            These relationships are automatically injected into the AI context to improve SQL query generation (JOINs).
           </p>
         </div>
       </div>
@@ -535,8 +535,8 @@ function FkRelationsTab({ fkRelations, setFkRelations, deletingFkId, setDeleting
       {fkRelations.length === 0 ? (
         <div className="flex flex-col items-center justify-center h-48 text-slate-400 bg-white rounded-2xl border border-dashed border-slate-200">
           <GitFork size={36} className="mb-3 opacity-20" />
-          <p className="text-sm font-medium">Aucune relation FK enregistrée.</p>
-          <p className="text-xs mt-1 text-slate-400">Lancez l'<strong>Agent Key Identifier</strong> depuis l'onglet Agents pour découvrir des relations.</p>
+          <p className="text-sm font-medium">No FK relationships registered.</p>
+          <p className="text-xs mt-1 text-slate-400">Run the <strong>Key Identifier Agent</strong> from the Agents tab to discover relationships.</p>
         </div>
       ) : (
         <div className="space-y-2">
@@ -572,7 +572,7 @@ function FkRelationsTab({ fkRelations, setFkRelations, deletingFkId, setDeleting
                     <p className="text-xs text-slate-400 mt-1 italic">{rel.llm_reason}</p>
                   )}
                   <p className="text-[10px] text-slate-400 mt-1.5">
-                    Ajouté le {new Date(rel.created_at).toLocaleDateString()}
+                    Added on {new Date(rel.created_at).toLocaleDateString()}
                   </p>
                 </div>
 
@@ -581,7 +581,7 @@ function FkRelationsTab({ fkRelations, setFkRelations, deletingFkId, setDeleting
                   onClick={() => handleDelete(rel.id)}
                   disabled={deletingFkId === rel.id}
                   className="p-1.5 text-slate-300 hover:text-red-400 hover:bg-red-50 rounded-lg transition-colors shrink-0 disabled:opacity-50"
-                  title="Supprimer cette relation"
+                  title="Delete this relationship"
                 >
                   {deletingFkId === rel.id ? <RotateCcw size={14} className="animate-spin" /> : <Trash2 size={14} />}
                 </button>
@@ -592,9 +592,9 @@ function FkRelationsTab({ fkRelations, setFkRelations, deletingFkId, setDeleting
       )}
 
       <div className="mt-4 p-3 bg-violet-50 border border-violet-100 rounded-xl text-xs text-violet-700">
-        <strong>Comment ça marche ?</strong> L'Agent Key Identifier analyse vos tables, échantillonne jusqu'à 5 valeurs par champ candidat,
-        puis utilise le LLM local pour identifier les correspondances FK↔PK. Vous confirmez les relations depuis l'onglet Agents
-        — elles apparaissent ici et enrichissent automatiquement la génération de SQL.
+        <strong>How does it work?</strong> The Key Identifier Agent analyzes your tables, samples up to 5 values per candidate field,
+        then uses the local LLM to identify FK↔PK matches. You confirm the relationships from the Agents tab
+        — they appear here and automatically enrich SQL generation.
       </div>
     </div>
   );

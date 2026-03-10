@@ -194,7 +194,7 @@ function ExecBulletView({ result }: { result: ExecSummaryResult }) {
     <div className="mt-3 rounded-xl overflow-hidden border border-indigo-200 shadow-sm">
       <div className="px-4 py-2.5 bg-gradient-to-r from-indigo-600 to-violet-600 flex items-center gap-2">
         <Zap size={13} className="text-indigo-200" />
-        <span className="text-xs font-bold text-white uppercase tracking-wide">5 Points Clés — Comité Exécutif</span>
+        <span className="text-xs font-bold text-white uppercase tracking-wide">5 Key Points — Executive Committee</span>
       </div>
       {result.preamble && (
         <div className="px-4 pt-3 pb-1">
@@ -232,7 +232,7 @@ function ExecBulletView({ result }: { result: ExecSummaryResult }) {
 // ── PDF Generator for Executive Summary ─────────────────────────────────────
 
 function generateExecSummaryPDF(content: string, title?: string) {
-  const genDate = new Date().toLocaleDateString('fr-FR', {
+  const genDate = new Date().toLocaleDateString('en-US', {
     year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit',
   });
   const reportTitle = title || 'Executive Summary';
@@ -301,7 +301,7 @@ function generateExecSummaryPDF(content: string, title?: string) {
   const bodyHtml = mdToHtml(content);
 
   const html = `<!DOCTYPE html>
-<html lang="fr">
+<html lang="en">
 <head>
 <meta charset="UTF-8"/>
 <title>${reportTitle} — ClickSense</title>
@@ -325,9 +325,9 @@ em { font-style:italic; }
     <div style="padding:36px 40px 28px;">
       <div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:20px;">
         <div>
-          <span style="display:inline-block;background:rgba(255,255,255,0.18);color:rgba(255,255,255,0.92);font-size:9px;font-weight:700;letter-spacing:0.14em;text-transform:uppercase;padding:3px 11px;border-radius:20px;margin-bottom:12px;">Rapport Confidentiel · Comité Exécutif</span>
+          <span style="display:inline-block;background:rgba(255,255,255,0.18);color:rgba(255,255,255,0.92);font-size:9px;font-weight:700;letter-spacing:0.14em;text-transform:uppercase;padding:3px 11px;border-radius:20px;margin-bottom:12px;">Confidential Report · Executive Committee</span>
           <h1 style="font-size:28px;font-weight:900;color:white;line-height:1.15;margin-bottom:6px;">${reportTitle}</h1>
-          <p style="font-size:13px;color:rgba(255,255,255,0.72);">Analyse approfondie multi-étapes · ClickSense AI Agent</p>
+          <p style="font-size:13px;color:rgba(255,255,255,0.72);">Multi-step in-depth analysis · ClickSense AI Agent</p>
         </div>
         <div style="padding:14px;border-radius:16px;background:rgba(255,255,255,0.12);flex-shrink:0;">
           <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.9)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -337,21 +337,21 @@ em { font-style:italic; }
       </div>
       <div style="display:flex;gap:24px;padding-top:18px;border-top:1px solid rgba(255,255,255,0.2);">
         <div>
-          <div style="font-size:10px;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:0.08em;">Généré le</div>
+          <div style="font-size:10px;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:0.08em;">Generated on</div>
           <div style="font-size:12px;font-weight:600;color:rgba(255,255,255,0.9);margin-top:2px;">${genDate}</div>
         </div>
         <div>
-          <div style="font-size:10px;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:0.08em;">Outil</div>
+          <div style="font-size:10px;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:0.08em;">Tool</div>
           <div style="font-size:12px;font-weight:600;color:rgba(255,255,255,0.9);margin-top:2px;">ClickSense AI</div>
         </div>
         <div>
           <div style="font-size:10px;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:0.08em;">Classification</div>
-          <div style="font-size:12px;font-weight:600;color:rgba(255,255,255,0.9);margin-top:2px;">Confidentiel</div>
+          <div style="font-size:12px;font-weight:600;color:rgba(255,255,255,0.9);margin-top:2px;">Confidential</div>
         </div>
       </div>
     </div>
     <div style="padding:8px 40px;background:rgba(0,0,0,0.18);font-size:9px;color:rgba(255,255,255,0.55);letter-spacing:0.04em;">
-      Document généré automatiquement par ClickSense · Usage réservé au comité de direction
+      Automatically generated document by ClickSense · For executive committee use only
     </div>
   </div>
 
@@ -359,7 +359,7 @@ em { font-style:italic; }
   <div style="background:white;border:1px solid #e2e8f0;border-radius:16px;overflow:hidden;margin-bottom:24px;">
     <div style="display:flex;align-items:center;gap:10px;padding:14px 20px;background:#f8fafc;border-bottom:1px solid #f1f5f9;">
       <div style="width:6px;height:6px;border-radius:50%;background:linear-gradient(135deg,#4f46e5,#0891b2);"></div>
-      <span style="font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.08em;">Analyse complète</span>
+      <span style="font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.08em;">Complete analysis</span>
     </div>
     <div style="padding:28px 32px;line-height:1.75;">
       ${bodyHtml}
@@ -368,14 +368,14 @@ em { font-style:italic; }
 
   <!-- Footer -->
   <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 18px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;font-size:9px;color:#94a3b8;">
-    <span>ClickSense Executive Report · Confidentiel</span>
+    <span>ClickSense Executive Report · Confidential</span>
     <span>${genDate}</span>
   </div>
 
   <!-- Print button (hidden in print) -->
   <div class="no-print" style="text-align:center;margin-top:20px;">
     <button onclick="window.print()" style="padding:10px 28px;background:linear-gradient(135deg,#4f46e5,#6d28d9);color:white;border:none;border-radius:10px;font-size:13px;font-weight:600;cursor:pointer;box-shadow:0 2px 12px rgba(79,70,229,0.3);">
-      Imprimer / Enregistrer en PDF
+      Print / Save as PDF
     </button>
   </div>
 
@@ -409,7 +409,7 @@ function ExecSummaryActions({ content, dismissed, onDismiss }: {
       const res = await fetch('/api/summarize_executive', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: content, lang: 'fr' }),
+        body: JSON.stringify({ text: content, lang: 'en' }),
       });
       const data = await res.json();
       if (data.error) { setError5(data.error); return; }
@@ -426,24 +426,24 @@ function ExecSummaryActions({ content, dismissed, onDismiss }: {
       {!result5 && (
         <div className="flex items-center gap-2 p-3 rounded-xl bg-gradient-to-r from-indigo-50 to-violet-50 border border-indigo-100">
           <div className="flex-1 min-w-0">
-            <p className="text-[11px] font-semibold text-indigo-700 mb-0.5">Actions disponibles</p>
+            <p className="text-[11px] font-semibold text-indigo-700 mb-0.5">Available actions</p>
             <p className="text-[10px] text-indigo-400 leading-relaxed">
-              Condensez cette analyse ou exportez-la en PDF pour votre comité exécutif.
+              Summarize this analysis or export it as PDF for your executive committee.
             </p>
           </div>
           <div className="flex items-center gap-1.5 flex-shrink-0">
             <button
               onClick={handle5Points}
               disabled={loading5}
-              title="Résumé 5 points clés avec risques"
+              title="5-point summary with key risks"
               className="flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white rounded-lg text-[11px] font-semibold transition-colors shadow-sm"
             >
               {loading5 ? <Loader2 size={11} className="animate-spin" /> : <Zap size={11} />}
-              5 points clés
+              5 key points
             </button>
             <button
               onClick={() => generateExecSummaryPDF(content)}
-              title="Export PDF — présentation comité exécutif"
+              title="Export PDF — executive committee presentation"
               className="flex items-center gap-1.5 px-3 py-1.5 bg-violet-600 hover:bg-violet-700 text-white rounded-lg text-[11px] font-semibold transition-colors shadow-sm"
             >
               <FileText size={11} />
@@ -474,13 +474,13 @@ function ExecSummaryActions({ content, dismissed, onDismiss }: {
               className="flex items-center gap-1.5 px-3 py-1.5 bg-violet-600 hover:bg-violet-700 text-white rounded-lg text-[11px] font-semibold transition-colors shadow-sm"
             >
               <FileText size={11} />
-              Export PDF complet
+              Full PDF Export
             </button>
             <button
               onClick={onDismiss}
               className="text-[10px] text-slate-400 hover:text-slate-600 flex items-center gap-1"
             >
-              <X size={10} /> Fermer
+              <X size={10} /> Close
             </button>
           </div>
         </div>
@@ -672,7 +672,7 @@ export function ChatPane() {
       });
       const data = await res.json();
       if (data.error) throw new Error(data.error);
-      setExportResult({ success: true, message: `${data.row_count.toLocaleString()} lignes exportées → ${data.path}` });
+      setExportResult({ success: true, message: `${data.row_count.toLocaleString()} rows exported → ${data.path}` });
     } catch (e: any) {
       setExportResult({ success: false, message: e.message });
     } finally {
@@ -898,10 +898,10 @@ export function ChatPane() {
                   <div className="flex items-center gap-1.5 mb-2">
                     <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-700 text-[10px] font-semibold uppercase tracking-wide">
                       <Brain size={9} />
-                      Analyse Agent
+                      Agent Analysis
                     </span>
                     {msg.agent_steps && (
-                      <span className="text-[10px] text-indigo-400">{msg.agent_steps.length} étape{msg.agent_steps.length > 1 ? 's' : ''}</span>
+                      <span className="text-[10px] text-indigo-400">{msg.agent_steps.length} step{msg.agent_steps.length > 1 ? 's' : ''}</span>
                     )}
                   </div>
                 )}
@@ -944,7 +944,7 @@ export function ChatPane() {
                         <button
                           onClick={() => openExportDialog(msg.sql!)}
                           className="flex items-center gap-1 text-xs bg-amber-500 hover:bg-amber-400 text-white px-2.5 py-1 rounded-md transition-colors"
-                          title="Exporter en CSV (séparateur pipe, max 1M lignes)"
+                          title="Export as CSV (pipe separator, max 1M rows)"
                         >
                           <Download size={11} />
                           Export CSV
@@ -970,7 +970,7 @@ export function ChatPane() {
                     <div className="px-3 py-2 bg-indigo-100/60 border-b border-indigo-200 flex items-center gap-2">
                       <Brain size={13} className="text-indigo-600" />
                       <span className="text-xs font-semibold text-indigo-700">
-                        Agent — {msg.agent_steps.length} analyse{msg.agent_steps.length > 1 ? 's' : ''} effectuée{msg.agent_steps.length > 1 ? 's' : ''}
+                        Agent — {msg.agent_steps.length} analysis{msg.agent_steps.length > 1 ? 'es' : ''} performed
                       </span>
                     </div>
                     <div className="divide-y divide-indigo-100">
@@ -987,7 +987,7 @@ export function ChatPane() {
                                 ? <CheckCircle2 size={12} className="text-emerald-500 shrink-0" />
                                 : <XCircle size={12} className="text-red-400 shrink-0" />
                               }
-                              <span className="font-medium text-indigo-800">Étape {step.step}</span>
+                              <span className="font-medium text-indigo-800">Step {step.step}</span>
                               <span className="text-indigo-500 truncate flex-1">{step.reasoning}</span>
                               <span className="text-indigo-400 shrink-0 flex items-center gap-1">
                                 {step.type === 'search_knowledge'
@@ -996,7 +996,7 @@ export function ChatPane() {
                                     ? <Download size={10} className="text-amber-400" />
                                     : <Database size={10} />
                                 }
-                                {step.type === 'search_knowledge' ? 'KB' : step.type === 'export_csv' ? 'Export' : `${step.row_count} ligne${step.row_count !== 1 ? 's' : ''}`}
+                                {step.type === 'search_knowledge' ? 'KB' : step.type === 'export_csv' ? 'Export' : `${step.row_count} row${step.row_count !== 1 ? 's' : ''}`}
                               </span>
                               {open
                                 ? <ChevronDown size={12} className="text-indigo-400 shrink-0" />
@@ -1008,10 +1008,10 @@ export function ChatPane() {
                                 {step.type === 'search_knowledge' ? (
                                   <div className="bg-violet-50 border border-violet-200 rounded-lg overflow-hidden">
                                     <div className="px-2 py-1 bg-violet-100/60 border-b border-violet-200">
-                                      <span className="text-[10px] font-mono text-violet-600">Recherche knowledge base</span>
+                                      <span className="text-[10px] font-mono text-violet-600">Knowledge base search</span>
                                     </div>
                                     <div className="p-2">
-                                      <p className="text-[10px] font-semibold text-violet-600 mb-1">Requête</p>
+                                      <p className="text-[10px] font-semibold text-violet-600 mb-1">Query</p>
                                       <p className="text-[10px] text-violet-700 font-mono italic">{step.search_query}</p>
                                     </div>
                                   </div>
@@ -1019,12 +1019,12 @@ export function ChatPane() {
                                   <div className="bg-amber-50 border border-amber-200 rounded-lg overflow-hidden">
                                     <div className="px-2 py-1 bg-amber-100/60 border-b border-amber-200">
                                       <span className="text-[10px] font-mono text-amber-700 flex items-center gap-1">
-                                        <Download size={9} /> Export CSV demandé
+                                        <Download size={9} /> CSV Export requested
                                       </span>
                                     </div>
                                     <div className="p-2 space-y-2">
                                       <div>
-                                        <p className="text-[10px] font-semibold text-amber-700 mb-1">SQL d'export</p>
+                                        <p className="text-[10px] font-semibold text-amber-700 mb-1">Export SQL</p>
                                         <pre className="text-[10px] font-mono text-slate-700 whitespace-pre-wrap bg-white border border-amber-100 rounded p-1.5 overflow-x-auto">
                                           {step.sql}
                                         </pre>
@@ -1038,14 +1038,14 @@ export function ChatPane() {
                                         className="w-full flex items-center justify-center gap-1.5 bg-amber-500 hover:bg-amber-600 text-white text-[11px] font-medium py-1.5 rounded-lg transition-colors"
                                       >
                                         <Download size={10} />
-                                        Confirmer et exporter
+                                        Confirm and export
                                       </button>
                                     </div>
                                   </div>
                                 ) : (
                                   <div className="bg-slate-900 rounded-lg overflow-hidden">
                                     <div className="px-2 py-1 bg-slate-800/50 border-b border-slate-700">
-                                      <span className="text-[10px] font-mono text-slate-400">SQL exécuté</span>
+                                      <span className="text-[10px] font-mono text-slate-400">SQL executed</span>
                                     </div>
                                     <pre className="p-2 text-[10px] font-mono text-emerald-400 overflow-x-auto whitespace-pre-wrap">
                                       {step.sql}
@@ -1054,7 +1054,7 @@ export function ChatPane() {
                                 )}
                                 {step.type !== 'export_csv' && (
                                   <div className="bg-white border border-indigo-100 rounded-lg p-2">
-                                    <p className="text-[10px] font-semibold text-slate-500 mb-1">Résultat</p>
+                                    <p className="text-[10px] font-semibold text-slate-500 mb-1">Result</p>
                                     <pre className="text-[10px] text-slate-600 whitespace-pre-wrap">{step.result_summary}</pre>
                                   </div>
                                 )}
@@ -1098,10 +1098,10 @@ export function ChatPane() {
             <div className="bg-indigo-50 border border-indigo-200 rounded-2xl rounded-tl-none p-3 shadow-sm">
               <div className="flex items-center gap-2 mb-1">
                 <Loader2 className="animate-spin text-indigo-500" size={14} />
-                <span className="text-xs font-medium text-indigo-700">Agent en cours d'analyse…</span>
+                <span className="text-xs font-medium text-indigo-700">Agent analyzing…</span>
               </div>
               <p className="text-[11px] text-indigo-500">
-                L'agent mène des requêtes itératives sur vos données ClickHouse (jusqu'à {agentMaxSteps} étapes).
+                The agent runs iterative queries on your ClickHouse data (up to {agentMaxSteps} steps).
               </p>
             </div>
           </div>
@@ -1124,7 +1124,7 @@ export function ChatPane() {
             onClick={() => handleSend()}
             disabled={!input.trim() || isLoading || isAgentLoading}
             className="absolute right-2 p-2 bg-emerald-500 text-white rounded-full hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-sm"
-            title="Envoyer (chat rapide)"
+            title="Send (quick chat)"
           >
             <Send size={16} />
           </button>
@@ -1137,13 +1137,13 @@ export function ChatPane() {
             "bg-indigo-600 hover:bg-indigo-700 text-white border-indigo-600",
             "disabled:opacity-40 disabled:cursor-not-allowed"
           )}
-          title={`Analyse approfondie multi-étapes par l'agent IA (jusqu'à ${agentMaxSteps} requêtes)`}
+          title={`Multi-step in-depth analysis by the AI agent (up to ${agentMaxSteps} queries)`}
         >
           {isAgentLoading
             ? <Loader2 size={15} className="animate-spin" />
             : <Brain size={15} />
           }
-          {isAgentLoading ? 'Agent en cours…' : 'Analyser avec l\'Agent'}
+          {isAgentLoading ? 'Agent running…' : 'Analyze with Agent'}
         </button>
       </div>
 
@@ -1156,7 +1156,7 @@ export function ChatPane() {
             <div className="p-4 border-b border-slate-200 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Download size={18} className="text-amber-600" />
-                <h3 className="text-sm font-bold text-slate-800">Exporter en CSV</h3>
+                <h3 className="text-sm font-bold text-slate-800">Export as CSV</h3>
               </div>
               <button onClick={() => setExportDialogOpen(false)} className="text-slate-400 hover:text-slate-600 p-1.5 hover:bg-slate-100 rounded-md">
                 <X size={16} />
@@ -1164,22 +1164,22 @@ export function ChatPane() {
             </div>
             <div className="p-5 space-y-4">
               <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-xs text-amber-700 space-y-1">
-                <p className="font-semibold">Format : CSV avec séparateur pipe ( | )</p>
-                <p>Limite : 1 000 000 lignes maximum</p>
+                <p className="font-semibold">Format: CSV with pipe separator ( | )</p>
+                <p>Limit: 1,000,000 rows maximum</p>
               </div>
               <div>
                 <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wide mb-1">
                   <FolderOpen size={12} className="inline mr-1" />
-                  Répertoire / fichier de destination
+                  Directory / destination file
                 </label>
                 <input
                   type="text"
                   value={exportPath}
                   onChange={e => { setExportPath(e.target.value); setExportResult(null); }}
-                  placeholder="/home/user/mes_données/export.csv"
+                  placeholder="/home/user/my_data/export.csv"
                   className="w-full bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-sm font-mono focus:ring-2 focus:ring-amber-500/20 focus:border-amber-500 transition-all"
                 />
-                <p className="mt-1 text-xs text-slate-400">Chemin absolu sur le serveur (ex : /home/user/export.csv)</p>
+                <p className="mt-1 text-xs text-slate-400">Absolute path on the server (e.g.: /home/user/export.csv)</p>
               </div>
               {exportResult && (
                 <div className={clsx(
@@ -1192,7 +1192,7 @@ export function ChatPane() {
               )}
               <div className="flex justify-end gap-2 pt-1">
                 <button onClick={() => setExportDialogOpen(false)} className="px-4 py-2 text-sm text-slate-600 hover:bg-slate-100 rounded-lg transition-colors">
-                  {exportResult?.success ? 'Fermer' : 'Annuler'}
+                  {exportResult?.success ? 'Close' : 'Cancel'}
                 </button>
                 {!exportResult?.success && (
                   <button
@@ -1200,7 +1200,7 @@ export function ChatPane() {
                     disabled={isExporting || !exportPath.trim()}
                     className="flex items-center gap-2 bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors"
                   >
-                    {isExporting ? <><Loader2 size={14} className="animate-spin" />Export en cours…</> : <><Download size={14} />Exporter</>}
+                    {isExporting ? <><Loader2 size={14} className="animate-spin" />Exporting…</> : <><Download size={14} />Export</>}
                   </button>
                 )}
               </div>

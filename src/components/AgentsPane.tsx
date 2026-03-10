@@ -265,7 +265,7 @@ function AgentCard({ agent, selected, onClick }: { agent: Agent; selected: boole
             {agent.description}
           </p>
           <p className="text-[10px] text-slate-400 mt-1.5 font-medium">
-            {agent.parameters.length} paramètre{agent.parameters.length !== 1 ? 's' : ''}
+            {agent.parameters.length} parameter{agent.parameters.length !== 1 ? 's' : ''}
           </p>
         </div>
       </div>
@@ -283,7 +283,7 @@ function StepsPanel({ steps }: { steps: StepInfo[] }) {
       >
         {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
         <Table2 size={13} />
-        {steps.length} table{steps.length !== 1 ? 's' : ''} analysée{steps.length !== 1 ? 's' : ''}
+        {steps.length} table{steps.length !== 1 ? 's' : ''} analyzed
         <span className="ml-auto flex gap-1">
           <span className="text-emerald-600">{steps.filter(s => s.ok).length} ✓</span>
           {steps.filter(s => !s.ok).length > 0 && (
@@ -346,11 +346,11 @@ function DataDictionaryView({ entries }: { entries: DictEntry[] }) {
               <table className="w-full text-xs">
                 <thead className="bg-slate-50">
                   <tr>
-                    <th className="text-left px-3 py-2 text-slate-500 font-semibold w-36">Colonne</th>
+                    <th className="text-left px-3 py-2 text-slate-500 font-semibold w-36">Column</th>
                     <th className="text-left px-3 py-2 text-slate-500 font-semibold w-28">Type</th>
-                    <th className="text-left px-3 py-2 text-slate-500 font-semibold">Description métier</th>
+                    <th className="text-left px-3 py-2 text-slate-500 font-semibold">Business Description</th>
                     <th className="text-left px-3 py-2 text-slate-500 font-semibold w-32">Format</th>
-                    <th className="text-left px-3 py-2 text-slate-500 font-semibold w-40">Valeurs possibles</th>
+                    <th className="text-left px-3 py-2 text-slate-500 font-semibold w-40">Possible Values</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
@@ -826,13 +826,13 @@ function formatDictEntryContent(entry: DictEntry): string {
     lines.push('');
   }
   if (entry.columns && entry.columns.length > 0) {
-    lines.push('Colonnes:');
+    lines.push('Columns:');
     for (const col of entry.columns) {
       let line = `- ${col.name} (${col.type})`;
       if (col.business_description) line += `: ${col.business_description}`;
       lines.push(line);
       if (col.format) lines.push(`  Format: ${col.format}`);
-      if (col.possible_values) lines.push(`  Valeurs possibles: ${col.possible_values}`);
+      if (col.possible_values) lines.push(`  Possible values: ${col.possible_values}`);
     }
   }
   return lines.join('\n');
@@ -850,7 +850,7 @@ function KnowledgeInjectionProposal({ entries, isLast }: { entries: DictEntry[];
       <div className="mt-3 flex items-center gap-2 p-3 bg-emerald-50 border border-emerald-200 rounded-xl">
         <CheckCircle2 size={14} className="text-emerald-500 shrink-0" />
         <span className="text-xs text-emerald-700 font-medium">
-          {injected} entrée{injected > 1 ? 's' : ''} injectée{injected > 1 ? 's' : ''} dans la Knowledge Base.
+          {injected} entr{injected > 1 ? 'ies' : 'y'} injected into the Knowledge Base.
         </span>
       </div>
     );
@@ -861,7 +861,7 @@ function KnowledgeInjectionProposal({ entries, isLast }: { entries: DictEntry[];
       <div className="mt-3 flex items-center gap-2 p-3 bg-emerald-50 border border-emerald-200 rounded-xl">
         <Loader2 size={14} className="animate-spin text-emerald-500 shrink-0" />
         <span className="text-xs text-emerald-700 font-medium">
-          Injection en cours… ({injected}/{entries.length})
+          Injecting… ({injected}/{entries.length})
         </span>
       </div>
     );
@@ -901,10 +901,10 @@ function KnowledgeInjectionProposal({ entries, isLast }: { entries: DictEntry[];
         <BookOpen size={14} className="text-amber-600 shrink-0 mt-0.5" />
         <div className="flex-1 min-w-0">
           <p className="text-xs font-semibold text-amber-800">
-            Injecter dans la Knowledge Base ?
+            Inject into the Knowledge Base?
           </p>
           <p className="text-[10px] text-amber-700 mt-0.5 leading-relaxed">
-            {entries.length} table{entries.length > 1 ? 's' : ''} documentée{entries.length > 1 ? 's' : ''} — souhaitez-vous enregistrer ces résultats dans la Knowledge Base pour enrichir les futures requêtes AI ?
+            {entries.length} table{entries.length > 1 ? 's' : ''} documented — would you like to save these results in the Knowledge Base to enrich future AI queries?
           </p>
           <div className="flex gap-2 mt-2">
             <button
@@ -912,13 +912,13 @@ function KnowledgeInjectionProposal({ entries, isLast }: { entries: DictEntry[];
               className="flex items-center gap-1 px-3 py-1.5 bg-emerald-500 hover:bg-emerald-600 text-white text-[10px] font-semibold rounded-lg transition-colors"
             >
               <BookOpen size={10} />
-              Oui, injecter
+              Yes, inject
             </button>
             <button
               onClick={() => setStatus('dismissed')}
               className="px-3 py-1.5 text-[10px] font-medium text-amber-700 hover:bg-amber-100 rounded-lg transition-colors"
             >
-              Non merci
+              No thanks
             </button>
           </div>
         </div>
@@ -947,7 +947,7 @@ function KeyIdentifierView({ suggestions }: { suggestions: FkSuggestion[] }) {
     return (
       <div className="mt-3 flex flex-col items-center justify-center py-8 text-slate-400">
         <GitFork size={28} className="mb-2 opacity-30" />
-        <p className="text-sm">Aucune relation FK détectée avec le seuil de confiance sélectionné.</p>
+        <p className="text-sm">No FK relationships detected with the selected confidence threshold.</p>
       </div>
     );
   }
@@ -959,8 +959,8 @@ function KeyIdentifierView({ suggestions }: { suggestions: FkSuggestion[] }) {
     const table_b = isFlipped ? sug.table_a : sug.table_b;
     const field_b = isFlipped ? sug.field_a : sug.field_b;
     const direction = isFlipped
-      ? `${table_a}.${field_a} → ${table_b}.${field_b}  (${field_a} référence ${field_b})`
-      : (sug.direction || `${table_a}.${field_a} → ${table_b}.${field_b}`);
+      ? `${table_a}.${field_a} → ${table_b}.${field_b}  (${field_a} references ${field_b})`
+      : (sug.direction || `${table_a}.${field_a} → ${table_b}.${field_b} (${field_a} references ${field_b})`);
 
     setSaving(prev => ({ ...prev, [idx]: true }));
     try {
@@ -974,10 +974,10 @@ function KeyIdentifierView({ suggestions }: { suggestions: FkSuggestion[] }) {
         setFkRelations([...fkRelations, newRel]);
         setStatuses(prev => ({ ...prev, [idx]: 'confirmed' }));
       } else {
-        alert('Erreur lors de la sauvegarde.');
+        alert('Error while saving.');
       }
     } catch {
-      alert('Erreur réseau.');
+      alert('Network error.');
     } finally {
       setSaving(prev => ({ ...prev, [idx]: false }));
     }
@@ -995,8 +995,8 @@ function KeyIdentifierView({ suggestions }: { suggestions: FkSuggestion[] }) {
   return (
     <div className="mt-3 space-y-2">
       <p className="text-xs text-slate-500 font-medium">
-        {suggestions.length} relation{suggestions.length > 1 ? 's' : ''} potentielle{suggestions.length > 1 ? 's' : ''} détectée{suggestions.length > 1 ? 's' : ''} —
-        confirmez ou rejetez chaque relation, et ajustez le sens si nécessaire.
+        {suggestions.length} potential relationship{suggestions.length > 1 ? 's' : ''} detected —
+        confirm or reject each relationship, and adjust the direction if necessary.
       </p>
       {suggestions.map((sug, idx) => {
         const status = statuses[idx];
@@ -1040,11 +1040,11 @@ function KeyIdentifierView({ suggestions }: { suggestions: FkSuggestion[] }) {
               <div className="flex items-center gap-1.5 mt-2">
                 <button
                   onClick={() => handleFlip(idx)}
-                  title="Inverser le sens de la relation"
+                  title="Reverse the relationship direction"
                   className="flex items-center gap-1 px-2 py-1 text-[10px] font-medium text-slate-500 hover:text-violet-600 hover:bg-violet-50 border border-slate-200 hover:border-violet-200 rounded-lg transition-colors"
                 >
                   <ArrowLeftRight size={10} />
-                  Inverser
+                  Reverse
                 </button>
                 <button
                   onClick={() => handleConfirm(idx, sug)}
@@ -1052,14 +1052,14 @@ function KeyIdentifierView({ suggestions }: { suggestions: FkSuggestion[] }) {
                   className="flex items-center gap-1 px-2.5 py-1 text-[10px] font-semibold bg-emerald-500 hover:bg-emerald-600 text-white rounded-lg transition-colors disabled:opacity-50"
                 >
                   {saving[idx] ? <Loader2 size={10} className="animate-spin" /> : <ThumbsUp size={10} />}
-                  Confirmer
+                  Confirm
                 </button>
                 <button
                   onClick={() => handleReject(idx)}
                   className="flex items-center gap-1 px-2.5 py-1 text-[10px] font-semibold text-red-500 hover:bg-red-50 border border-red-200 rounded-lg transition-colors"
                 >
                   <ThumbsDown size={10} />
-                  Rejeter
+                  Reject
                 </button>
               </div>
             )}
@@ -1068,13 +1068,13 @@ function KeyIdentifierView({ suggestions }: { suggestions: FkSuggestion[] }) {
             {status === 'confirmed' && (
               <div className="flex items-center gap-1.5 mt-1.5">
                 <CheckCircle2 size={12} className="text-emerald-500" />
-                <span className="text-[10px] font-semibold text-emerald-700">Relation enregistrée dans la Knowledge Base</span>
+                <span className="text-[10px] font-semibold text-emerald-700">Relationship registered in the Knowledge Base</span>
               </div>
             )}
             {status === 'rejected' && (
               <div className="flex items-center gap-1.5 mt-1.5">
                 <XCircle size={12} className="text-red-400" />
-                <span className="text-[10px] text-red-500">Relation ignorée</span>
+                <span className="text-[10px] text-red-500">Relationship ignored</span>
               </div>
             )}
           </div>
@@ -1116,14 +1116,14 @@ function PlanView({ plan, actionCount }: { plan: WriterPlan; actionCount?: numbe
       >
         {open ? <ChevronDown size={13} className="text-violet-500" /> : <ChevronRight size={13} className="text-violet-500" />}
         <Zap size={14} className="text-violet-600" />
-        <span className="text-sm font-bold text-violet-800">Plan d'exécution</span>
+        <span className="text-sm font-bold text-violet-800">Execution Plan</span>
         <span className={clsx('ml-2 px-2 py-0.5 text-[10px] font-bold rounded-full border', badgeClass)}>
           {complexity.toUpperCase()}
         </span>
         <span className="ml-auto flex items-center gap-2">
           {actionCount !== undefined && (
             <span className="text-xs text-violet-600 font-medium">
-              {actionCount}/{plan.steps.length} étapes
+              {actionCount}/{plan.steps.length} steps
             </span>
           )}
         </span>
@@ -1133,13 +1133,13 @@ function PlanView({ plan, actionCount }: { plan: WriterPlan; actionCount?: numbe
         <div className="p-4 bg-white space-y-3">
           {/* Objective */}
           <div className="p-3 bg-violet-50 rounded-lg border border-violet-100">
-            <p className="text-[10px] font-bold text-violet-500 uppercase tracking-wide mb-1">Objectif</p>
+            <p className="text-[10px] font-bold text-violet-500 uppercase tracking-wide mb-1">Objective</p>
             <p className="text-sm text-violet-900 font-medium">{plan.objective}</p>
           </div>
 
           {/* Approach */}
           <div>
-            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-1">Approche</p>
+            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-1">Approach</p>
             <p className="text-xs text-slate-600 leading-relaxed">{plan.approach}</p>
           </div>
 
@@ -1212,11 +1212,11 @@ function ActionLogView({ log }: { log: ActionEntry[] }) {
     <div className="mt-3 border border-slate-200 rounded-xl overflow-hidden">
       <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-200 flex items-center gap-2">
         <Code2 size={13} className="text-slate-500" />
-        <span className="text-xs font-bold text-slate-700">Journal d'exécution</span>
+        <span className="text-xs font-bold text-slate-700">Execution Log</span>
         <span className="ml-auto flex gap-2 text-xs">
           <span className="text-emerald-600 font-medium">{log.filter(e => e.ok).length} OK</span>
           {log.filter(e => !e.ok).length > 0 && (
-            <span className="text-red-500 font-medium">{log.filter(e => !e.ok).length} Erreur</span>
+            <span className="text-red-500 font-medium">{log.filter(e => !e.ok).length} Error</span>
           )}
         </span>
       </div>
@@ -1243,7 +1243,7 @@ function ActionLogView({ log }: { log: ActionEntry[] }) {
               </div>
               <div className="flex items-center gap-2 flex-shrink-0">
                 {entry.rows_affected != null && (
-                  <span className="text-[10px] text-slate-400">{entry.rows_affected} lignes</span>
+                  <span className="text-[10px] text-slate-400">{entry.rows_affected} rows</span>
                 )}
                 {expandedIdx[i] ? <ChevronDown size={12} className="text-slate-400" /> : <ChevronRight size={12} className="text-slate-400" />}
               </div>
@@ -1253,7 +1253,7 @@ function ActionLogView({ log }: { log: ActionEntry[] }) {
               <div className="px-4 pb-3 space-y-2">
                 {entry.sql && (
                   <div>
-                    <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-1">SQL exécuté</p>
+                    <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-1">Executed SQL</p>
                     <pre className="text-[10px] bg-slate-900 text-green-300 rounded-lg p-3 overflow-x-auto whitespace-pre-wrap font-mono leading-relaxed">
                       {entry.sql}
                     </pre>
@@ -1261,7 +1261,7 @@ function ActionLogView({ log }: { log: ActionEntry[] }) {
                 )}
                 {entry.result_preview != null && (
                   <div>
-                    <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-1">Résultat</p>
+                    <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-1">Result</p>
                     {typeof entry.result_preview === 'string' ? (
                       <p className={clsx(
                         'text-xs p-2 rounded-lg',
@@ -1345,7 +1345,7 @@ function ChoicesPanel({
 // ── Writer Synthesis PDF Export ───────────────────────────────────────────
 
 function generateSynthesisPDF(synthesis: Synthesis) {
-  const genDate = new Date().toLocaleDateString('fr-FR', {
+  const genDate = new Date().toLocaleDateString('en-US', {
     year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit',
   });
 
@@ -1366,9 +1366,9 @@ function generateSynthesisPDF(synthesis: Synthesis) {
     <div style="padding:12px 14px;border-radius:10px;border:1px solid;margin-bottom:8px;${statusColor(r.status)}">
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
         <span style="font-size:13px;">${statusIcon(r.status)}</span>
-        <span style="font-size:12px;font-weight:700;color:#1e293b;">Étape ${r.step_id} — ${r.description}</span>
+        <span style="font-size:12px;font-weight:700;color:#1e293b;">Step ${r.step_id} — ${r.description}</span>
       </div>
-      <p style="font-size:11px;color:#334155;margin:0 0 4px;"><strong>Résultat :</strong> ${r.outcome}</p>
+      <p style="font-size:11px;color:#334155;margin:0 0 4px;"><strong>Result:</strong> ${r.outcome}</p>
       ${r.insight ? `<p style="font-size:10px;color:#64748b;font-style:italic;margin:0;">${r.insight}</p>` : ''}
     </div>`).join('');
 
@@ -1381,8 +1381,8 @@ function generateSynthesisPDF(synthesis: Synthesis) {
   const tablesHtml = (synthesis.tables_created || []).map((t) => `
     <div style="padding:12px 14px;background:#f5f3ff;border:1px solid #ddd6fe;border-radius:10px;margin-bottom:8px;">
       <p style="font-size:12px;font-weight:700;font-family:'Courier New',monospace;color:#5b21b6;margin:0 0 4px;">📊 ${t.name}</p>
-      <p style="font-size:11px;color:#334155;margin:0 0 2px;"><strong>Contenu :</strong> ${t.purpose}</p>
-      ${t.useful_for ? `<p style="font-size:10px;color:#64748b;font-style:italic;margin:0;">Utile pour : ${t.useful_for}</p>` : ''}
+      <p style="font-size:11px;color:#334155;margin:0 0 2px;"><strong>Content:</strong> ${t.purpose}</p>
+      ${t.useful_for ? `<p style="font-size:10px;color:#64748b;font-style:italic;margin:0;">Useful for: ${t.useful_for}</p>` : ''}
     </div>`).join('');
 
   function section(num: number, title: string, color: string, content: string) {
@@ -1397,10 +1397,10 @@ function generateSynthesisPDF(synthesis: Synthesis) {
   }
 
   const html = `<!DOCTYPE html>
-<html lang="fr">
+<html lang="en">
 <head>
 <meta charset="UTF-8"/>
-<title>Synthèse Agent ClickHouse Writer — ClickSense</title>
+<title>ClickHouse Writer Agent Summary — ClickSense</title>
 <style>
 * { box-sizing:border-box; margin:0; padding:0; }
 body { font-family:'Segoe UI',system-ui,-apple-system,sans-serif; color:#0f172a; background:#f8fafc; -webkit-print-color-adjust:exact; print-color-adjust:exact; }
@@ -1419,9 +1419,9 @@ strong { font-weight:700; }
     <div style="padding:36px 40px 26px;">
       <div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:18px;">
         <div>
-          <span style="display:inline-block;background:rgba(255,255,255,0.18);color:rgba(255,255,255,0.92);font-size:9px;font-weight:700;letter-spacing:0.14em;text-transform:uppercase;padding:3px 12px;border-radius:20px;margin-bottom:12px;">ClickHouse Writer Agent · Rapport de synthèse</span>
-          <h1 style="font-size:26px;font-weight:900;color:white;line-height:1.2;margin-bottom:6px;">Synthèse finale</h1>
-          <p style="font-size:13px;color:rgba(255,255,255,0.72);">Analyse approfondie multi-étapes · ClickSense AI</p>
+          <span style="display:inline-block;background:rgba(255,255,255,0.18);color:rgba(255,255,255,0.92);font-size:9px;font-weight:700;letter-spacing:0.14em;text-transform:uppercase;padding:3px 12px;border-radius:20px;margin-bottom:12px;">ClickHouse Writer Agent · Summary Report</span>
+          <h1 style="font-size:26px;font-weight:900;color:white;line-height:1.2;margin-bottom:6px;">Final Summary</h1>
+          <p style="font-size:13px;color:rgba(255,255,255,0.72);">In-depth multi-step analysis · ClickSense AI</p>
         </div>
         <div style="padding:14px;border-radius:16px;background:rgba(255,255,255,0.12);flex-shrink:0;">
           <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.9)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -1430,48 +1430,48 @@ strong { font-weight:700; }
         </div>
       </div>
       <div style="display:flex;gap:24px;padding-top:16px;border-top:1px solid rgba(255,255,255,0.18);">
-        <div><div style="font-size:9px;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:.08em;">Généré le</div><div style="font-size:12px;font-weight:600;color:rgba(255,255,255,0.9);margin-top:2px;">${genDate}</div></div>
-        <div><div style="font-size:9px;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:.08em;">Découvertes</div><div style="font-size:12px;font-weight:600;color:rgba(255,255,255,0.9);margin-top:2px;">${synthesis.key_findings?.length ?? 0}</div></div>
-        <div><div style="font-size:9px;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:.08em;">Recommandations</div><div style="font-size:12px;font-weight:600;color:rgba(255,255,255,0.9);margin-top:2px;">${synthesis.recommendations?.length ?? 0}</div></div>
-        <div><div style="font-size:9px;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:.08em;">Tables créées</div><div style="font-size:12px;font-weight:600;color:rgba(255,255,255,0.9);margin-top:2px;">${synthesis.tables_created?.length ?? 0}</div></div>
+        <div><div style="font-size:9px;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:.08em;">Generated on</div><div style="font-size:12px;font-weight:600;color:rgba(255,255,255,0.9);margin-top:2px;">${genDate}</div></div>
+        <div><div style="font-size:9px;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:.08em;">Findings</div><div style="font-size:12px;font-weight:600;color:rgba(255,255,255,0.9);margin-top:2px;">${synthesis.key_findings?.length ?? 0}</div></div>
+        <div><div style="font-size:9px;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:.08em;">Recommendations</div><div style="font-size:12px;font-weight:600;color:rgba(255,255,255,0.9);margin-top:2px;">${synthesis.recommendations?.length ?? 0}</div></div>
+        <div><div style="font-size:9px;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:.08em;">Tables created</div><div style="font-size:12px;font-weight:600;color:rgba(255,255,255,0.9);margin-top:2px;">${synthesis.tables_created?.length ?? 0}</div></div>
       </div>
     </div>
     <div style="padding:8px 40px;background:rgba(0,0,0,0.2);font-size:9px;color:rgba(255,255,255,0.5);letter-spacing:.04em;">
-      Document généré automatiquement par ClickSense ClickHouse Writer Agent
+      Document automatically generated by ClickSense ClickHouse Writer Agent
     </div>
   </div>
 
   <!-- Executive summary -->
-  ${section(1, 'Résumé exécutif', '#7c3aed',
+  ${section(1, 'Executive Summary', '#7c3aed',
     `<div style="padding:16px;background:#faf5ff;border:1px solid #e9d5ff;border-radius:10px;margin-bottom:${synthesis.data_insights || synthesis.conclusion ? '14px' : '0'};">
       <p style="font-size:13px;line-height:1.75;color:#3b0764;font-weight:500;">${synthesis.executive_summary || '—'}</p>
     </div>
-    ${synthesis.data_insights ? `<div style="margin-bottom:${synthesis.conclusion ? '12px' : '0'};"><p style="font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px;">Insights analytiques</p><p style="font-size:12px;line-height:1.7;color:#334155;">${synthesis.data_insights}</p></div>` : ''}
+    ${synthesis.data_insights ? `<div style="margin-bottom:${synthesis.conclusion ? '12px' : '0'};"><p style="font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px;">Analytical Insights</p><p style="font-size:12px;line-height:1.7;color:#334155;">${synthesis.data_insights}</p></div>` : ''}
     ${synthesis.conclusion ? `<div style="padding:12px 14px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;"><p style="font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;">Conclusion</p><p style="font-size:12px;line-height:1.7;color:#334155;">${synthesis.conclusion}</p></div>` : ''}`
   )}
 
   <!-- Key findings -->
-  ${synthesis.key_findings?.length ? section(2, 'Découvertes clés', '#0891b2', findingsHtml) : ''}
+  ${synthesis.key_findings?.length ? section(2, 'Key Findings', '#0891b2', findingsHtml) : ''}
 
   <!-- Recommendations -->
-  ${synthesis.recommendations?.length ? section(3, 'Recommandations', '#2563eb', recsHtml) : ''}
+  ${synthesis.recommendations?.length ? section(3, 'Recommendations', '#2563eb', recsHtml) : ''}
 
   <!-- Step reflections -->
-  ${synthesis.step_reflections?.length ? section(4, 'Réflexion par étape', '#d97706', stepsHtml) : ''}
+  ${synthesis.step_reflections?.length ? section(4, 'Step-by-Step Reflection', '#d97706', stepsHtml) : ''}
 
   <!-- Tables created -->
-  ${synthesis.tables_created?.length ? section(5, 'Tables temporaires créées', '#059669', tablesHtml) : ''}
+  ${synthesis.tables_created?.length ? section(5, 'Temporary Tables Created', '#059669', tablesHtml) : ''}
 
   <!-- Footer -->
   <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 18px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;font-size:9px;color:#94a3b8;margin-top:8px;">
-    <span>ClickSense · ClickHouse Writer Agent · Synthèse</span>
+    <span>ClickSense · ClickHouse Writer Agent · Summary</span>
     <span>${genDate}</span>
   </div>
 
   <!-- Print button -->
   <div class="no-print" style="text-align:center;margin-top:20px;">
     <button onclick="window.print()" style="padding:10px 28px;background:linear-gradient(135deg,#6d28d9,#7c3aed);color:white;border:none;border-radius:10px;font-size:13px;font-weight:600;cursor:pointer;box-shadow:0 2px 12px rgba(109,40,217,0.3);">
-      Imprimer / Enregistrer en PDF
+      Print / Save as PDF
     </button>
   </div>
 
@@ -1489,11 +1489,11 @@ function SynthesisView({ synthesis }: { synthesis: Synthesis }) {
   const [activeSection, setActiveSection] = useState<string>('summary');
 
   const sections = [
-    { id: 'summary', label: 'Résumé', icon: Star },
-    { id: 'findings', label: 'Découvertes', icon: TrendingUp },
-    { id: 'steps', label: 'Réflexion', icon: BookOpen },
-    { id: 'recommendations', label: 'Recommandations', icon: Info },
-    { id: 'tables', label: 'Tables créées', icon: Database },
+    { id: 'summary', label: 'Summary', icon: Star },
+    { id: 'findings', label: 'Findings', icon: TrendingUp },
+    { id: 'steps', label: 'Reflection', icon: BookOpen },
+    { id: 'recommendations', label: 'Recommendations', icon: Info },
+    { id: 'tables', label: 'Tables Created', icon: Database },
   ] as const;
 
   return (
@@ -1502,10 +1502,10 @@ function SynthesisView({ synthesis }: { synthesis: Synthesis }) {
       <div className="px-4 py-3 bg-gradient-to-r from-violet-600 to-violet-800">
         <div className="flex items-center gap-2">
           <Star size={15} className="text-violet-200" />
-          <h3 className="text-sm font-bold text-white">Synthèse finale de l'agent</h3>
+          <h3 className="text-sm font-bold text-white">Agent's final summary</h3>
           <button
             onClick={() => generateSynthesisPDF(synthesis)}
-            title="Exporter en PDF — présentation soignée"
+            title="Export to PDF — clean presentation"
             className="ml-auto flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/15 hover:bg-white/25 text-white text-[11px] font-semibold transition-colors border border-white/20"
           >
             <Download size={12} />
@@ -1545,7 +1545,7 @@ function SynthesisView({ synthesis }: { synthesis: Synthesis }) {
             {synthesis.data_insights && (
               <div>
                 <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-2">
-                  Insights analytiques
+                  Analytical Insights
                 </p>
                 <p className="text-xs text-slate-700 leading-relaxed">{synthesis.data_insights}</p>
               </div>
@@ -1573,7 +1573,7 @@ function SynthesisView({ synthesis }: { synthesis: Synthesis }) {
                 </div>
               ))
             ) : (
-              <p className="text-xs text-slate-400 italic">Aucune découverte renseignée.</p>
+              <p className="text-xs text-slate-400 italic">No findings entered.</p>
             )}
           </div>
         )}
@@ -1597,10 +1597,10 @@ function SynthesisView({ synthesis }: { synthesis: Synthesis }) {
                     <div className="flex items-center gap-2 mb-1.5">
                       {statusIcon[ref.status] || statusIcon.success}
                       <span className="text-xs font-bold text-slate-700">
-                        Étape {ref.step_id}: {ref.description}
+                        Step {ref.step_id}: {ref.description}
                       </span>
                     </div>
-                    <p className="text-xs text-slate-600 mb-1"><strong>Résultat:</strong> {ref.outcome}</p>
+                    <p className="text-xs text-slate-600 mb-1"><strong>Result:</strong> {ref.outcome}</p>
                     {ref.insight && (
                       <p className="text-[10px] text-slate-500 italic">{ref.insight}</p>
                     )}
@@ -1608,7 +1608,7 @@ function SynthesisView({ synthesis }: { synthesis: Synthesis }) {
                 );
               })
             ) : (
-              <p className="text-xs text-slate-400 italic">Aucune réflexion disponible.</p>
+              <p className="text-xs text-slate-400 italic">No insights available.</p>
             )}
           </div>
         )}
@@ -1625,7 +1625,7 @@ function SynthesisView({ synthesis }: { synthesis: Synthesis }) {
                 </div>
               ))
             ) : (
-              <p className="text-xs text-slate-400 italic">Aucune recommandation disponible.</p>
+              <p className="text-xs text-slate-400 italic">No recommendations available.</p>
             )}
           </div>
         )}
@@ -1639,14 +1639,14 @@ function SynthesisView({ synthesis }: { synthesis: Synthesis }) {
                     <Table2 size={12} className="text-violet-600" />
                     <span className="text-xs font-bold font-mono text-violet-800">{tbl.name}</span>
                   </div>
-                  <p className="text-xs text-slate-600 mb-0.5"><strong>Contenu:</strong> {tbl.purpose}</p>
+                  <p className="text-xs text-slate-600 mb-0.5"><strong>Content:</strong> {tbl.purpose}</p>
                   {tbl.useful_for && (
-                    <p className="text-[10px] text-slate-500 italic">Utile pour: {tbl.useful_for}</p>
+                    <p className="text-[10px] text-slate-500 italic">Useful for: {tbl.useful_for}</p>
                   )}
                 </div>
               ))
             ) : (
-              <p className="text-xs text-slate-400 italic">Aucune table temporaire créée.</p>
+              <p className="text-xs text-slate-400 italic">No temporary table created.</p>
             )}
           </div>
         )}
@@ -1671,13 +1671,13 @@ function ReplanBadge({ replanLog }: { replanLog: ReplanEntry[] }) {
           )}
         >
           <RotateCcw size={9} />
-          Contrôle {i + 1}{r.should_replan ? ' → réévalué' : ' → OK'}
+          Check {i + 1}{r.should_replan ? ' → re-evaluated' : ' → OK'}
         </div>
       ))}
       {replanned.length > 0 && (
         <div className="flex items-center gap-1 px-2 py-1 rounded-full text-[10px] font-medium bg-violet-50 border border-violet-200 text-violet-700">
           <Zap size={9} />
-          {replanned.length} réévaluation{replanned.length > 1 ? 's' : ''}
+          {replanned.length} re-evaluation{replanned.length > 1 ? 's' : ''}
         </div>
       )}
     </div>
@@ -1708,9 +1708,9 @@ function WriterMessageView({
             />
           </div>
           <span className="flex-shrink-0 font-medium text-violet-600">
-            {msg.action_count}/{msg.plan.steps?.length ?? '?'} étapes
+            {msg.action_count}/{msg.plan.steps?.length ?? '?'} steps
             {msg.remaining_credits !== undefined && (
-              <span className="text-slate-400 ml-1">· {msg.remaining_credits} crédits restants</span>
+              <span className="text-slate-400 ml-1">· {msg.remaining_credits} credits remaining</span>
             )}
           </span>
         </div>
@@ -1739,7 +1739,7 @@ function WriterMessageView({
         <div className="flex items-center gap-2 p-3 bg-red-50 border border-red-200 rounded-lg">
           <Trash2 size={13} className="text-red-500" />
           <span className="text-xs text-red-700 font-medium">
-            Tables supprimées: {msg.tables_dropped.join(', ')}
+            Tables deleted: {msg.tables_dropped.join(', ')}
           </span>
         </div>
       )}
@@ -1747,7 +1747,7 @@ function WriterMessageView({
         <div className="flex items-center gap-2 p-3 bg-emerald-50 border border-emerald-200 rounded-lg">
           <Database size={13} className="text-emerald-600" />
           <span className="text-xs text-emerald-700 font-medium">
-            Tables conservées: {msg.created_tables.join(', ')}
+            Tables kept: {msg.created_tables.join(', ')}
           </span>
         </div>
       )}
@@ -1805,10 +1805,10 @@ function EtlFilesView({ files }: { files: EtlFileInfo[] }) {
         {open ? <ChevronDown size={13} className="text-orange-500" /> : <ChevronRight size={13} className="text-orange-500" />}
         <FolderOpen size={14} className="text-orange-600" />
         <span className="text-sm font-bold text-orange-800">
-          {files.length} fichier{files.length > 1 ? 's' : ''} trouvé{files.length > 1 ? 's' : ''}
+          {files.length} file{files.length > 1 ? 's' : ''} found
         </span>
         <span className="ml-auto text-xs text-orange-500">
-          {files.filter(f => !f.parse_error).length} lisibles
+          {files.filter(f => !f.parse_error).length} readable
         </span>
       </button>
       {open && (
@@ -1826,8 +1826,8 @@ function EtlFilesView({ files }: { files: EtlFileInfo[] }) {
                   <p className="text-xs font-medium text-slate-800 truncate">{f.relative}</p>
                   <p className="text-[10px] text-slate-400">
                     {f.size_human}
-                    {f.columns && f.columns.length > 0 && ` · ${f.columns.length} colonnes`}
-                    {f.row_count !== undefined && ` · ~${f.row_count} lignes`}
+                    {f.columns && f.columns.length > 0 && ` · ${f.columns.length} columns`}
+                    {f.row_count !== undefined && ` · ~${f.row_count} rows`}
                   </p>
                 </div>
                 {f.parse_error ? (
@@ -1844,7 +1844,7 @@ function EtlFilesView({ files }: { files: EtlFileInfo[] }) {
                   )}
                   {f.columns && f.columns.length > 0 && (
                     <div className="mt-2">
-                      <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-1">Colonnes</p>
+                      <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-1">Columns</p>
                       <div className="flex flex-wrap gap-1">
                         {f.columns.map((col, ci) => (
                           <span key={ci} className="px-1.5 py-0.5 bg-white border border-slate-200 rounded text-[9px] font-mono text-slate-600">
@@ -1856,7 +1856,7 @@ function EtlFilesView({ files }: { files: EtlFileInfo[] }) {
                   )}
                   {f.sample_rows && f.sample_rows.length > 0 && (
                     <div className="mt-2">
-                      <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-1">Aperçu</p>
+                      <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-1">Preview</p>
                       <div className="overflow-x-auto rounded-lg border border-slate-200">
                         <table className="text-[9px] w-full">
                           <thead className="bg-slate-100">
@@ -1906,22 +1906,22 @@ function EtlPlanView({ plan, actionCount }: { plan: EtlPlan; actionCount?: numbe
           </span>
         )}
         <span className="ml-auto text-xs text-orange-600 font-medium">
-          {actionCount !== undefined ? `${actionCount}/${plan.steps.length}` : plan.steps.length} étape{plan.steps.length > 1 ? 's' : ''}
+          {actionCount !== undefined ? `${actionCount}/${plan.steps.length}` : plan.steps.length} step{plan.steps.length > 1 ? 's' : ''}
         </span>
       </button>
       {open && (
         <div className="p-4 bg-white space-y-3">
           <div className="p-3 bg-orange-50 rounded-lg border border-orange-100">
-            <p className="text-[10px] font-bold text-orange-500 uppercase tracking-wide mb-1">Objectif</p>
+            <p className="text-[10px] font-bold text-orange-500 uppercase tracking-wide mb-1">Objective</p>
             <p className="text-sm text-orange-900 font-medium">{plan.objective}</p>
           </div>
           <div>
-            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-1">Approche</p>
+            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-1">Approach</p>
             <p className="text-xs text-slate-600 leading-relaxed">{plan.approach}</p>
           </div>
           {plan.tables_to_create?.length > 0 && (
             <div>
-              <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-1">Tables à créer</p>
+              <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-1">Tables to create</p>
               <div className="flex flex-wrap gap-1">
                 {plan.tables_to_create.map((t, i) => (
                   <span key={i} className="px-2 py-0.5 bg-orange-50 border border-orange-200 rounded text-[9px] font-mono font-bold text-orange-700">
@@ -1991,11 +1991,11 @@ function EtlActionLogView({ log }: { log: EtlActionEntry[] }) {
     <div className="mt-3 border border-slate-200 rounded-xl overflow-hidden">
       <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-200 flex items-center gap-2">
         <Code2 size={13} className="text-orange-500" />
-        <span className="text-xs font-bold text-slate-700">Journal ETL</span>
+        <span className="text-xs font-bold text-slate-700">ETL Log</span>
         <span className="ml-auto flex gap-2 text-xs">
           <span className="text-emerald-600 font-medium">{log.filter(e => e.ok).length} OK</span>
           {log.filter(e => !e.ok).length > 0 && (
-            <span className="text-red-500 font-medium">{log.filter(e => !e.ok).length} Erreur</span>
+            <span className="text-red-500 font-medium">{log.filter(e => !e.ok).length} Error</span>
           )}
         </span>
       </div>
@@ -2019,7 +2019,7 @@ function EtlActionLogView({ log }: { log: EtlActionEntry[] }) {
               </div>
               <div className="flex items-center gap-2 flex-shrink-0">
                 {entry.rows_affected != null && (
-                  <span className="text-[10px] text-orange-500 font-medium">{entry.rows_affected} lignes</span>
+                  <span className="text-[10px] text-orange-500 font-medium">{entry.rows_affected} rows</span>
                 )}
                 {expandedIdx[i] ? <ChevronDown size={12} className="text-slate-400" /> : <ChevronRight size={12} className="text-slate-400" />}
               </div>
@@ -2036,7 +2036,7 @@ function EtlActionLogView({ log }: { log: EtlActionEntry[] }) {
                 )}
                 {entry.result_preview != null && (
                   <div>
-                    <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-1">Résultat</p>
+                    <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-1">Result</p>
                     {typeof entry.result_preview === 'string' ? (
                       <p className={clsx(
                         'text-xs p-2 rounded-lg',
@@ -2083,7 +2083,7 @@ function EtlSynthesisView({ synthesis }: { synthesis: EtlSynthesis }) {
       <div className="px-4 py-3 bg-gradient-to-r from-orange-500 to-amber-500">
         <div className="flex items-center gap-2">
           <Star size={14} className="text-orange-100" />
-          <h3 className="text-sm font-bold text-white">Synthèse ETL</h3>
+          <h3 className="text-sm font-bold text-white">ETL Summary</h3>
         </div>
       </div>
       <div className="bg-white p-4 space-y-4">
@@ -2095,7 +2095,7 @@ function EtlSynthesisView({ synthesis }: { synthesis: EtlSynthesis }) {
         {/* Tables created */}
         {synthesis.tables_created?.length > 0 && (
           <div>
-            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-2">Tables créées (BOT_ETL_*)</p>
+            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-2">Tables created (BOT_ETL_*)</p>
             <div className="space-y-1.5">
               {synthesis.tables_created.map((tbl, i) => (
                 <div key={i} className="flex items-start gap-3 p-2.5 bg-orange-50 rounded-lg border border-orange-100">
@@ -2105,7 +2105,7 @@ function EtlSynthesisView({ synthesis }: { synthesis: EtlSynthesis }) {
                     {tbl.description && <p className="text-[10px] text-slate-500 mt-0.5">{tbl.description}</p>}
                   </div>
                   {tbl.row_count !== undefined && tbl.row_count > 0 && (
-                    <span className="text-[10px] text-orange-500 font-medium flex-shrink-0">{tbl.row_count} lignes</span>
+                    <span className="text-[10px] text-orange-500 font-medium flex-shrink-0">{tbl.row_count} rows</span>
                   )}
                 </div>
               ))}
@@ -2116,7 +2116,7 @@ function EtlSynthesisView({ synthesis }: { synthesis: EtlSynthesis }) {
         {/* Key points */}
         {synthesis.key_points?.length > 0 && (
           <div>
-            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-2">Points clés</p>
+            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-2">Key points</p>
             <div className="space-y-1.5">
               {synthesis.key_points.map((pt, i) => (
                 <div key={i} className="flex items-start gap-2 p-2 bg-slate-50 rounded-lg border border-slate-100">
@@ -2131,7 +2131,7 @@ function EtlSynthesisView({ synthesis }: { synthesis: EtlSynthesis }) {
         {/* Warnings */}
         {synthesis.warnings?.length > 0 && (
           <div>
-            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-2">Avertissements</p>
+            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-2">Warnings</p>
             <div className="space-y-1.5">
               {synthesis.warnings.map((w, i) => (
                 <div key={i} className="flex items-start gap-2 p-2 bg-amber-50 rounded-lg border border-amber-100">
@@ -2146,7 +2146,7 @@ function EtlSynthesisView({ synthesis }: { synthesis: EtlSynthesis }) {
         {/* Next steps */}
         {synthesis.next_steps?.length > 0 && (
           <div>
-            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-2">Prochaines étapes suggérées</p>
+            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide mb-2">Suggested next steps</p>
             <div className="space-y-1.5">
               {synthesis.next_steps.map((ns, i) => (
                 <div key={i} className="flex items-start gap-2 p-2 bg-blue-50 rounded-lg border border-blue-100">
@@ -2293,7 +2293,7 @@ function AssistantMessage({
             <div className="flex items-center gap-2 mt-2">
               <CheckCircle2 size={13} className="text-emerald-500" />
               <span className="text-xs text-emerald-700 font-medium">
-                {msg.tables_processed}/{msg.total_tables} table{(msg.total_tables ?? 0) > 1 ? 's' : ''} documentée{(msg.tables_processed ?? 0) > 1 ? 's' : ''}
+                {msg.tables_processed}/{msg.total_tables} table{(msg.total_tables ?? 0) > 1 ? 's' : ''} documented
               </span>
             </div>
           )}
@@ -2302,7 +2302,7 @@ function AssistantMessage({
             <div className="flex items-center gap-2 mt-2">
               <GitFork size={13} className="text-indigo-500" />
               <span className="text-xs text-indigo-700 font-medium">
-                {msg.suggestions.length} relation{msg.suggestions.length !== 1 ? 's' : ''} potentielle{msg.suggestions.length !== 1 ? 's' : ''} · {msg.total_fields ?? '?'} champs analysés
+                {msg.suggestions.length} potential relationship{msg.suggestions.length !== 1 ? 's' : ''} · {msg.total_fields ?? '?'} fields analyzed
               </span>
             </div>
           )}
@@ -2311,7 +2311,7 @@ function AssistantMessage({
             <div className="flex items-center gap-2 mt-2">
               <Database size={13} className="text-orange-500" />
               <span className="text-xs text-orange-700 font-medium">
-                {msg.created_tables.length} table{msg.created_tables.length > 1 ? 's' : ''} BOT_ETL_ créée{msg.created_tables.length > 1 ? 's' : ''}
+                {msg.created_tables.length} BOT_ETL_ table{msg.created_tables.length > 1 ? 's' : ''} created
               </span>
             </div>
           )}
@@ -2416,7 +2416,7 @@ export function AgentsPane() {
         // Writer agent: rich message
         setMessages(prev => [...prev, {
           role: 'assistant',
-          content: data.content ?? 'Opération terminée.',
+          content: data.content ?? 'Operation complete.',
           ...data,
         }]);
       } else if (selectedAgent.id === 'key-identifier') {
@@ -2424,8 +2424,8 @@ export function AgentsPane() {
         const sugs = data.suggestions ?? [];
         const totalFields = data.total_fields ?? 0;
         const content = sugs.length > 0
-          ? `${sugs.length} relation${sugs.length > 1 ? 's' : ''} FK potentielle${sugs.length > 1 ? 's' : ''} identifiée${sugs.length > 1 ? 's' : ''} sur ${totalFields} champs candidats. Confirmez ou rejetez chaque proposition ci-dessous.`
-          : (data.message ?? `Analyse terminée — aucune relation FK détectée parmi ${totalFields} champs candidats.`);
+          ? `${sugs.length} potential FK relation${sugs.length > 1 ? 's' : ''} identified across ${totalFields} candidate fields. Confirm or reject each suggestion below.`
+          : (data.message ?? `Analysis complete — no FK relations detected among ${totalFields} candidate fields.`);
         setMessages(prev => [...prev, {
           role: 'assistant',
           content,
@@ -2453,14 +2453,14 @@ export function AgentsPane() {
         const total = data.total_tables ?? 0;
         setMessages(prev => [...prev, {
           role: 'assistant',
-          content: `Documentation générée pour ${processed}/${total} table${total > 1 ? 's' : ''}.`,
+          content: `Documentation generated for ${processed}/${total} table${total > 1 ? 's' : ''}.`,
           ...data,
         }]);
       }
     } catch {
       setMessages(prev => [...prev, {
         role: 'assistant',
-        content: 'Erreur de connexion au serveur.',
+        content: 'Server connection error.',
         error: 'Connection error',
       }]);
     } finally {
@@ -2493,9 +2493,9 @@ export function AgentsPane() {
         <div className="p-4 border-b border-slate-100">
           <div className="flex items-center gap-2 mb-0.5">
             <Cpu size={16} className="text-emerald-500" />
-            <h2 className="text-sm font-bold text-slate-800">Agents disponibles</h2>
+            <h2 className="text-sm font-bold text-slate-800">Available Agents</h2>
           </div>
-          <p className="text-xs text-slate-400">Sélectionnez un agent pour démarrer</p>
+          <p className="text-xs text-slate-400">Select an agent to get started</p>
         </div>
 
         <div className="flex-1 overflow-y-auto p-3 space-y-2">
@@ -2504,7 +2504,7 @@ export function AgentsPane() {
               <Loader2 size={20} className="animate-spin text-slate-400" />
             </div>
           ) : agents.length === 0 ? (
-            <p className="text-xs text-slate-400 text-center py-10">Aucun agent disponible</p>
+            <p className="text-xs text-slate-400 text-center py-10">No agents available</p>
           ) : (
             agents.map(agent => (
               <AgentCard
@@ -2524,9 +2524,9 @@ export function AgentsPane() {
           <div className="p-5 bg-emerald-50 rounded-2xl mb-4">
             <Cpu size={40} className="text-emerald-400" />
           </div>
-          <h3 className="text-lg font-semibold text-slate-700 mb-2">Choisissez un agent</h3>
+          <h3 className="text-lg font-semibold text-slate-700 mb-2">Choose an agent</h3>
           <p className="text-sm text-slate-400 max-w-xs leading-relaxed">
-            Sélectionnez un agent dans le panneau de gauche pour démarrer une conversation dédiée.
+            Select an agent from the left panel to start a dedicated conversation.
           </p>
         </div>
       ) : (
@@ -2557,7 +2557,7 @@ export function AgentsPane() {
             )}
             <button
               onClick={() => { setMessages([]); setSessionId(null); }}
-              title="Réinitialiser la conversation"
+              title="Reset conversation"
               className="p-1.5 rounded-lg hover:bg-slate-100 text-slate-400 hover:text-slate-600 transition-colors"
             >
               <RefreshCw size={14} />
@@ -2572,7 +2572,7 @@ export function AgentsPane() {
                 className="w-full flex items-center gap-2 px-6 py-2.5 text-xs font-semibold text-slate-500 hover:bg-slate-50 transition-colors"
               >
                 <Settings2 size={13} />
-                Paramètres de l'agent
+                Agent Parameters
                 <span className="ml-auto">
                   {showParams ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
                 </span>
@@ -2624,16 +2624,16 @@ export function AgentsPane() {
                       Agent ClickHouse Writer
                     </p>
                     <p className="text-xs text-slate-400 max-w-sm leading-relaxed mb-4">
-                      Décrivez votre besoin en langage naturel. L'agent planifiera et exécutera
-                      automatiquement jusqu'à 12 opérations complexes, créera des tables
-                      intermédiaires si nécessaire, et produira une synthèse détaillée.
+                      Describe your need in natural language. The agent will automatically plan and execute
+                      up to 12 complex operations, create intermediate tables if necessary,
+                      and produce a detailed summary.
                     </p>
                     <div className="flex flex-wrap gap-2 justify-center">
                       {[
-                        'Analyse les 10 tables les plus volumineuses et synthétise leur contenu',
-                        'Crée une table agrégée BOT_ avec les métriques clés de ma base',
-                        'Identifie les doublons dans toutes les tables et produis un rapport',
-                        'Calcule la distribution des valeurs pour chaque colonne numérique',
+                        'Analyze the 10 largest tables and summarize their content',
+                        'Create an aggregated BOT_ table with key metrics from my database',
+                        'Identify duplicates across all tables and produce a report',
+                        'Calculate the value distribution for each numeric column',
                       ].map(s => (
                         <button
                           key={s}
@@ -2654,15 +2654,15 @@ export function AgentsPane() {
                       Agent Key Identifier
                     </p>
                     <p className="text-xs text-slate-400 max-w-sm leading-relaxed mb-4">
-                      Cet agent va scanner toutes vos tables, échantillonner jusqu'à 5 valeurs par champ candidat,
-                      puis utiliser le LLM pour détecter les relations FK potentielles.
-                      Configurez les paramètres ci-dessus, puis lancez l'analyse.
+                      This agent will scan all your tables, sample up to 5 values per candidate field,
+                      then use the LLM to detect potential FK relationships.
+                      Configure the parameters above, then launch the analysis.
                     </p>
                     <div className="flex flex-wrap gap-2 justify-center">
                       {[
-                        'Analyse toutes les tables et identifie les clés étrangères',
-                        'Trouve les relations entre les tables de ma base',
-                        'Identifie les champs qui se correspondent entre les tables',
+                        'Analyze all tables and identify foreign keys',
+                        'Find the relationships between tables in my database',
+                        'Identify fields that correspond to each other across tables',
                       ].map(s => (
                         <button
                           key={s}
@@ -2680,20 +2680,20 @@ export function AgentsPane() {
                       <Upload size={36} className="text-orange-400" />
                     </div>
                     <p className="text-sm text-slate-600 font-semibold mb-1">
-                      Agent ETL — Import fichiers
+                      ETL Agent — File Import
                     </p>
                     <p className="text-xs text-slate-400 max-w-sm leading-relaxed mb-4">
-                      Renseignez le <strong>dossier source</strong> dans les paramètres.
-                      L'agent listera les fichiers (CSV, Excel, Parquet, JSON, TXT),
-                      générera un plan d'import et créera des tables <span className="font-mono">BOT_ETL_*</span> dans ClickHouse.
-                      Les champs calculés seront préfixés <span className="font-mono">C_*</span>.
+                      Set the <strong>source folder</strong> in the parameters.
+                      The agent will list the files (CSV, Excel, Parquet, JSON, TXT),
+                      generate an import plan and create <span className="font-mono">BOT_ETL_*</span> tables in ClickHouse.
+                      Calculated fields will be prefixed with <span className="font-mono">C_*</span>.
                     </p>
                     <div className="flex flex-wrap gap-2 justify-center">
                       {[
-                        'Importe tous les fichiers dans une seule table clients',
-                        'Crée une table par fichier avec enrichissement depuis t_ref',
-                        'Importe les données et ajoute le champ C_montant_total calculé',
-                        'Répartis les données dans plusieurs tables selon le type',
+                        'Import all files into a single clients table',
+                        'Create one table per file with enrichment from t_ref',
+                        'Import the data and add the calculated C_total_amount field',
+                        'Split the data into multiple tables by type',
                       ].map(s => (
                         <button
                           key={s}
@@ -2708,15 +2708,15 @@ export function AgentsPane() {
                 ) : (
                   <>
                     <MessageSquare size={32} className="text-slate-300 mb-3" />
-                    <p className="text-sm text-slate-400 font-medium">Démarrez la conversation</p>
+                    <p className="text-sm text-slate-400 font-medium">Start the conversation</p>
                     <p className="text-xs text-slate-400 mt-1 max-w-xs">
-                      Tapez votre demande ci-dessous ou utilisez les suggestions de démarrage.
+                      Type your request below or use the starter suggestions.
                     </p>
                     <div className="mt-4 flex flex-wrap gap-2 justify-center">
                       {[
-                        'Génère le dictionnaire de données complet',
-                        'Documente toutes les tables disponibles',
-                        'Analyse et décris le schéma de la base',
+                        'Generate the complete data dictionary',
+                        'Document all available tables',
+                        'Analyze and describe the database schema',
                       ].map(s => (
                         <button
                           key={s}
@@ -2766,7 +2766,7 @@ export function AgentsPane() {
                 </div>
                 <div className="bg-white border border-slate-200 rounded-xl px-4 py-3 shadow-sm">
                   <div className="flex items-center gap-2 text-sm text-slate-400">
-                    <span>{isWriter ? "L'agent planifie et exécute" : isEtl ? "L'agent ETL analyse et importe" : 'Analyse en cours'}</span>
+                    <span>{isWriter ? 'Agent planning and executing' : isEtl ? 'ETL agent analyzing and importing' : 'Analysis in progress'}</span>
                     <span className="flex gap-0.5">
                       {[0, 150, 300].map(d => (
                         <span
@@ -2782,7 +2782,7 @@ export function AgentsPane() {
                   </div>
                   {(isWriter || isEtl) && (
                     <p className="text-[10px] text-slate-300 mt-1">
-                      Cela peut prendre quelques instants selon la taille des fichiers…
+                      This may take a few moments depending on file size…
                     </p>
                   )}
                 </div>
@@ -2801,10 +2801,10 @@ export function AgentsPane() {
                 onKeyDown={handleKey}
                 placeholder={
                   isWriter
-                    ? 'Décrivez votre analyse en langage naturel…'
+                    ? 'Describe your analysis in natural language…'
                     : isEtl
-                      ? 'Décrivez comment importer vos données, tables à créer, champs calculés…'
-                      : `Interrogez l'agent "${selectedAgent.name}"…`
+                      ? 'Describe how to import your data, tables to create, calculated fields…'
+                      : `Ask the "${selectedAgent.name}" agent…`
                 }
                 rows={2}
                 disabled={loading}
@@ -2833,15 +2833,15 @@ export function AgentsPane() {
               </button>
             </div>
             <p className="text-[10px] text-slate-400 mt-1.5 ml-1">
-              Entrée pour envoyer · Maj+Entrée pour sauter une ligne
+              Enter to send · Shift+Enter for new line
               {isWriter && sessionId && (
                 <span className="ml-2 text-violet-400 font-medium">
-                  · Session en cours
+                  · Session in progress
                 </span>
               )}
               {isEtl && sessionId && (
                 <span className="ml-2 text-orange-400 font-medium">
-                  · Session ETL active
+                  · ETL session active
                 </span>
               )}
             </p>

@@ -638,7 +638,7 @@ export function DataQualityPane() {
                 onChange={e => setTimeColumn(e.target.value)}
                 className="w-full text-xs bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 focus:ring-2 focus:ring-violet-500/20 focus:border-violet-500 transition-all font-mono"
               >
-                <option value="">— aucune (pas d'analyse temporelle) —</option>
+                <option value="">— none (no temporal analysis) —</option>
                 {tableColumns
                   .filter(col => ['DATE', 'DATETIME', 'TIMESTAMP'].some(t => col.type.toUpperCase().includes(t)))
                   .map(col => (
@@ -655,7 +655,7 @@ export function DataQualityPane() {
               {timeColumn && (
                 <p className="text-[10px] text-teal-700 bg-teal-50 border border-teal-200 rounded-lg px-2 py-1 flex items-center gap-1">
                   <Activity size={9} />
-                  Analyse de cohérence volumétrique par heure / jour activée.
+                  Volumetric consistency analysis by hour / day enabled.
                 </p>
               )}
             </div>
@@ -831,21 +831,21 @@ export function DataQualityPane() {
                       <Activity size={15} />
                     </div>
                     <div>
-                      <h4 className="text-sm font-bold text-slate-800">Cohérence Volumétrique</h4>
+                      <h4 className="text-sm font-bold text-slate-800">Volume Consistency</h4>
                       <p className="text-xs text-slate-500">
-                        Volume par {result.volume_analysis.granularity} sur <span className="font-mono">{result.volume_analysis.time_column}</span>
+                        Volume per {result.volume_analysis.granularity} on <span className="font-mono">{result.volume_analysis.time_column}</span>
                       </p>
                     </div>
                     {result.volume_analysis.anomaly_count > 0 && (
                       <span className="ml-auto flex items-center gap-1 text-xs font-semibold text-amber-700 bg-amber-50 border border-amber-200 px-2.5 py-1 rounded-full">
                         <AlertTriangle size={11} />
-                        {result.volume_analysis.anomaly_count} période{result.volume_analysis.anomaly_count > 1 ? 's' : ''} anormale{result.volume_analysis.anomaly_count > 1 ? 's' : ''}
+                        {result.volume_analysis.anomaly_count} abnormal period{result.volume_analysis.anomaly_count > 1 ? 's' : ''}
                       </span>
                     )}
                     {result.volume_analysis.anomaly_count === 0 && (
                       <span className="ml-auto flex items-center gap-1 text-xs font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded-full">
                         <CheckCircle2 size={11} />
-                        Volume stable
+                        Stable volume
                       </span>
                     )}
                   </div>
@@ -854,8 +854,8 @@ export function DataQualityPane() {
                   {/* Stats summary */}
                   <div className="grid grid-cols-4 gap-3">
                     {[
-                      { label: 'Moy. / période', value: result.volume_analysis.avg_volume.toLocaleString() },
-                      { label: 'Écart-type', value: result.volume_analysis.stddev_volume.toLocaleString() },
+                      { label: 'Avg. / period', value: result.volume_analysis.avg_volume.toLocaleString() },
+                      { label: 'Std. dev.', value: result.volume_analysis.stddev_volume.toLocaleString() },
                       { label: 'Min', value: result.volume_analysis.min_volume.toLocaleString(), accent: true },
                       { label: 'Max', value: result.volume_analysis.max_volume.toLocaleString() },
                     ].map(({ label, value, accent }) => (
@@ -881,7 +881,7 @@ export function DataQualityPane() {
                     <div>
                       <p className="text-xs font-semibold text-amber-700 mb-2 flex items-center gap-1.5">
                         <TrendingDown size={12} />
-                        Périodes sous le seuil ({result.volume_analysis.low_volume_threshold.toLocaleString()} entrées)
+                        Periods below threshold ({result.volume_analysis.low_volume_threshold.toLocaleString()} entries)
                       </p>
                       <div className="flex flex-wrap gap-1.5">
                         {result.volume_analysis.anomaly_periods.map((p, i) => (
@@ -898,13 +898,13 @@ export function DataQualityPane() {
                   <div>
                     <p className="text-xs font-semibold text-slate-500 mb-2 flex items-center gap-1.5">
                       <Clock size={11} />
-                      Périodes récentes
+                      Recent periods
                     </p>
                     <div className="overflow-x-auto">
                       <table className="w-full text-xs">
                         <thead>
                           <tr className="border-b border-slate-100">
-                            <th className="text-left py-1.5 px-2 text-slate-500 font-semibold">Période</th>
+                            <th className="text-left py-1.5 px-2 text-slate-500 font-semibold">Period</th>
                             <th className="text-right py-1.5 px-2 text-slate-500 font-semibold">Volume</th>
                             <th className="py-1.5 px-2 w-24"></th>
                           </tr>

@@ -721,13 +721,13 @@ export function BuilderPane() {
 
   const buildExportSql = useCallback(() => {
     const table = selectedTable;
-    if (!table) throw new Error("Aucune table sélectionnée");
+    if (!table) throw new Error("No table selected");
     const allDims = [...rowDims, ...colDims];
     const selects = [
       ...allDims.map(d => d.name),
       ...queryConfig.measures.map((m: any) => measureSql(m))
     ];
-    if (selects.length === 0) throw new Error("Ajoutez au moins une dimension ou une mesure");
+    if (selects.length === 0) throw new Error("Add at least one dimension or measure");
     let sql = `SELECT ${selects.join(', ')} FROM ${table}`;
     sql += buildWhereClause();
     if (allDims.length > 0 && queryConfig.measures.length > 0) {
@@ -756,7 +756,7 @@ export function BuilderPane() {
       });
       const data = await res.json();
       if (data.error) throw new Error(data.error);
-      setExportResult({ success: true, message: `${data.row_count.toLocaleString()} lignes exportées → ${data.path}` });
+      setExportResult({ success: true, message: `${data.row_count.toLocaleString()} rows exported → ${data.path}` });
     } catch (e: any) {
       setExportResult({ success: false, message: e.message });
     } finally {
@@ -1420,7 +1420,7 @@ export function BuilderPane() {
               onClick={openExportDialog}
               disabled={[...rowDims, ...colDims].length === 0 && queryConfig.measures.length === 0}
               className="flex items-center gap-2 bg-amber-500 hover:bg-amber-600 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
-              title="Exporter les résultats en CSV (séparateur pipe, max 1M lignes)"
+              title="Export results to CSV (pipe separator, max 1M rows)"
             >
               <Download size={16} />
               Export CSV
@@ -2030,7 +2030,7 @@ export function BuilderPane() {
                 </div>
                 <div>
                   <h2 className="text-base font-bold text-white">AI Explore</h2>
-                  <p className="text-xs text-indigo-200">Profiling IA de vos tables</p>
+                  <p className="text-xs text-indigo-200">AI profiling of your tables</p>
                 </div>
               </div>
               <div className="flex items-center gap-3">
@@ -2049,7 +2049,7 @@ export function BuilderPane() {
                   {aiExplore.loading ? (
                     <><span className="animate-spin inline-block w-3 h-3 border-2 border-indigo-400 border-t-transparent rounded-full" /> Profiling…</>
                   ) : (
-                    <><Telescope size={14} /> Analyser</>
+                    <><Telescope size={14} /> Analyze</>
                   )}
                 </button>
                 <button onClick={() => setAiExplore(prev => ({ ...prev, visible: false }))} className="text-white/70 hover:text-white p-1.5 hover:bg-white/20 rounded-lg">
@@ -2070,7 +2070,7 @@ export function BuilderPane() {
               {!aiExplore.stats && !aiExplore.loading && !aiExplore.error && (
                 <div className="flex flex-col items-center justify-center h-64 text-slate-400 gap-3">
                   <Telescope size={48} className="opacity-20" />
-                  <p className="text-sm">Sélectionnez une table et cliquez sur <strong>Analyser</strong></p>
+                  <p className="text-sm">Select a table and click <strong>Analyze</strong></p>
                 </div>
               )}
 
@@ -2082,8 +2082,8 @@ export function BuilderPane() {
                     <Telescope size={20} className="absolute inset-0 m-auto text-indigo-500" />
                   </div>
                   <div className="text-center">
-                    <p className="text-sm font-semibold text-slate-700">Analyse en cours…</p>
-                    <p className="text-xs text-slate-400 mt-1">Calcul des statistiques et profiling IA</p>
+                    <p className="text-sm font-semibold text-slate-700">Analysis in progress…</p>
+                    <p className="text-xs text-slate-400 mt-1">Computing statistics and AI profiling</p>
                   </div>
                 </div>
               )}
@@ -2121,10 +2121,10 @@ export function BuilderPane() {
                     {/* Metric cards */}
                     <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
                       {[
-                        { label: 'Lignes totales', value: s.total_rows.toLocaleString(), icon: Database, color: 'from-blue-500 to-blue-600' },
-                        { label: 'Colonnes', value: s.total_columns, icon: Layers, color: 'from-emerald-500 to-emerald-600' },
-                        { label: 'Score qualité', value: `${qualityScore}%`, icon: CheckCircle2, color: qualityScore >= 80 ? 'from-green-500 to-green-600' : qualityScore >= 60 ? 'from-amber-500 to-amber-600' : 'from-red-500 to-red-600' },
-                        { label: 'Colonnes >10% null', value: nullyColumns.length, icon: AlertTriangle, color: nullyColumns.length === 0 ? 'from-slate-400 to-slate-500' : 'from-orange-500 to-red-500' },
+                        { label: 'Total Rows', value: s.total_rows.toLocaleString(), icon: Database, color: 'from-blue-500 to-blue-600' },
+                        { label: 'Columns', value: s.total_columns, icon: Layers, color: 'from-emerald-500 to-emerald-600' },
+                        { label: 'Quality Score', value: `${qualityScore}%`, icon: CheckCircle2, color: qualityScore >= 80 ? 'from-green-500 to-green-600' : qualityScore >= 60 ? 'from-amber-500 to-amber-600' : 'from-red-500 to-red-600' },
+                        { label: 'Columns >10% null', value: nullyColumns.length, icon: AlertTriangle, color: nullyColumns.length === 0 ? 'from-slate-400 to-slate-500' : 'from-orange-500 to-red-500' },
                       ].map((m, i) => (
                         <div key={i} className={`bg-gradient-to-br ${m.color} rounded-2xl p-4 text-white shadow-lg`}>
                           <div className="flex items-center justify-between mb-2">
@@ -2141,8 +2141,8 @@ export function BuilderPane() {
                       <div className="bg-gradient-to-r from-indigo-50 to-purple-50 border border-indigo-100 rounded-2xl p-5">
                         <div className="flex items-center gap-2 mb-3">
                           <Brain size={16} className="text-indigo-600" />
-                          <span className="text-sm font-bold text-indigo-700">Analyse IA</span>
-                          {aiExplore.insightsLoading && <span className="animate-pulse text-xs text-indigo-400">En cours…</span>}
+                          <span className="text-sm font-bold text-indigo-700">AI Analysis</span>
+                          {aiExplore.insightsLoading && <span className="animate-pulse text-xs text-indigo-400">In progress…</span>}
                         </div>
                         {aiExplore.insightsLoading ? (
                           <div className="space-y-2">
@@ -2155,7 +2155,7 @@ export function BuilderPane() {
                               {aiExplore.insights.quality_issues?.length > 0 && (
                                 <div className="bg-red-50 border border-red-100 rounded-xl p-3">
                                   <div className="flex items-center gap-1.5 mb-2 text-red-700 text-xs font-bold uppercase tracking-wider">
-                                    <AlertTriangle size={12} /> Problèmes qualité
+                                    <AlertTriangle size={12} /> Quality Issues
                                   </div>
                                   <ul className="space-y-1">
                                     {aiExplore.insights.quality_issues.map((q, i) => <li key={i} className="text-xs text-red-800">• {q}</li>)}
@@ -2165,7 +2165,7 @@ export function BuilderPane() {
                               {aiExplore.insights.key_insights?.length > 0 && (
                                 <div className="bg-amber-50 border border-amber-100 rounded-xl p-3">
                                   <div className="flex items-center gap-1.5 mb-2 text-amber-700 text-xs font-bold uppercase tracking-wider">
-                                    <Lightbulb size={12} /> Insights clés
+                                    <Lightbulb size={12} /> Key Insights
                                   </div>
                                   <ul className="space-y-1">
                                     {aiExplore.insights.key_insights.map((q, i) => <li key={i} className="text-xs text-amber-800">• {q}</li>)}
@@ -2175,7 +2175,7 @@ export function BuilderPane() {
                               {aiExplore.insights.recommendations?.length > 0 && (
                                 <div className="bg-emerald-50 border border-emerald-100 rounded-xl p-3">
                                   <div className="flex items-center gap-1.5 mb-2 text-emerald-700 text-xs font-bold uppercase tracking-wider">
-                                    <CheckCircle2 size={12} /> Recommandations
+                                    <CheckCircle2 size={12} /> Recommendations
                                   </div>
                                   <ul className="space-y-1">
                                     {aiExplore.insights.recommendations.map((q, i) => <li key={i} className="text-xs text-emerald-800">• {q}</li>)}
@@ -2193,7 +2193,7 @@ export function BuilderPane() {
                       {/* Type distribution pie */}
                       <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-sm">
                         <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3 flex items-center gap-1.5">
-                          <Type size={12} /> Distribution des types
+                          <Type size={12} /> Type Distribution
                         </h3>
                         <ResponsiveContainer width="100%" height={200}>
                           <RechartsPieChart>
@@ -2208,7 +2208,7 @@ export function BuilderPane() {
                       {/* Null rate bar chart */}
                       <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-sm">
                         <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3 flex items-center gap-1.5">
-                          <Percent size={12} /> Taux de null par colonne (top 15)
+                          <Percent size={12} /> Null rate per column (top 15)
                         </h3>
                         <ResponsiveContainer width="100%" height={200}>
                           <BarChart data={nullBarData} layout="vertical" margin={{ left: 0, right: 8 }}>
@@ -2228,7 +2228,7 @@ export function BuilderPane() {
                       {/* Distinct count chart */}
                       <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-sm">
                         <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3 flex items-center gap-1.5">
-                          <Hash size={12} /> Valeurs distinctes (top 12)
+                          <Hash size={12} /> Distinct values (top 12)
                         </h3>
                         <ResponsiveContainer width="100%" height={200}>
                           <BarChart data={distinctBarData} margin={{ left: 0, right: 8 }}>
@@ -2245,7 +2245,7 @@ export function BuilderPane() {
                     {/* Column cards grid */}
                     <div>
                       <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3 flex items-center gap-1.5">
-                        <Layers size={12} /> Détail des colonnes ({s.total_columns})
+                        <Layers size={12} /> Column details ({s.total_columns})
                       </h3>
                       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
                         {s.columns.map(col => {
@@ -2291,7 +2291,7 @@ export function BuilderPane() {
                               {/* Top values mini bars */}
                               {col.top_values.length > 0 && (
                                 <div className="mt-2 pt-2 border-t border-slate-100">
-                                  <p className="text-[9px] text-slate-400 uppercase tracking-wider mb-1">Top valeurs</p>
+                                  <p className="text-[9px] text-slate-400 uppercase tracking-wider mb-1">Top values</p>
                                   <div className="space-y-1">
                                     {col.top_values.slice(0, 4).map((tv, i) => {
                                       const maxCount = col.top_values[0]?.count || 1;
@@ -2301,7 +2301,7 @@ export function BuilderPane() {
                                           <div className="h-1 bg-indigo-200 rounded-full flex-1 overflow-hidden">
                                             <div className="h-full bg-indigo-500 rounded-full" style={{ width: `${pct}%` }} />
                                           </div>
-                                          <span className="text-[9px] text-slate-500 truncate max-w-[60px]" title={tv.value}>{tv.value || '(vide)'}</span>
+                                          <span className="text-[9px] text-slate-500 truncate max-w-[60px]" title={tv.value}>{tv.value || '(empty)'}</span>
                                           <span className="text-[9px] text-slate-400 shrink-0">{tv.count.toLocaleString()}</span>
                                         </div>
                                       );
@@ -2332,7 +2332,7 @@ export function BuilderPane() {
             <div className="p-4 border-b border-slate-200 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Download size={18} className="text-amber-600" />
-                <h3 className="text-sm font-bold text-slate-800">Exporter en CSV</h3>
+                <h3 className="text-sm font-bold text-slate-800">Export as CSV</h3>
               </div>
               <button onClick={() => setExportDialogOpen(false)} className="text-slate-400 hover:text-slate-600 p-1.5 hover:bg-slate-100 rounded-md">
                 <X size={16} />
@@ -2340,22 +2340,22 @@ export function BuilderPane() {
             </div>
             <div className="p-5 space-y-4">
               <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-xs text-amber-700 space-y-1">
-                <p className="font-semibold">Format : CSV avec séparateur pipe ( | )</p>
-                <p>Limite : 1 000 000 lignes maximum</p>
+                <p className="font-semibold">Format: CSV with pipe separator ( | )</p>
+                <p>Limit: 1,000,000 rows maximum</p>
               </div>
               <div>
                 <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wide mb-1">
                   <FolderOpen size={12} className="inline mr-1" />
-                  Répertoire / fichier de destination
+                  Directory / destination file
                 </label>
                 <input
                   type="text"
                   value={exportPath}
                   onChange={e => { setExportPath(e.target.value); setExportResult(null); }}
-                  placeholder="/home/user/mes_données/export.csv"
+                  placeholder="/home/user/my_data/export.csv"
                   className="w-full bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-sm font-mono focus:ring-2 focus:ring-amber-500/20 focus:border-amber-500 transition-all"
                 />
-                <p className="mt-1 text-xs text-slate-400">Chemin absolu sur le serveur (ex : /home/user/export.csv)</p>
+                <p className="mt-1 text-xs text-slate-400">Absolute path on the server (e.g.: /home/user/export.csv)</p>
               </div>
               {exportResult && (
                 <div className={clsx(
@@ -2368,7 +2368,7 @@ export function BuilderPane() {
               )}
               <div className="flex justify-end gap-2 pt-1">
                 <button onClick={() => setExportDialogOpen(false)} className="px-4 py-2 text-sm text-slate-600 hover:bg-slate-100 rounded-lg transition-colors">
-                  {exportResult?.success ? 'Fermer' : 'Annuler'}
+                  {exportResult?.success ? 'Close' : 'Cancel'}
                 </button>
                 {!exportResult?.success && (
                   <button
@@ -2376,7 +2376,7 @@ export function BuilderPane() {
                     disabled={isExporting || !exportPath.trim()}
                     className="flex items-center gap-2 bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors"
                   >
-                    {isExporting ? <><Loader2 size={14} className="animate-spin" />Export en cours…</> : <><Download size={14} />Exporter</>}
+                    {isExporting ? <><Loader2 size={14} className="animate-spin" />Exporting…</> : <><Download size={14} />Export</>}
                   </button>
                 )}
               </div>
