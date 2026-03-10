@@ -2,6 +2,7 @@ import os
 import json
 import uuid
 import re
+import ipaddress
 import requests as http_requests
 import urllib3
 from datetime import datetime, timezone
@@ -23,6 +24,39 @@ def _http_post(url, **kwargs):
     """POST with SSL verification disabled (supports self-signed certificates)."""
     kwargs.setdefault("verify", False)
     return http_requests.post(url, **kwargs)
+
+
+def _is_local_url(url: str) -> bool:
+    """Return True if *url* resolves to a local / private network address.
+
+    Accepted addresses:
+    - loopback: localhost, 127.x.x.x, ::1
+    - link-local: 169.254.x.x, fe80::/10
+    - private ranges: 10.x, 172.16-31.x, 192.168.x
+    - bare hostnames without a dot (e.g. "mybox", "ollama-server")
+    - *.local mDNS names
+    - empty string (will fall back to a localhost default in the caller)
+    """
+    if not url:
+        return True
+    try:
+        host = urlparse(url).hostname or ""
+        if not host:
+            return True
+        # Well-known loopback aliases
+        if host in ("localhost", "::1", "0.0.0.0"):
+            return True
+        # Bare hostname (no dot) or .local mDNS — assumed internal
+        if "." not in host or host.endswith(".local"):
+            return True
+        # Numeric IP — check private / loopback ranges
+        ip = ipaddress.ip_address(host)
+        return ip.is_private or ip.is_loopback or ip.is_link_local
+    except ValueError:
+        # Not a numeric IP → not obviously local
+        return False
+    except Exception:
+        return False
 
 
 load_dotenv()
@@ -741,7 +775,17 @@ def update_config():
     if data.get("clickhouse"):
         clickhouse_config.update(data["clickhouse"])
     if data.get("llm"):
-        llm_config.update(data["llm"])
+        new_llm = data["llm"]
+        base_url = (new_llm.get("baseUrl") or "").strip()
+        if base_url and not _is_local_url(base_url):
+            return jsonify({
+                "error": (
+                    "LLM baseUrl must point to a local address "
+                    "(localhost, 127.x.x.x, private IP range, or *.local). "
+                    f"Received: {base_url!r}"
+                )
+            }), 400
+        llm_config.update(new_llm)
     if "knowledge" in data:
         knowledge_base = data["knowledge"]
     return jsonify({"success": True})
@@ -1006,7 +1050,16 @@ def test_llm():
     """Test LLM connection by sending a simple hello prompt."""
     data = request.get_json()
     provider = data.get("provider")
-    base_url = (data.get("baseUrl") or "").rstrip("/")
+    base_url = (data.get("baseUrl") or "").strip().rstrip("/")
+    # Enforce local-only LLM connections
+    if base_url and not _is_local_url(base_url):
+        return jsonify({
+            "error": (
+                "LLM endpoint must be a local address "
+                "(localhost, 127.x.x.x, private IP, or *.local). "
+                f"Received: {base_url!r}"
+            )
+        }), 400
     test_prompt = "Hello, are you online? Respond with 'Yes'."
     try:
         if provider == "ollama":

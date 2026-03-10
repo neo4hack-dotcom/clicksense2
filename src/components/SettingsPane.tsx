@@ -244,6 +244,23 @@ export function SettingsPane() {
     }
   };
 
+  const isLocalUrl = (url: string): boolean => {
+    if (!url) return true;
+    try {
+      const { hostname } = new URL(url);
+      if (!hostname) return true;
+      if (['localhost', '127.0.0.1', '::1', '0.0.0.0'].includes(hostname)) return true;
+      if (!hostname.includes('.') || hostname.endsWith('.local')) return true;
+      // Private IPv4: 10.x, 172.16-31.x, 192.168.x
+      if (/^10\./.test(hostname)) return true;
+      if (/^192\.168\./.test(hostname)) return true;
+      if (/^172\.(1[6-9]|2\d|3[01])\./.test(hostname)) return true;
+      return false;
+    } catch {
+      return true; // unparseable → don't block
+    }
+  };
+
   const testBtnClass = (result: 'idle' | 'success' | 'error') =>
     `px-4 py-2 rounded-lg text-sm font-medium transition-colors border flex items-center gap-2 ${result === 'success' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : result === 'error' ? 'bg-red-50 text-red-700 border-red-200' : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'}`;
 
@@ -333,9 +350,15 @@ export function SettingsPane() {
               placeholder={
                 config.llm.provider === 'ollama' ? 'http://localhost:11434' :
                 config.llm.provider === 'local_http' ? 'http://localhost:8000/v1/chat/completions' :
-                'https://your-n8n.example.com/webhook/...'
+                'http://localhost:5678/webhook/...'
               }
             />
+            {config.llm.baseUrl && !isLocalUrl(config.llm.baseUrl) && (
+              <p className="text-xs text-amber-600 flex items-center gap-1 mt-1">
+                <AlertCircle size={12} />
+                This URL does not appear to be local. Only local addresses are allowed (localhost, 127.x.x.x, private IP ranges).
+              </p>
+            )}
           </div>
           {(config.llm.provider === 'local_http' || config.llm.provider === 'n8n') && (
             <div className="space-y-2">
