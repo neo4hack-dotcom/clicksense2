@@ -2710,8 +2710,9 @@ def agent_analysis():
 
     data = request.get_json()
     MAX_AGENT_STEPS = max(1, min(50, int(data.get("maxSteps", 10))))
-    # One technical rephrase retry at most per consumed step.
-    MAX_TECHNICAL_RETRIES = MAX_AGENT_STEPS
+    # Global cap: at most 3 technical alternatives across the whole run.
+    # Worst-case total SQL attempts = MAX_AGENT_STEPS + 3.
+    MAX_TECHNICAL_RETRIES = 3
 
     user_question = data.get("question", "")
     schema = data.get("schema", {})
@@ -2810,6 +2811,173 @@ def agent_analysis():
     steps: list = []
     seen_query_fingerprints: set[str] = set()
     context_injected_once = False
+    halfway_step = max(1, (MAX_AGENT_STEPS + 1) // 2)
+
+    def _sanitize_plan_steps(raw_steps, max_items: int) -> list[str]:
+        """Normalize plan steps into concise, unique text items."""
+        if not isinstance(raw_steps, list):
+            return []
+        clean = []
+        seen = set()
+        for item in raw_steps:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            text = " ".join(text.split())
+            if len(text) > 180:
+                text = text[:180].rstrip() + "..."
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            clean.append(text)
+            if len(clean) >= max_items:
+                break
+        return clean
+
+    def _build_fallback_plan() -> list[str]:
+        fallback = [
+            "Valider les tables/colonnes pertinentes et la métrique principale.",
+            "Exécuter une requête de base avec filtre date explicite pour établir un baseline.",
+            "Comparer le résultat par une dimension métier clé pour expliquer les écarts.",
+            "Confirmer la robustesse (métrique alternative simple ou contrôle croisé).",
+            "Conclure avec limites et niveau de confiance.",
+        ]
+        return fallback[:max(1, min(MAX_AGENT_STEPS, 5))]
+
+    def _build_initial_agent_plan() -> dict:
+        """Create an initial compact SQL action plan."""
+        schema_brief = {}
+        for tbl, cols in list(schema.items())[:12]:
+            col_names = [c["name"] if isinstance(c, dict) else str(c) for c in cols][:8]
+            schema_brief[tbl] = col_names
+
+        plan_prompt = f"""You are planning an efficient ClickHouse analysis strategy.
+Create a concise action plan for SQL exploration.
+
+USER QUESTION:
+{user_question}
+
+TABLE HINTS (truncated):
+{json.dumps(schema_brief, ensure_ascii=False, indent=2)}
+
+CONSTRAINTS:
+- Max action credits: {MAX_AGENT_STEPS}
+- Prefer 3 to 5 focused SQL actions.
+- Use only simple SQL functions (COUNT, SUM, AVG, MIN, MAX, COUNT DISTINCT, ROUND, COALESCE).
+- Date filters must use BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD' or = 'YYYY-MM-DD'.
+- Avoid advanced ClickHouse functions.
+
+Return ONLY JSON:
+{{
+  "plan_steps": ["step 1", "step 2", "step 3"],
+  "reasoning": "short strategy rationale"
+}}"""
+        try:
+            content = _call_llm(
+                plan_prompt,
+                [{"role": "user", "content": "Build the plan."}],
+                temperature=0.1,
+            )
+            parsed = _parse_llm_json(content)
+            plan_steps = _sanitize_plan_steps(
+                parsed.get("plan_steps"),
+                max_items=max(1, min(MAX_AGENT_STEPS, 6)),
+            )
+            if not plan_steps:
+                plan_steps = _build_fallback_plan()
+            return {
+                "plan_steps": plan_steps,
+                "reasoning": str(parsed.get("reasoning", ""))[:220],
+                "source": "llm" if parsed else "fallback",
+            }
+        except Exception as exc:
+            print(f"[Agent Plan] Initial planning fallback: {exc}")
+            return {
+                "plan_steps": _build_fallback_plan(),
+                "reasoning": "Fallback heuristic plan",
+                "source": "fallback",
+            }
+
+    def _run_midcourse_review(steps_so_far: list, used_steps: int, current_plan_steps: list[str]) -> dict:
+        """Reassess direction at midpoint and optionally revise remaining plan."""
+        steps_context = _summarize_agent_steps_for_prompt(
+            steps_so_far,
+            max_steps=8,
+            max_result_chars=180,
+        )
+        remaining = max(0, MAX_AGENT_STEPS - used_steps)
+        plan_block = "\n".join(f"- {s}" for s in current_plan_steps[:6]) or "- (none)"
+        review_prompt = f"""You are reviewing the current SQL investigation strategy.
+Decide if the agent is on track or drifting, then revise the remaining plan.
+
+USER QUESTION:
+{user_question}
+
+CURRENT PLAN:
+{plan_block}
+
+USED CREDITS: {used_steps}/{MAX_AGENT_STEPS}
+REMAINING CREDITS: {remaining}
+
+EVIDENCE SUMMARY:
+{steps_context}
+
+Return ONLY JSON:
+{{
+  "judgement": "on_track" | "off_track" | "blocked",
+  "guidance": "short directive for next actions",
+  "should_finish_early": false,
+  "updated_plan_steps": ["next step 1", "next step 2"]
+}}"""
+        try:
+            content = _call_llm(
+                review_prompt,
+                [{"role": "user", "content": "Review and revise now."}],
+                temperature=0.1,
+            )
+            parsed = _parse_llm_json(content)
+            updated_steps = _sanitize_plan_steps(
+                parsed.get("updated_plan_steps"),
+                max_items=max(1, min(remaining, 5)),
+            )
+            return {
+                "judgement": str(parsed.get("judgement", "on_track")),
+                "guidance": str(parsed.get("guidance", ""))[:260],
+                "should_finish_early": bool(parsed.get("should_finish_early", False)),
+                "updated_plan_steps": updated_steps,
+                "source": "llm",
+            }
+        except Exception as exc:
+            print(f"[Agent Plan] Midcourse review fallback: {exc}")
+            failed = sum(1 for s in steps_so_far if s.get("type") == "query" and not s.get("ok"))
+            judgement = "off_track" if failed >= 2 else "on_track"
+            fallback_guidance = (
+                "Recentrer la stratégie: 1) baseline agrégé simple, 2) une seule dimension de découpage, "
+                "3) conclure rapidement."
+            )
+            fallback_steps = _sanitize_plan_steps(
+                [
+                    "Calculer un baseline agrégé strictement aligné à la question.",
+                    "Comparer une dimension métier principale avec la même plage de dates.",
+                    "Finaliser la réponse avec niveau de confiance.",
+                ],
+                max_items=max(1, min(remaining, 3)),
+            )
+            return {
+                "judgement": judgement,
+                "guidance": fallback_guidance,
+                "should_finish_early": False,
+                "updated_plan_steps": fallback_steps,
+                "source": "fallback",
+            }
+
+    initial_plan = _build_initial_agent_plan()
+    current_plan_steps = list(initial_plan.get("plan_steps", []))
+    midcourse_review = None
+    midcourse_review_done = False
+    midcourse_guidance = ""
+    force_finish_now = False
 
     def _search_knowledge_for_agent(query: str) -> str:
         """Search the knowledge base (ES RAG) for context relevant to the query.
@@ -2892,6 +3060,16 @@ def agent_analysis():
         )
 
         effective_used = used_steps if used_steps is not None else len(steps_so_far)
+        plan_block = "\n".join(
+            f"{idx + 1}. {step}"
+            for idx, step in enumerate(current_plan_steps[:8])
+        ) or "1. Build a direct baseline SQL query.\n2. Validate with one comparison query.\n3. Conclude."
+        midcourse_block = midcourse_guidance or "No mid-course revision yet."
+        mandatory_finish_note = ""
+        if effective_used >= MAX_AGENT_STEPS or force_finish_now:
+            mandatory_finish_note = (
+                "IMPORTANT: based on credit constraints/review, you MUST respond with action 'finish' now."
+            )
 
         if use_knowledge_base:
             actions_block = """You have FOUR possible actions:
@@ -2944,13 +3122,19 @@ DATE HANDLING — CRITICAL:
 CURRENT ANALYSIS PROGRESS ({effective_used}/{MAX_AGENT_STEPS} steps used):
 {steps_context if steps_context else "None yet — this is the first step."}
 
+CURRENT EXECUTION PLAN:
+{plan_block}
+
+MID-COURSE GUIDANCE:
+{midcourse_block}
+
 USER QUESTION:
 {user_question}
 
 INSTRUCTIONS:
 {actions_block}
 
-{"IMPORTANT: You have used all available steps — you MUST respond with action 'finish'." if effective_used >= MAX_AGENT_STEPS else ""}
+{mandatory_finish_note}
 
 Respond ONLY with valid JSON in one of these forms:
 
@@ -3205,6 +3389,7 @@ Respond ONLY with valid JSON (no markdown):
         final_answer = None
         used_steps = 0        # steps counting against the credit budget
         technical_retries_used = 0  # retries not counting against credits
+        query_attempts_used = 0
         retry_pending = None  # {"failed_sql": "...", "error": "...", "error_class": "..."}
         safety_limit = MAX_AGENT_STEPS * 4  # absolute ceiling to prevent infinite loops
         safety_counter = 0
@@ -3214,9 +3399,33 @@ Respond ONLY with valid JSON (no markdown):
                 break
             safety_counter += 1
 
+            # ── Mid-course review (exactly once around half of the credit) ─────
+            if (
+                not midcourse_review_done
+                and used_steps >= halfway_step
+                and steps
+                and not retry_pending
+            ):
+                midcourse_review = _run_midcourse_review(
+                    steps,
+                    used_steps,
+                    current_plan_steps,
+                )
+                midcourse_review_done = True
+                midcourse_guidance = str(midcourse_review.get("guidance", "")).strip()
+                revised_steps = midcourse_review.get("updated_plan_steps") or []
+                if revised_steps:
+                    current_plan_steps = revised_steps
+                if midcourse_review.get("should_finish_early"):
+                    force_finish_now = True
+
             # ── Handle a pending corrective retry (free, no credit consumed) ────
             if retry_pending:
                 if technical_retries_used >= MAX_TECHNICAL_RETRIES:
+                    if steps and steps[-1].get("type") == "query" and not steps[-1].get("ok"):
+                        steps[-1]["result_summary"] += (
+                            f" | Technical retry budget exhausted ({MAX_TECHNICAL_RETRIES} max)."
+                        )
                     retry_pending = None
                 else:
                     alt_decision = _run_agent_retry(steps, retry_pending)
@@ -3226,6 +3435,7 @@ Respond ONLY with valid JSON (no markdown):
 
                     alt_sql = (alt_decision.get("sql") or "").strip()
                     if alt_sql and steps:
+                        query_attempts_used += 1
                         alt_result = _execute_and_summarise(alt_sql)
                         alt_norm = (alt_result.get("normalized_sql") or alt_sql).strip()
                         is_dup = alt_norm.lower() in seen_query_fingerprints
@@ -3270,9 +3480,14 @@ Respond ONLY with valid JSON (no markdown):
             action = decision.get("action", "finish")
             reasoning = decision.get("reasoning", "")
 
+            if force_finish_now and action != "finish":
+                # Mid-course review requested early stop to avoid inefficient chains.
+                break
+
             if action == "query":
                 used_steps += 1
                 sql = decision.get("sql", "").strip()
+                query_attempts_used += 1
                 exec_result = _execute_and_summarise(sql)
                 normalized_sql = (exec_result.get("normalized_sql") or sql).strip()
 
@@ -3408,6 +3623,12 @@ Requirements:
             "total_steps": len(steps),
             "technical_retries_used": technical_retries_used,
             "free_retries_used": technical_retries_used,
+            "query_attempts_used": query_attempts_used,
+            "max_technical_retries": MAX_TECHNICAL_RETRIES,
+            "max_total_query_attempts": MAX_AGENT_STEPS + MAX_TECHNICAL_RETRIES,
+            "initial_plan": initial_plan.get("plan_steps", []),
+            "current_plan": current_plan_steps,
+            "midcourse_review": midcourse_review or {},
         })
 
     except Exception as exc:
