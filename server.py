@@ -981,6 +981,37 @@ _READONLY_FORBIDDEN_KEYWORDS = (
     "RENAME", "ATTACH", "DETACH", "OPTIMIZE", "SYSTEM", "GRANT", "REVOKE",
     "KILL", "SET ROLE", "USE",
 )
+_SIMPLE_COMPAT_FORBIDDEN_FUNCTION_PATTERNS = (
+    r"\bwindowfunnel\s*\(",
+    r"\bretention\s*\(",
+    r"\bsequencematch\s*\(",
+    r"\bsequencecount\s*\(",
+    r"\bsequencenextnode\s*\(",
+    r"\bargmax\s*\(",
+    r"\bargmin\s*\(",
+    r"\btopk\s*\(",
+    r"\buniqhll12\s*\(",
+    r"\buniqtheta\s*\(",
+    r"\bquantiles?[a-z0-9_]*\s*\(",
+    r"\bjsonextract[a-z0-9_]*\s*\(",
+    r"\bsumif\s*\(",
+    r"\bcountif\s*\(",
+)
+_SIMPLE_COMPAT_FORBIDDEN_DATE_FUNCTION_PATTERNS = (
+    r"\btoyear\s*\(",
+    r"\btomonth\s*\(",
+    r"\btoquarter\s*\(",
+    r"\byear\s*\(",
+    r"\bmonth\s*\(",
+    r"\bdate_trunc\s*\(",
+    r"\btostartof[a-z0-9_]*\s*\(",
+    r"\bextract\s*\(",
+)
+_DATE_LITERAL_PATTERN = (
+    r"(?:'\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}:\d{2})?'"
+    r"|toDate\s*\(\s*'\d{4}-\d{2}-\d{2}'\s*\)"
+    r"|toDateTime\s*\(\s*'\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}'\s*\))"
+)
 
 
 def _classify_clickhouse_error(error_text: str) -> str:
@@ -1006,7 +1037,61 @@ def _classify_clickhouse_error(error_text: str) -> str:
         return "aggregation_error"
     if "join" in text and ("not found" in text or "cannot" in text):
         return "join_error"
+    if "simple compatibility" in text or "between" in text or "date filter" in text:
+        return "simple_compat"
     return "execution_error"
+
+
+def _validate_simple_clickhouse_sql(statement: str) -> None:
+    """Validate SQL against simple compatibility + strict date filtering rules."""
+    sql = (statement or "").strip()
+    low = sql.lower()
+
+    for pattern in _SIMPLE_COMPAT_FORBIDDEN_FUNCTION_PATTERNS:
+        if re.search(pattern, low, flags=re.IGNORECASE):
+            raise ValueError(
+                "Simple compatibility mode: advanced ClickHouse functions are not allowed. "
+                "Use COUNT, SUM, AVG, MIN, MAX, COUNT DISTINCT, ROUND, COALESCE."
+            )
+
+    for pattern in _SIMPLE_COMPAT_FORBIDDEN_DATE_FUNCTION_PATTERNS:
+        if re.search(pattern, low, flags=re.IGNORECASE):
+            raise ValueError(
+                "Simple compatibility mode: date extraction functions are not allowed "
+                "(year/month/toYear/toMonth/date_trunc/toStartOf*)."
+            )
+
+    # Date filtering policy:
+    # - If a date literal is used, filter must use BETWEEN ... AND ... or '='
+    # - Comparators >, <, >=, <= with date literals are forbidden.
+    has_date_literal = bool(re.search(_DATE_LITERAL_PATTERN, sql, flags=re.IGNORECASE))
+    if not has_date_literal:
+        return
+
+    left_cmp = rf"\b[\w`.]+\b\s*(?:>=|<=|>|<)\s*{_DATE_LITERAL_PATTERN}"
+    right_cmp = rf"{_DATE_LITERAL_PATTERN}\s*(?:>=|<=|>|<)\s*\b[\w`.]+\b"
+    if re.search(left_cmp, sql, flags=re.IGNORECASE) or re.search(right_cmp, sql, flags=re.IGNORECASE):
+        raise ValueError(
+            "Simple compatibility mode: date filters must use BETWEEN ... AND ... or '=' "
+            "(no >, <, >=, <= with date values)."
+        )
+
+    has_between = bool(
+        re.search(
+            rf"\bbetween\s+{_DATE_LITERAL_PATTERN}\s+and\s+{_DATE_LITERAL_PATTERN}",
+            sql,
+            flags=re.IGNORECASE,
+        )
+    )
+    has_equal_date = bool(
+        re.search(rf"\b[\w`.]+\b\s*=\s*{_DATE_LITERAL_PATTERN}", sql, flags=re.IGNORECASE)
+        or re.search(rf"{_DATE_LITERAL_PATTERN}\s*=\s*\b[\w`.]+\b", sql, flags=re.IGNORECASE)
+    )
+    if not (has_between or has_equal_date):
+        raise ValueError(
+            "Simple compatibility mode: when filtering by date, use either "
+            "`column BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'` or `column = 'YYYY-MM-DD'`."
+        )
 
 
 def _normalize_sql_for_execution(
@@ -1058,6 +1143,7 @@ def _execute_sql_guarded(
     sql: str,
     *,
     read_only: bool,
+    enforce_simple_compat: bool = False,
     max_preview_rows: int = 20,
     max_execution_time: int = 15,
     default_limit: int = 1000,
@@ -1072,6 +1158,8 @@ def _execute_sql_guarded(
             default_limit=default_limit,
             hard_limit_cap=hard_limit_cap,
         )
+        if enforce_simple_compat:
+            _validate_simple_clickhouse_sql(normalized_sql)
     except Exception as exc:
         err = str(exc)
         return {
@@ -2210,17 +2298,18 @@ You must ask for clarification in ALL of these situations. Prefer asking over gu
     "context": {"table": "exact_table_name"}}
 
 CLICKHOUSE INSTRUCTIONS:
-- Use advanced ClickHouse functions when appropriate.
-- For funnels: windowFunnel(). For retention: retention(). For patterns: sequenceMatch().
-- For latest status: argMax(). For top-K: topK(). For unique counts: uniqHLL12().
-- For response times: quantilesTiming(). For JSON: JSONExtract(). For conditionals: sumIf(), countIf().
-- Always write highly optimized SQL.
+- Use SIMPLE and highly compatible ClickHouse SQL only.
+- Prefer: COUNT, SUM, AVG, MIN, MAX, COUNT DISTINCT, ROUND, COALESCE, IF, simple GROUP BY.
+- Avoid advanced/specialized functions: windowFunnel, retention, sequenceMatch, argMax, topK, uniqHLL12, quantiles*, JSONExtract*, sumIf, countIf.
+- Keep SQL straightforward and robust.
 
 DATE HANDLING — CRITICAL:
-- Prefer explicit date ranges with literals and BETWEEN when possible.
-- Avoid expensive transformations on date columns inside WHERE.
-- If a relative period is requested (last 7 days, this month), translate it into a clear and correct SQL date filter.
-- Do not hardcode fixed years unless the user explicitly asked for that period.
+- When filtering by date, ALWAYS use either:
+  1) `date_col BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'`
+  2) `date_col = 'YYYY-MM-DD'`
+- NEVER use date extraction/transformation functions for filtering: no year(), month(), toYear(), toMonth(), date_trunc(), toStartOf*().
+- NEVER use >, <, >=, <= with date literals.
+- If the user asks a relative period, translate it to explicit literal dates and use BETWEEN.
 
 When NOT ambiguous, return ONLY this JSON:
 {
@@ -2303,17 +2392,18 @@ You must ask for clarification in ALL of these situations. Prefer asking over gu
     "context": {{"table": "exact_table_name"}}}}
 
 CLICKHOUSE INSTRUCTIONS:
-- Use advanced ClickHouse functions when appropriate.
-- For funnels: windowFunnel(). For retention: retention(). For patterns: sequenceMatch().
-- For latest status: argMax(). For top-K: topK(). For unique counts: uniqHLL12().
-- For response times: quantilesTiming(). For JSON: JSONExtract(). For conditionals: sumIf(), countIf().
-- Always write highly optimized SQL.
+- Use SIMPLE and highly compatible ClickHouse SQL only.
+- Prefer: COUNT, SUM, AVG, MIN, MAX, COUNT DISTINCT, ROUND, COALESCE, IF, simple GROUP BY.
+- Avoid advanced/specialized functions: windowFunnel, retention, sequenceMatch, argMax, topK, uniqHLL12, quantiles*, JSONExtract*, sumIf, countIf.
+- Keep SQL straightforward and robust.
 
 DATE HANDLING — CRITICAL:
-- Prefer explicit date ranges with literals and BETWEEN when possible.
-- Avoid expensive transformations on date columns inside WHERE.
-- If a relative period is requested (last 7 days, this month), translate it into a clear and correct SQL date filter.
-- Do not hardcode fixed years unless the user explicitly asked for that period.
+- When filtering by date, ALWAYS use either:
+  1) `date_col BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'`
+  2) `date_col = 'YYYY-MM-DD'`
+- NEVER use date extraction/transformation functions for filtering: no year(), month(), toYear(), toMonth(), date_trunc(), toStartOf*().
+- NEVER use >, <, >=, <= with date literals.
+- If the user asks a relative period, translate it to explicit literal dates and use BETWEEN.
 
 SQL QUERY — PRIORITY RULE:
 The SQL query is ALWAYS the primary deliverable. Even for descriptive or analytical questions,
@@ -2834,7 +2924,9 @@ After gathering enough evidence you MUST produce a final answer.
         static_footer = f"""
 
 CLICKHOUSE INSTRUCTIONS:
-- Use advanced ClickHouse functions when appropriate (windowFunnel, retention, argMax, topK, uniqHLL12, quantilesTiming, JSONExtract, sumIf, countIf …).
+- Use SIMPLE and highly compatible ClickHouse SQL only.
+- Prefer: COUNT, SUM, AVG, MIN, MAX, COUNT DISTINCT, ROUND, COALESCE, IF, simple GROUP BY.
+- Avoid advanced/specialized functions: windowFunnel, retention, sequenceMatch, argMax, topK, uniqHLL12, quantiles*, JSONExtract*, sumIf, countIf.
 - SQL MUST remain read-only in this agent: SELECT/SHOW/DESCRIBE/EXPLAIN/WITH only.
 - Always write highly optimised SQL with LIMIT <= 5000.
 - Each query must explore a genuinely distinct angle (different aggregation, filter, dimension, or sub-question).
@@ -2842,10 +2934,12 @@ CLICKHOUSE INSTRUCTIONS:
 - Emit exactly one SQL statement (no semicolon-separated batch).
 
 DATE HANDLING — CRITICAL:
-- Prefer explicit date ranges with literals and BETWEEN when possible.
-- Avoid expensive transformations on date columns inside WHERE.
-- If a relative period is requested (last 7 days, this month), translate it into a clear and correct SQL date filter.
-- Never hardcode fixed years unless the user explicitly asked for that period.
+- When filtering by date, ALWAYS use either:
+  1) `date_col BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'`
+  2) `date_col = 'YYYY-MM-DD'`
+- NEVER use date extraction/transformation functions for filtering: no year(), month(), toYear(), toMonth(), date_trunc(), toStartOf*().
+- NEVER use >, <, >=, <= with date literals.
+- If the user asks a relative period, translate it to explicit literal dates and use BETWEEN.
 
 CURRENT ANALYSIS PROGRESS ({effective_used}/{MAX_AGENT_STEPS} steps used):
 {steps_context if steps_context else "None yet — this is the first step."}
@@ -3067,8 +3161,12 @@ PREVIOUS STEPS FOR CONTEXT:
 RULES:
 - Read-only SQL only: SELECT/SHOW/DESCRIBE/EXPLAIN/WITH.
 - Use FEWER and SIMPLER functions when fixing technical errors.
+- Use only simple compatible functions: COUNT, SUM, AVG, MIN, MAX, COUNT DISTINCT, ROUND, COALESCE, IF.
+- Do NOT use: windowFunnel, retention, sequenceMatch, argMax, topK, uniqHLL12, quantiles*, JSONExtract*, sumIf, countIf.
 - Avoid nested complexity unless strictly required.
-- Prefer clear date ranges and avoid expensive date transforms in WHERE.
+- For date filters use only: BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD' or = 'YYYY-MM-DD'.
+- No year()/month()/toYear()/toMonth()/date_trunc()/toStartOf*() in filters.
+- No >, <, >=, <= with date literals.
 - Add LIMIT 200 if not present; never exceed LIMIT 5000.
 - Return exactly one SQL statement.
 
@@ -3094,6 +3192,7 @@ Respond ONLY with valid JSON (no markdown):
         return _execute_sql_guarded(
             sql,
             read_only=True,
+            enforce_simple_compat=True,
             max_preview_rows=max_rows,
             max_execution_time=15,
             default_limit=1000,
