@@ -101,6 +101,31 @@ interface DQResult {
   column_stats: ColumnStat[];
   analysis: DQAnalysis;
   volume_analysis?: VolumeAnalysis | null;
+  llm_plan?: DQLlmPlan;
+}
+
+interface DQLlmPlan {
+  raw_context_window_tokens?: number;
+  effective_context_window_tokens?: number;
+  token_budget_per_call?: number;
+  estimated_total_synthesis_tokens?: number;
+  estimated_total_prompt_tokens?: number;
+  estimated_calls_ratio?: number;
+  estimated_calls?: number;
+  estimated_prompt_tokens_per_call?: number[];
+  columns_per_call?: number[];
+  executed_calls?: number;
+}
+
+interface DQPrepareResponse {
+  status: 'awaiting_llm_approval';
+  approval_required: boolean;
+  prepared_run_id: string;
+  table: string;
+  sample_size: number | null;
+  columns_count: number;
+  llm_plan: DQLlmPlan;
+  message: string;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -213,9 +238,12 @@ export function DataQualityPane() {
 
   const [selectedTable, setSelectedTable] = useState('');
   const [selectedColumns, setSelectedColumns] = useState<string[]>([]);
+  const [columnSearch, setColumnSearch] = useState('');
   const [sampleSize, setSampleSize] = useState<number | null>(50000);
   const [tableSearch, setTableSearch] = useState('');
+  const [isPlanning, setIsPlanning] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [pendingPlan, setPendingPlan] = useState<DQPrepareResponse | null>(null);
   const [result, setResult] = useState<DQResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [expandedColumns, setExpandedColumns] = useState<Set<string>>(new Set());
@@ -234,6 +262,14 @@ export function DataQualityPane() {
     : allTables;
 
   const tableColumns = selectedTable ? (schema[selectedTable] ?? []) : [];
+  const filteredColumns = columnSearch.trim()
+    ? tableColumns.filter(col => {
+      const q = columnSearch.toLowerCase().trim();
+      return col.name.toLowerCase().includes(q) || String(col.type || '').toLowerCase().includes(q);
+    })
+    : tableColumns;
+  const visibleColumnNames = filteredColumns.map(c => c.name);
+  const isBusy = isPlanning || isAnalyzing;
 
   const toggleColumn = (col: string) => {
     setSelectedColumns(prev =>
@@ -245,6 +281,10 @@ export function DataQualityPane() {
     setSelectedColumns(tableColumns.map(c => c.name));
   };
 
+  const selectVisibleColumns = () => {
+    setSelectedColumns(visibleColumnNames);
+  };
+
   const toggleExpandedColumn = (col: string) => {
     setExpandedColumns(prev => {
       const next = new Set(prev);
@@ -253,13 +293,7 @@ export function DataQualityPane() {
     });
   };
 
-  const handleAnalyze = async () => {
-    if (!selectedTable || selectedColumns.length === 0) return;
-    setIsAnalyzing(true);
-    setError(null);
-    setResult(null);
-    setExpandedColumns(new Set());
-
+  const buildAnalyzePayload = () => {
     const body: Record<string, unknown> = {
       table: selectedTable,
       columns: selectedColumns,
@@ -276,18 +310,54 @@ export function DataQualityPane() {
     if (timeColumn) {
       body.time_column = timeColumn;
     }
+    return body;
+  };
 
+  const handleAnalyze = async () => {
+    if (!selectedTable || selectedColumns.length === 0) return;
+    setIsPlanning(true);
+    setError(null);
+    setResult(null);
+    setPendingPlan(null);
+    setExpandedColumns(new Set());
+
+    try {
+      const res = await fetch('/api/data-quality/plan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(buildAnalyzePayload()),
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      setPendingPlan(data);
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setIsPlanning(false);
+    }
+  };
+
+  const handleRunPrepared = async (approved: boolean) => {
+    const currentPlan = pendingPlan;
+    setPendingPlan(null);
+    if (!currentPlan) return;
+    if (!approved) return;
+
+    setIsAnalyzing(true);
+    setError(null);
     try {
       const res = await fetch('/api/data-quality/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        body: JSON.stringify({
+          prepared_run_id: currentPlan.prepared_run_id,
+          llm_approval: 'OUI',
+        }),
       });
       const data = await res.json();
       if (data.error) throw new Error(data.error);
       setResult(data);
-      // auto-expand all columns
-      setExpandedColumns(new Set(selectedColumns));
+      setExpandedColumns(new Set((data.column_stats || []).map((s: ColumnStat) => s.column)));
     } catch (e: any) {
       setError(e.message);
     } finally {
@@ -456,7 +526,17 @@ export function DataQualityPane() {
                 filteredTables.map(t => (
                   <button
                     key={t}
-                    onClick={() => { setSelectedTable(t); setSelectedColumns([]); setResult(null); setFilterColumn(''); setFilterValue(''); setFilterValue2(''); setTimeColumn(''); }}
+                    onClick={() => {
+                      setSelectedTable(t);
+                      setSelectedColumns([]);
+                      setColumnSearch('');
+                      setPendingPlan(null);
+                      setResult(null);
+                      setFilterColumn('');
+                      setFilterValue('');
+                      setFilterValue2('');
+                      setTimeColumn('');
+                    }}
                     className={clsx(
                       'w-full text-left flex items-center gap-2 px-3 py-2 text-xs transition-colors',
                       selectedTable === t
@@ -482,29 +562,48 @@ export function DataQualityPane() {
                 <div className="flex gap-1">
                   <button onClick={selectAllColumns} className="text-xs text-violet-600 hover:underline">All</button>
                   <span className="text-slate-300">·</span>
+                  <button onClick={selectVisibleColumns} className="text-xs text-violet-600 hover:underline">Visible</button>
+                  <span className="text-slate-300">·</span>
                   <button onClick={() => setSelectedColumns([])} className="text-xs text-slate-500 hover:underline">None</button>
                 </div>
               </div>
+              <div className="relative">
+                <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
+                <input
+                  type="text"
+                  value={columnSearch}
+                  onChange={e => setColumnSearch(e.target.value)}
+                  placeholder="Search columns…"
+                  className="w-full pl-8 pr-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:ring-2 focus:ring-violet-500/20 focus:border-violet-500 transition-all"
+                />
+              </div>
+              <p className="text-[10px] text-slate-400">
+                {filteredColumns.length} visible column{filteredColumns.length > 1 ? 's' : ''} on {tableColumns.length}
+              </p>
               <div className="max-h-56 overflow-y-auto border border-slate-200 rounded-xl bg-white divide-y divide-slate-50">
-                {tableColumns.map(col => (
-                  <button
-                    key={col.name}
-                    onClick={() => toggleColumn(col.name)}
-                    className={clsx(
-                      'w-full text-left flex items-center gap-2 px-3 py-2 text-xs transition-colors',
-                      selectedColumns.includes(col.name) ? 'bg-violet-50' : 'hover:bg-slate-50'
-                    )}
-                  >
-                    <div className={clsx(
-                      'w-3.5 h-3.5 rounded border-2 shrink-0 flex items-center justify-center',
-                      selectedColumns.includes(col.name) ? 'bg-violet-500 border-violet-500' : 'border-slate-300'
-                    )}>
-                      {selectedColumns.includes(col.name) && <CheckCircle2 size={9} className="text-white" />}
-                    </div>
-                    <span className={clsx('font-mono truncate', selectedColumns.includes(col.name) ? 'text-violet-700 font-semibold' : 'text-slate-700')}>{col.name}</span>
-                    <span className="ml-auto text-slate-400 font-mono text-[10px] shrink-0">{col.type}</span>
-                  </button>
-                ))}
+                {filteredColumns.length === 0 ? (
+                  <p className="text-xs text-slate-400 p-3 text-center">No column match.</p>
+                ) : (
+                  filteredColumns.map(col => (
+                    <button
+                      key={col.name}
+                      onClick={() => toggleColumn(col.name)}
+                      className={clsx(
+                        'w-full text-left flex items-center gap-2 px-3 py-2 text-xs transition-colors',
+                        selectedColumns.includes(col.name) ? 'bg-violet-50' : 'hover:bg-slate-50'
+                      )}
+                    >
+                      <div className={clsx(
+                        'w-3.5 h-3.5 rounded border-2 shrink-0 flex items-center justify-center',
+                        selectedColumns.includes(col.name) ? 'bg-violet-500 border-violet-500' : 'border-slate-300'
+                      )}>
+                        {selectedColumns.includes(col.name) && <CheckCircle2 size={9} className="text-white" />}
+                      </div>
+                      <span className={clsx('font-mono truncate', selectedColumns.includes(col.name) ? 'text-violet-700 font-semibold' : 'text-slate-700')}>{col.name}</span>
+                      <span className="ml-auto text-slate-400 font-mono text-[10px] shrink-0">{col.type}</span>
+                    </button>
+                  ))
+                )}
               </div>
             </div>
           )}
@@ -666,16 +765,18 @@ export function DataQualityPane() {
         <div className="p-4 border-t border-slate-200">
           <button
             onClick={handleAnalyze}
-            disabled={!selectedTable || selectedColumns.length === 0 || isAnalyzing}
+            disabled={!selectedTable || selectedColumns.length === 0 || isBusy}
             className="w-full flex items-center justify-center gap-2 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white py-3 rounded-xl text-sm font-semibold transition-colors shadow-sm"
           >
-            {isAnalyzing ? (
+            {isPlanning ? (
+              <><Loader2 size={16} className="animate-spin" /> Estimating LLM calls…</>
+            ) : isAnalyzing ? (
               <><Loader2 size={16} className="animate-spin" /> Analyzing…</>
             ) : (
               <><BarChart3 size={16} /> Analyze Data Quality</>
             )}
           </button>
-          {selectedColumns.length > 0 && !isAnalyzing && (
+          {selectedColumns.length > 0 && !isBusy && (
             <p className="text-center text-xs text-slate-400 mt-2">
               {selectedColumns.length} column{selectedColumns.length > 1 ? 's' : ''} · {sampleSize === null ? 'full scan' : `${sampleSize.toLocaleString()} rows`}
             </p>
@@ -686,7 +787,7 @@ export function DataQualityPane() {
       {/* ── Right panel: results ───────────────────────────────────────────── */}
       <div className="flex-1 overflow-y-auto bg-slate-50">
         {/* Empty state */}
-        {!isAnalyzing && !result && !error && (
+        {!isBusy && !result && !error && (
           <div className="flex flex-col items-center justify-center h-full text-center space-y-4 p-8">
             <div className="w-16 h-16 bg-violet-100 rounded-full flex items-center justify-center text-violet-500">
               <ShieldCheck size={28} />
@@ -718,12 +819,18 @@ export function DataQualityPane() {
         )}
 
         {/* Loading */}
-        {isAnalyzing && (
+        {isBusy && (
           <div className="flex flex-col items-center justify-center h-full space-y-4">
             <Loader2 size={36} className="animate-spin text-violet-500" />
             <div className="text-center">
-              <p className="font-semibold text-slate-700">Running analysis…</p>
-              <p className="text-xs text-slate-500 mt-1">Collecting statistics + calling LLM for anomaly detection</p>
+              <p className="font-semibold text-slate-700">
+                {isPlanning ? 'Estimating local LLM workload…' : 'Running analysis…'}
+              </p>
+              <p className="text-xs text-slate-500 mt-1">
+                {isPlanning
+                  ? 'Profiling selected columns and computing token-aware LLM call batches'
+                  : 'Collecting statistics + calling LLM for anomaly detection'}
+              </p>
             </div>
           </div>
         )}
@@ -745,7 +852,7 @@ export function DataQualityPane() {
         )}
 
         {/* Results */}
-        {result && !isAnalyzing && (
+      {result && !isBusy && (
           <div className="p-6 space-y-6 max-w-5xl mx-auto">
             {/* Summary header */}
             <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-6">
@@ -796,6 +903,12 @@ export function DataQualityPane() {
                   <p className="text-xs text-slate-500">Columns</p>
                   <p className="text-sm font-bold text-slate-800">{result.column_stats.length}</p>
                 </div>
+                {result.llm_plan?.executed_calls != null && (
+                  <div className="bg-slate-50 rounded-xl px-4 py-2 text-center">
+                    <p className="text-xs text-slate-500">LLM calls</p>
+                    <p className="text-sm font-bold text-slate-800">{result.llm_plan.executed_calls}</p>
+                  </div>
+                )}
                 <div className={clsx('rounded-xl px-4 py-2 text-center', criticalCount > 0 ? 'bg-red-50' : 'bg-slate-50')}>
                   <p className="text-xs text-slate-500">Critical issues</p>
                   <p className={clsx('text-sm font-bold', criticalCount > 0 ? 'text-red-600' : 'text-slate-800')}>{criticalCount}</p>
@@ -1051,6 +1164,59 @@ export function DataQualityPane() {
           </div>
         )}
       </div>
+
+      {pendingPlan && (
+        <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-[1px] flex items-center justify-center p-4">
+          <div className="w-full max-w-xl bg-white rounded-2xl border border-slate-200 shadow-xl overflow-hidden">
+            <div className="px-5 py-4 border-b border-slate-200">
+              <h4 className="text-sm font-bold text-slate-800">Autoriser les appels LLM locaux ?</h4>
+              <p className="text-xs text-slate-500 mt-1 leading-relaxed">
+                Cette analyse prévoit <strong>{pendingPlan.llm_plan?.estimated_calls ?? pendingPlan.llm_plan?.estimated_calls_ratio ?? 1} appel(s)</strong> successif(s) au modèle local.
+                Confirmez avant exécution.
+              </p>
+            </div>
+            <div className="p-5 space-y-3">
+              <div className="grid grid-cols-2 gap-2">
+                <div className="bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
+                  <p className="text-[10px] text-slate-500">Context window (raw)</p>
+                  <p className="text-xs font-semibold text-slate-700">{pendingPlan.llm_plan?.raw_context_window_tokens?.toLocaleString() ?? '—'} tokens</p>
+                </div>
+                <div className="bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
+                  <p className="text-[10px] text-slate-500">Context usable</p>
+                  <p className="text-xs font-semibold text-slate-700">{pendingPlan.llm_plan?.effective_context_window_tokens?.toLocaleString() ?? '—'} tokens</p>
+                </div>
+                <div className="bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
+                  <p className="text-[10px] text-slate-500">Estimated synthesis</p>
+                  <p className="text-xs font-semibold text-slate-700">{pendingPlan.llm_plan?.estimated_total_synthesis_tokens?.toLocaleString() ?? '—'} tokens</p>
+                </div>
+                <div className="bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
+                  <p className="text-[10px] text-slate-500">Token budget / call</p>
+                  <p className="text-xs font-semibold text-slate-700">{pendingPlan.llm_plan?.token_budget_per_call?.toLocaleString() ?? '—'} tokens</p>
+                </div>
+              </div>
+              {pendingPlan.llm_plan?.columns_per_call && pendingPlan.llm_plan.columns_per_call.length > 0 && (
+                <p className="text-[11px] text-slate-500">
+                  Grouping: {pendingPlan.llm_plan.columns_per_call.map((n, i) => `Call ${i + 1}: ${n} col.`).join(' · ')}
+                </p>
+              )}
+            </div>
+            <div className="px-5 py-4 border-t border-slate-200 bg-slate-50 flex items-center justify-end gap-2">
+              <button
+                onClick={() => handleRunPrepared(false)}
+                className="px-3 py-1.5 text-xs font-semibold text-slate-600 border border-slate-300 rounded-lg hover:bg-slate-100 transition-colors"
+              >
+                NON
+              </button>
+              <button
+                onClick={() => handleRunPrepared(true)}
+                className="px-3 py-1.5 text-xs font-semibold text-white bg-violet-600 rounded-lg hover:bg-violet-700 transition-colors"
+              >
+                OUI, lancer l’analyse
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

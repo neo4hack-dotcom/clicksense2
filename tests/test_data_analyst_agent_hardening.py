@@ -1,4 +1,5 @@
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -50,15 +51,66 @@ class _LargeRowsClient:
         return None
 
 
+class _CommandRecorderClient:
+    def __init__(self):
+        self.commands = []
+
+    def query(self, sql, settings=None):
+        _ = sql
+        _ = settings
+        return _FakeResult(rows=[], cols=[])
+
+    def command(self, sql):
+        self.commands.append(sql)
+        return None
+
+
+class _DQClient:
+    def __init__(self, columns):
+        self.columns = columns
+
+    def query(self, sql, settings=None):
+        _ = settings
+        q = " ".join(str(sql).split())
+        if q.startswith("DESCRIBE TABLE"):
+            return _FakeResult(rows=[(c, "String") for c in self.columns], cols=["name", "type"])
+        if "count() AS total" in q and "approx_distinct" in q:
+            return _FakeResult(rows=[(1000, 42, 120)], cols=["total", "null_count", "approx_distinct"])
+        if "min(length(" in q and "avg(length(" in q:
+            return _FakeResult(
+                rows=[(8, 1, 120, 14.5, 2, 6, 18, 12, 4)],
+                cols=[
+                    "empty_count", "min_length", "max_length", "avg_length", "very_long_count",
+                    "whitespace_padded_count", "all_caps_count", "numeric_string_count", "email_like_count",
+                ],
+            )
+        if "lower(toString(" in q and "sentinel" not in q:
+            return _FakeResult(rows=[(5,)], cols=["sentinel_count"])
+        if "GROUP BY" in q and "ORDER BY cnt DESC LIMIT 10" in q:
+            return _FakeResult(rows=[("A", 120), ("B", 80), ("C", 40)], cols=["val", "cnt"])
+        # Fallback for any optional date/time-volume query paths
+        return _FakeResult(rows=[(0,)], cols=["v"])
+
+    def command(self, sql):
+        _ = sql
+        return None
+
+
 @pytest.fixture(autouse=True)
 def _reset_model_cache():
     server._model_context_cache.clear()
+    server._writer_sessions.clear()
+    with server._dq_prepared_runs_lock:
+        server._dq_prepared_runs.clear()
     with server._data_analyst_sessions_lock:
         server._data_analyst_sessions.clear()
     with server._data_wrangling_sessions_lock:
         server._data_wrangling_sessions.clear()
     yield
     server._model_context_cache.clear()
+    server._writer_sessions.clear()
+    with server._dq_prepared_runs_lock:
+        server._dq_prepared_runs.clear()
     with server._data_analyst_sessions_lock:
         server._data_analyst_sessions.clear()
     with server._data_wrangling_sessions_lock:
@@ -506,6 +558,41 @@ def test_summarize_executive_backfills_when_llm_returns_few_bullets(client, monk
     assert len(payload["bullets"]) == 7
 
 
+def test_clickhouse_writer_security_blocks_non_bot_drop_and_multi_drop():
+    ok, reason = server._cw_is_sql_safe("DROP TABLE users")
+    assert ok is False
+    assert "BOT_" in reason
+
+    ok_multi, reason_multi = server._cw_is_sql_safe("DROP TABLE BOT_tmp, users")
+    assert ok_multi is False
+    assert "multi-cibles" in reason_multi
+
+    ok_bot, _ = server._cw_is_sql_safe("DROP TABLE IF EXISTS BOT_tmp")
+    assert ok_bot is True
+
+
+def test_clickhouse_writer_cleanup_drops_only_bot_tables(client, monkeypatch):
+    recorder = _CommandRecorderClient()
+    monkeypatch.setattr(server, "get_clickhouse_client", lambda: recorder)
+
+    session_id = "writer-cleanup-1"
+    server._writer_sessions[session_id] = {
+        "created_tables": ["BOT_tmp_sales", "users", "BOT_ETL_stage"],
+        "database": "default",
+    }
+
+    resp = client.post(
+        "/api/agents/clickhouse-writer/cleanup",
+        json={"session_id": session_id},
+    )
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert sorted(payload["dropped"]) == ["BOT_ETL_stage", "BOT_tmp_sales"]
+    assert payload["skipped_non_bot"] == ["users"]
+    assert len(recorder.commands) == 2
+    assert all("BOT_" in cmd for cmd in recorder.commands)
+
+
 def test_resolve_sql_memory_placeholders_supports_last_alias_and_unknown_refs():
     memory = {
         "artifacts": {
@@ -568,3 +655,91 @@ def test_wrangling_detect_batch_anomalies_flags_duplicate_id_and_bad_email():
     issue_types = {a["issue_type"] for a in anomalies}
     assert "duplicate_primary_id" in issue_types
     assert "invalid_email_format" in issue_types
+
+
+def test_data_quality_plan_estimates_token_aware_llm_calls(client, monkeypatch):
+    columns = [f"col_{i}" for i in range(1, 15)]
+    monkeypatch.setattr(server, "get_clickhouse_client", lambda: _DQClient(columns))
+    monkeypatch.setattr(server, "_get_model_context_limit", lambda: 4096)
+    monkeypatch.setattr(server, "_get_effective_context_limit", lambda: 1500)
+
+    resp = client.post(
+        "/api/data-quality/plan",
+        json={"table": "events", "columns": columns, "sample_size": 10000},
+    )
+    assert resp.status_code == 200
+    payload = resp.get_json()
+
+    assert payload["status"] == "awaiting_llm_approval"
+    assert payload["approval_required"] is True
+    assert payload["prepared_run_id"].startswith("dq_")
+    assert payload["columns_count"] == len(columns)
+    assert payload["llm_plan"]["estimated_calls"] >= 2
+    assert payload["llm_plan"]["estimated_total_synthesis_tokens"] > 0
+    assert len(payload["llm_plan"]["columns_per_call"]) == payload["llm_plan"]["estimated_calls"]
+
+
+def test_data_quality_analyze_requires_approval_then_runs_prepared_batches(client, monkeypatch):
+    columns = [f"col_{i}" for i in range(1, 13)]
+    monkeypatch.setattr(server, "get_clickhouse_client", lambda: _DQClient(columns))
+    monkeypatch.setattr(server, "_get_model_context_limit", lambda: 4096)
+    monkeypatch.setattr(server, "_get_effective_context_limit", lambda: 1500)
+
+    llm_calls = {"count": 0}
+
+    def _fake_llm(system_prompt, messages, temperature=0.7, language=None):
+        _ = system_prompt
+        _ = temperature
+        _ = language
+        llm_calls["count"] += 1
+        content = messages[-1]["content"]
+        names = []
+        for name in re.findall(r'"column"\s*:\s*"([^"]+)"', content):
+            if name not in names:
+                names.append(name)
+        if not names:
+            names = columns[:4]
+        return json.dumps(
+            {
+                "summary": "Batch assessed.",
+                "quality_score": 88,
+                "columns": [
+                    {"column": c, "quality_score": 90, "issues": [], "insights": "Looks consistent."}
+                    for c in names
+                ],
+                "recommendations": ["Standardize sentinel values."],
+            }
+        )
+
+    monkeypatch.setattr(server, "_call_llm", _fake_llm)
+
+    plan_resp = client.post(
+        "/api/data-quality/plan",
+        json={"table": "events", "columns": columns, "sample_size": 10000},
+    )
+    assert plan_resp.status_code == 200
+    plan = plan_resp.get_json()
+    run_id = plan["prepared_run_id"]
+
+    blocked = client.post("/api/data-quality/analyze", json={"prepared_run_id": run_id})
+    assert blocked.status_code == 400
+    blocked_payload = blocked.get_json()
+    assert blocked_payload["approval_required"] is True
+
+    ok = client.post(
+        "/api/data-quality/analyze",
+        json={"prepared_run_id": run_id, "llm_approval": "OUI"},
+    )
+    assert ok.status_code == 200
+    payload = ok.get_json()
+    assert payload["table"] == "events"
+    assert payload["analysis"]["summary"]
+    assert len(payload["analysis"]["columns"]) == len(columns)
+    assert payload["llm_plan"]["executed_calls"] == plan["llm_plan"]["estimated_calls"]
+    assert llm_calls["count"] == payload["llm_plan"]["executed_calls"]
+
+    expired = client.post(
+        "/api/data-quality/analyze",
+        json={"prepared_run_id": run_id, "llm_approval": "OUI"},
+    )
+    assert expired.status_code == 404
