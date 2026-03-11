@@ -775,6 +775,8 @@ export function ChatPane() {
         tableMetadata,
         tableMappingFilter: selectedTableMappings,
         maxSteps: agentMaxSteps,
+        use_knowledge_base: useKnowledgeBase,
+        use_knowledge_agent: useKnowledgeBase,
       };
       if (confirmedTables && confirmedTables.length > 0) {
         body.confirmedTables = confirmedTables;
