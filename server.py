@@ -2887,31 +2887,50 @@ def summarize_executive():
     data = request.get_json(silent=True) or {}
     text = (data.get("text") or "").strip()
     lang = data.get("lang", "fr")
+    count = max(5, min(10, _parse_int_like(data.get("count", 5), 5)))
+    functional_focus = _coerce_bool_any(
+        data.get("functional_focus", data.get("functionalFocus", False)),
+        False,
+    )
 
     if not text:
         return jsonify({"error": "No text provided."}), 400
 
     system_prompt = (
         "You are an expert executive analyst. Your task is to distill a detailed "
-        "analysis report into exactly 5 concise bullet points for a C-level audience. "
+        f"analysis report into exactly {count} concise bullet points for a C-level audience. "
         "For each point, identify if it contains a risk or warning flag. "
         "Reply ONLY with valid JSON — no markdown, no extra text."
     )
 
     if lang == "fr":
+        focus_note = (
+            "Priorise fortement la lecture FONCTIONNELLE: explique les implications métier, "
+            "les déductions opérationnelles et les conclusions fonctionnelles."
+            if functional_focus
+            else ""
+        )
         format_instruction = (
-            "Réponds en FRANÇAIS. Rédige exactement 5 points synthétiques en langage "
+            f"Réponds en FRANÇAIS. Rédige exactement {count} points synthétiques en langage "
             "de comité exécutif. Pour chaque point indique s'il constitue un risque/point "
             "d'attention (risk: true/false) et sa sévérité (severity: 'high', 'medium' ou 'info').\n"
+            f"{focus_note + chr(10) if focus_note else ''}"
             "Format JSON attendu:\n"
             '{"preamble": "Phrase introductive courte.", "bullets": ['
             '{"point": "Texte du bullet point", "risk": false, "severity": "info"}, ...]}'
         )
     else:
+        focus_note = (
+            "Strongly prioritize FUNCTIONAL/business interpretation: implications, operational deductions, "
+            "and business conclusions."
+            if functional_focus
+            else ""
+        )
         format_instruction = (
-            "Write in ENGLISH. Draft exactly 5 concise bullet points in executive committee "
+            f"Write in ENGLISH. Draft exactly {count} concise bullet points in executive committee "
             "language. For each point indicate if it is a risk/watch point (risk: true/false) "
             "and its severity (severity: 'high', 'medium' or 'info').\n"
+            f"{focus_note + chr(10) if focus_note else ''}"
             "Expected JSON format:\n"
             '{"preamble": "Short introductory sentence.", "bullets": ['
             '{"point": "Bullet point text", "risk": false, "severity": "info"}, ...]}'
@@ -2929,18 +2948,45 @@ def summarize_executive():
             result = json.loads(m.group(0)) if m else {}
 
         bullets = result.get("bullets", [])
-        # Ensure exactly 5 bullets and normalize fields
+        # Ensure requested bullet count and normalize fields
         normalized = []
-        for b in bullets[:5]:
+        for b in bullets[:count]:
             if isinstance(b, dict):
                 normalized.append({
                     "point": str(b.get("point", "")),
                     "risk": bool(b.get("risk", False)),
                     "severity": b.get("severity", "info") if b.get("severity") in ("high", "medium", "info") else "info",
                 })
+        if len(normalized) < count:
+            chunks = re.split(r"(?<=[\.\!\?])\s+", text)
+            for chunk in chunks:
+                c = str(chunk or "").strip()
+                if not c:
+                    continue
+                normalized.append({
+                    "point": c[:240],
+                    "risk": False,
+                    "severity": "info",
+                })
+                if len(normalized) >= count:
+                    break
+        while len(normalized) < count:
+            idx = len(normalized) + 1
+            normalized.append({
+                "point": (
+                    f"Point complémentaire {idx}: confirmer l'impact fonctionnel avec une vérification ciblée."
+                    if lang == "fr"
+                    else f"Additional point {idx}: validate functional impact with a targeted follow-up check."
+                ),
+                "risk": False,
+                "severity": "info",
+            })
+        normalized = normalized[:count]
         return jsonify({
             "preamble": str(result.get("preamble", "")),
             "bullets": normalized,
+            "requested_count": count,
+            "actual_count": len(normalized),
         })
     except Exception as exc:
         return jsonify({"error": f"LLM error: {exc}"}), 500
@@ -3076,6 +3122,76 @@ Réponds UNIQUEMENT avec du JSON valide (sans markdown) :
     return {"tables": [], "needs_selection": True, "candidates": all_table_names}
 
 
+_KNOWLEDGE_MODE_CONTEXT_ONCE = "kb_context_once"
+_KNOWLEDGE_MODE_AGENTIC = "kb_agentic"
+_KNOWLEDGE_MODE_SCHEMA_ONLY = "schema_only"
+_KNOWLEDGE_MODE_MINIMAL = "minimal"
+
+
+def _coerce_bool_any(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "oui"}
+    return bool(value)
+
+
+def _normalize_knowledge_mode(raw_mode) -> str:
+    txt = str(raw_mode or "").strip().lower()
+    aliases = {
+        _KNOWLEDGE_MODE_CONTEXT_ONCE: _KNOWLEDGE_MODE_CONTEXT_ONCE,
+        "context_once": _KNOWLEDGE_MODE_CONTEXT_ONCE,
+        "default": _KNOWLEDGE_MODE_CONTEXT_ONCE,
+        "standard": _KNOWLEDGE_MODE_CONTEXT_ONCE,
+        _KNOWLEDGE_MODE_AGENTIC: _KNOWLEDGE_MODE_AGENTIC,
+        "agentic": _KNOWLEDGE_MODE_AGENTIC,
+        "knowledge_agent": _KNOWLEDGE_MODE_AGENTIC,
+        _KNOWLEDGE_MODE_SCHEMA_ONLY: _KNOWLEDGE_MODE_SCHEMA_ONLY,
+        "schema_only_no_kb": _KNOWLEDGE_MODE_SCHEMA_ONLY,
+        "no_kb_schema": _KNOWLEDGE_MODE_SCHEMA_ONLY,
+        _KNOWLEDGE_MODE_MINIMAL: _KNOWLEDGE_MODE_MINIMAL,
+        "minimal_no_context": _KNOWLEDGE_MODE_MINIMAL,
+        "no_kb_no_context": _KNOWLEDGE_MODE_MINIMAL,
+    }
+    return aliases.get(txt, "")
+
+
+def _resolve_knowledge_mode_flags(
+    *,
+    knowledge_mode_raw,
+    use_knowledge_base_raw,
+    use_knowledge_agent_raw,
+) -> tuple[str, bool, bool]:
+    mode = _normalize_knowledge_mode(knowledge_mode_raw)
+    if not mode:
+        use_knowledge_base = _coerce_bool_any(use_knowledge_base_raw, True)
+        use_knowledge_agent = _coerce_bool_any(use_knowledge_agent_raw, False)
+        if use_knowledge_base and not use_knowledge_agent:
+            mode = _KNOWLEDGE_MODE_CONTEXT_ONCE
+        elif use_knowledge_base and use_knowledge_agent:
+            mode = _KNOWLEDGE_MODE_AGENTIC
+        elif (not use_knowledge_base) and (not use_knowledge_agent):
+            mode = _KNOWLEDGE_MODE_SCHEMA_ONLY
+        else:
+            mode = _KNOWLEDGE_MODE_MINIMAL
+
+    mapping = {
+        _KNOWLEDGE_MODE_CONTEXT_ONCE: (True, False),
+        _KNOWLEDGE_MODE_AGENTIC: (True, True),
+        _KNOWLEDGE_MODE_SCHEMA_ONLY: (False, False),
+        _KNOWLEDGE_MODE_MINIMAL: (False, True),
+    }
+    use_knowledge_base, use_knowledge_agent = mapping.get(
+        mode,
+        mapping[_KNOWLEDGE_MODE_CONTEXT_ONCE],
+    )
+    return mode, use_knowledge_base, use_knowledge_agent
+
+
 @app.route("/api/agent", methods=["POST"])
 def agent_analysis():
     """Orchestrated multi-step analysis: the LLM autonomously decides which
@@ -3097,24 +3213,12 @@ def agent_analysis():
     table_mapping_filter = data.get("tableMappingFilter", [])
     # Tables explicitly confirmed by the user via the selection UI (skips auto-identification)
     confirmed_tables = data.get("confirmedTables", [])
-    # Chat UI flags (robust parsing for bool/string/int payloads)
-    def _as_bool(value, default: bool = False) -> bool:
-        if value is None:
-            return default
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, (int, float)):
-            return bool(value)
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "on"}
-        return bool(value)
-
-    use_knowledge_base = _as_bool(data.get("use_knowledge_base", True), True)
-    # "knowledge agent" mode: do not inject static context in prompts.
-    use_knowledge_agent = _as_bool(
-        data.get("use_knowledge_agent", data.get("useKnowledgeAgent", False)),
-        False,
+    knowledge_mode, use_knowledge_base, use_knowledge_agent = _resolve_knowledge_mode_flags(
+        knowledge_mode_raw=data.get("knowledge_mode", data.get("knowledgeMode", "")),
+        use_knowledge_base_raw=data.get("use_knowledge_base", True),
+        use_knowledge_agent_raw=data.get("use_knowledge_agent", data.get("useKnowledgeAgent", False)),
     )
+    # "knowledge agent" mode: do not inject static context in prompts.
     no_prompt_context_injection = use_knowledge_agent
     control_session_id = str(data.get("control_session_id", "")).strip()
 
@@ -3452,17 +3556,38 @@ Return ONLY JSON:
             max_steps=12,
             max_result_chars=240,
         )
-        synth_prompt = f"""Based on the following evidence, write a final answer.
+        synth_prompt = f"""You are a senior business data analyst.
+Write a clear and professional final answer with strong FUNCTIONAL focus.
+Use the same language as the USER QUESTION.
 
 USER QUESTION: {user_question}
 
 STEPS AND RESULTS:
 {chr(10).join(detailed_lines)}
 
+Output structure (plain text section titles, no markdown markers):
+Résumé exécutif:
+Short executive summary for decision-makers.
+
+Explications fonctionnelles:
+Explain business meaning of observed patterns (process, product, revenue, risk, operations).
+
+Déductions et conclusions fonctionnelles:
+List key deductions and functional conclusions, each tied to evidence.
+
+Faits chiffrés et preuves:
+List quantified facts and references to step evidence.
+
+Recommandations actionnables:
+Pragmatic next actions ordered by priority.
+
+Niveau de confiance et limites:
+State confidence and important caveats.
+
 Requirements:
-- Be explicit about confidence level and evidence quality.
-- If data is missing or inconclusive, say it clearly.
-- Provide concise next best actions."""
+- Prioritize functional interpretation, not only numbers.
+- Connect conclusions to explicit evidence from the steps.
+- If data is missing or inconclusive, say it clearly."""
         context_limit = _get_effective_context_limit()
         if _estimate_tokens(synth_prompt) > context_limit:
             compact_lines = _build_synthesis_evidence_lines(
@@ -3471,12 +3596,14 @@ Requirements:
                 max_result_chars=120,
             )
             synth_prompt = f"""Write a concise final answer from this compact evidence.
+Use the same language as the USER QUESTION.
 
 USER QUESTION: {user_question}
 EVIDENCE:
 {chr(10).join(compact_lines)}
 
 Requirements:
+- Keep a clear functional/business focus.
 - Mention confidence level.
 - Mention gaps/limitations.
 - Give next best actions."""
@@ -3496,7 +3623,7 @@ Requirements:
                 max_result_chars=80,
             )
             emergency_prompt = (
-                "Write final answer in 5 short bullets from minimal evidence only.\n\n"
+                "Write final answer in 5 short bullets with functional focus from minimal evidence only.\n\n"
                 f"USER QUESTION: {user_question}\n"
                 "EVIDENCE:\n"
                 + "\n".join(compact_lines)
@@ -3716,6 +3843,10 @@ REACT DISCIPLINE:
 - For action "query", explicitly include a hypothesis and expected signal before SQL execution.
 - If the previous query failed or was weak, first explain how the next action corrects trajectory.
 
+FINAL ANSWER QUALITY:
+- The final answer must remain professional and detailed with a strong functional/business focus.
+- Include functional explanations, deductions, and business conclusions in addition to factual metrics.
+
 WORKING MEMORY (TRANSIENT, FOR MULTI-HOP RETRIEVAL):
 {working_memory_block}
 - You may reuse stored ID sets with SQL placeholders (best used inside IN (...)):
@@ -3765,7 +3896,7 @@ For the final answer:
 {{
   "action": "finish",
   "reasoning": "Why you have enough information to conclude",
-  "final_answer": "A detailed, structured answer for the user based on all gathered information"
+  "final_answer": "A detailed, structured answer with functional explanations, deductions, conclusions, quantified facts, actions and confidence"
 }}
 
 No markdown fences. Only raw JSON."""
@@ -3845,7 +3976,7 @@ For final answer:
 {{
   "action": "finish",
   "reasoning": "Why enough information is available",
-  "final_answer": "Structured answer based on gathered evidence"
+  "final_answer": "Structured answer with functional focus based on gathered evidence"
 }}"""
             compact_total = _estimate_tokens(system_prompt + "Proceed with the next step.")
             if compact_total > context_limit:
@@ -4038,6 +4169,7 @@ Respond ONLY with valid JSON (no markdown):
                     "current_plan": current_plan_steps,
                     "midcourse_review": midcourse_review or {},
                     "no_prompt_context_injection": bool(no_prompt_context_injection),
+                    "knowledge_mode": knowledge_mode,
                     "interrupted": True,
                     "interrupt_reason": interrupt_reason,
                 })
@@ -4308,7 +4440,8 @@ Respond ONLY with valid JSON (no markdown):
                 })
             else:
                 # action == "finish"
-                final_answer = decision.get("final_answer", "")
+                decision_final = str(decision.get("final_answer", "")).strip()
+                final_answer = decision_final if decision_final else None
                 break
 
         # If the loop exhausted all steps without finish, synthesize from evidence.
@@ -4328,6 +4461,7 @@ Respond ONLY with valid JSON (no markdown):
             "current_plan": current_plan_steps,
             "midcourse_review": midcourse_review or {},
             "no_prompt_context_injection": bool(no_prompt_context_injection),
+            "knowledge_mode": knowledge_mode,
         })
 
     except Exception as exc:
@@ -5212,10 +5346,16 @@ def _da_parse_table_filter(raw_value) -> list:
 
 def _da_normalize_params(raw_params: dict | None) -> dict:
     params = raw_params or {}
+    knowledge_mode, use_knowledge_base, use_knowledge_agent = _resolve_knowledge_mode_flags(
+        knowledge_mode_raw=params.get("knowledge_mode", params.get("knowledgeMode", "")),
+        use_knowledge_base_raw=params.get("use_knowledge_base", "yes"),
+        use_knowledge_agent_raw=params.get("use_knowledge_agent", "no"),
+    )
     return {
         "max_steps": _da_coerce_int(params.get("max_steps", 8), 8, 1, 50),
-        "use_knowledge_base": _da_coerce_bool(params.get("use_knowledge_base", "yes"), True),
-        "use_knowledge_agent": _da_coerce_bool(params.get("use_knowledge_agent", "no"), False),
+        "knowledge_mode": knowledge_mode,
+        "use_knowledge_base": use_knowledge_base,
+        "use_knowledge_agent": use_knowledge_agent,
         "memory_turn_limit": _da_coerce_int(params.get("memory_turn_limit", 8), 8, 2, 24),
         "memory_token_budget": _da_coerce_int(params.get("memory_token_budget", 700), 700, 120, 2400),
         "auto_run": _da_coerce_bool(params.get("auto_run", "yes"), True),
@@ -5471,6 +5611,7 @@ def _da_worker_loop(session_id: str, run_seq: int) -> None:
             "tableMetadata": table_metadata,
             "tableMappingFilter": table_filter,
             "maxSteps": _da_coerce_int(params.get("max_steps", 8), 8, 1, 50),
+            "knowledge_mode": str(params.get("knowledge_mode", _KNOWLEDGE_MODE_CONTEXT_ONCE)),
             "use_knowledge_base": _da_coerce_bool(params.get("use_knowledge_base", True), True),
             "use_knowledge_agent": _da_coerce_bool(params.get("use_knowledge_agent", False), False),
             "control_session_id": session_id,
@@ -5517,6 +5658,7 @@ def _da_worker_loop(session_id: str, run_seq: int) -> None:
                     "current_plan": result.get("current_plan", []),
                     "midcourse_review": result.get("midcourse_review", {}),
                     "no_prompt_context_injection": bool(result.get("no_prompt_context_injection", False)),
+                    "knowledge_mode": str(result.get("knowledge_mode", params.get("knowledge_mode", _KNOWLEDGE_MODE_CONTEXT_ONCE))),
                     "interrupted": interrupted,
                     "interrupt_reason": interrupt_reason,
                 }
@@ -7306,20 +7448,12 @@ AGENTS_CATALOG = [
                 "description": "Crédit de steps par run (1-50). Les retries techniques gratuits restent plafonnés globalement.",
             },
             {
-                "name": "use_knowledge_base",
-                "label": "Use knowledge base",
+                "name": "knowledge_mode",
+                "label": "Knowledge strategy",
                 "type": "select",
-                "options": ["yes", "no"],
-                "default": "yes",
-                "description": "Active la recherche de contexte métier via la base de connaissance.",
-            },
-            {
-                "name": "use_knowledge_agent",
-                "label": "Knowledge agent mode",
-                "type": "select",
-                "options": ["no", "yes"],
-                "default": "no",
-                "description": "Si 'yes': aucune injection statique schéma/métadonnées/KB dans les prompts.",
+                "options": ["kb_context_once", "kb_agentic", "schema_only", "minimal"],
+                "default": "kb_context_once",
+                "description": "Choix unique (4 modes) pour contrôler l'usage KB et l'injection de contexte.",
             },
             {
                 "name": "memory_turn_limit",

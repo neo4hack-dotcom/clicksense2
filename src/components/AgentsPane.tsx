@@ -11,6 +11,12 @@ import {
 import clsx from 'clsx';
 import { useAppStore } from '../store';
 import { DataQualityPane } from './DataQualityPane';
+import {
+  KNOWLEDGE_MODE_OPTIONS,
+  knowledgeModeDescription,
+  knowledgeModeLabel,
+  normalizeKnowledgeMode,
+} from '../knowledgeMode';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -226,6 +232,7 @@ interface AnalystResult {
     should_finish_early?: boolean;
     source?: string;
   };
+  knowledge_mode?: string;
   no_prompt_context_injection?: boolean;
   interrupted?: boolean;
   interrupt_reason?: string;
@@ -255,6 +262,19 @@ interface AnalystRuntimeState {
     error?: string;
   } | null;
   last_result?: AnalystResult | WranglingResult | null;
+}
+
+interface AnalystExecSummaryBullet {
+  point: string;
+  risk: boolean;
+  severity: 'high' | 'medium' | 'info';
+}
+
+interface AnalystExecSummaryResult {
+  preamble: string;
+  bullets: AnalystExecSummaryBullet[];
+  requested_count?: number;
+  actual_count?: number;
 }
 
 interface WranglingAnomaly {
@@ -332,6 +352,17 @@ interface ChatMessage {
   agent_kind?: 'analyst' | 'wrangling';
   analyst_runtime_status?: string;
   analyst_memory_summary?: string;
+}
+
+function isKnowledgeModeParam(paramName: string): boolean {
+  return paramName === 'knowledge_mode';
+}
+
+function getParamOptionLabel(paramName: string, optionValue: string): string {
+  if (isKnowledgeModeParam(paramName)) {
+    return knowledgeModeLabel(optionValue);
+  }
+  return optionValue;
 }
 
 // ── Data Dictionary Sub-components ─────────────────────────────────────────
@@ -2435,10 +2466,267 @@ function AnalystStepsView({ steps }: { steps: AnalystStep[] }) {
   );
 }
 
+function AnalystExecBulletView({ result }: { result: AnalystExecSummaryResult }) {
+  const severityDot: Record<'high' | 'medium' | 'info', string> = {
+    high: 'bg-red-500',
+    medium: 'bg-amber-500',
+    info: 'bg-emerald-500',
+  };
+
+  return (
+    <div className="rounded-xl border border-indigo-200 bg-indigo-50 p-3 mt-2">
+      {result.preamble && (
+        <p className="text-xs text-indigo-700 mb-2">{result.preamble}</p>
+      )}
+      <div className="space-y-1.5">
+        {result.bullets.map((bullet, i) => (
+          <div
+            key={`analyst-bullet-${i}`}
+            className="flex items-start gap-2 px-2.5 py-2 rounded-lg bg-white border border-indigo-100 text-xs text-slate-700"
+          >
+            <span className={clsx('w-2 h-2 rounded-full mt-1.5', severityDot[bullet.severity || 'info'])} />
+            <span className="font-semibold text-slate-400 w-4 flex-shrink-0">{i + 1}</span>
+            <span className="flex-1">{bullet.point}</span>
+            {bullet.risk ? (
+              <ShieldAlert
+                size={13}
+                className={clsx(
+                  'flex-shrink-0 mt-0.5',
+                  bullet.severity === 'high' ? 'text-red-500' : 'text-amber-500',
+                )}
+              />
+            ) : (
+              <ShieldCheck size={13} className="flex-shrink-0 mt-0.5 text-emerald-500" />
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function _escapeHtml(raw: string): string {
+  return String(raw || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function _markdownToReportHtml(markdown: string): string {
+  const lines = String(markdown || '').split('\n');
+  let html = '';
+  let inList = false;
+  const flushList = () => {
+    if (inList) {
+      html += '</ul>';
+      inList = false;
+    }
+  };
+
+  const inline = (txt: string) =>
+    _escapeHtml(txt)
+      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/`([^`]+)`/g, '<code style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace;background:#f1f5f9;padding:1px 4px;border-radius:4px;">$1</code>');
+
+  for (const line of lines) {
+    const h2 = line.match(/^##\s+(.+)/);
+    const h3 = line.match(/^###\s+(.+)/);
+    const bullet = line.match(/^\s*[-*]\s+(.+)/);
+    if (h2) {
+      flushList();
+      html += `<h2 style="margin:14px 0 8px;font-size:16px;color:#1e293b;">${inline(h2[1])}</h2>`;
+      continue;
+    }
+    if (h3) {
+      flushList();
+      html += `<h3 style="margin:10px 0 6px;font-size:13px;color:#334155;text-transform:uppercase;letter-spacing:0.04em;">${inline(h3[1])}</h3>`;
+      continue;
+    }
+    if (bullet) {
+      if (!inList) {
+        html += '<ul style="margin:4px 0 10px;padding-left:18px;">';
+        inList = true;
+      }
+      html += `<li style="margin:2px 0;font-size:12px;line-height:1.6;color:#334155;">${inline(bullet[1])}</li>`;
+      continue;
+    }
+    if (!line.trim()) {
+      flushList();
+      html += '<div style="height:6px;"></div>';
+      continue;
+    }
+    flushList();
+    html += `<p style="margin:3px 0;font-size:12px;line-height:1.7;color:#334155;">${inline(line)}</p>`;
+  }
+  flushList();
+  return html;
+}
+
+function generateAnalystConclusionPDF(
+  content: string,
+  summary: AnalystExecSummaryResult | null,
+  title = 'AI Data Analyst Session Conclusion',
+) {
+  const genDate = new Date().toLocaleString();
+  const bodyHtml = _markdownToReportHtml(content);
+  const summaryBlock = summary && summary.bullets?.length
+    ? `
+      <div style="margin-top:16px;background:#eef2ff;border:1px solid #c7d2fe;border-radius:12px;padding:12px;">
+        <h3 style="margin:0 0 8px;font-size:13px;color:#3730a3;text-transform:uppercase;letter-spacing:0.05em;">Key points (${summary.actual_count || summary.bullets.length})</h3>
+        <ul style="margin:0;padding-left:18px;">
+          ${summary.bullets.map((b) => (
+            `<li style="font-size:12px;line-height:1.6;color:#312e81;margin:2px 0;">${_escapeHtml(b.point)}</li>`
+          )).join('')}
+        </ul>
+      </div>
+    `
+    : '';
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>${_escapeHtml(title)}</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; margin: 0; background: #f8fafc; color: #0f172a; }
+    @media print {
+      body { background: #ffffff; }
+      @page { size: A4; margin: 15mm 13mm; }
+      .no-print { display: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <div style="max-width:900px;margin:0 auto;padding:26px 22px;">
+    <div style="border-radius:14px;background:linear-gradient(135deg,#0ea5e9,#6366f1);color:#fff;padding:22px 24px;margin-bottom:18px;">
+      <div style="font-size:10px;opacity:0.85;letter-spacing:0.08em;text-transform:uppercase;">ClickSense · AI Data Analyst Session</div>
+      <h1 style="margin:6px 0 4px;font-size:24px;line-height:1.2;">${_escapeHtml(title)}</h1>
+      <div style="font-size:12px;opacity:0.9;">Generated on ${_escapeHtml(genDate)}</div>
+    </div>
+
+    <div style="background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:18px 20px;">
+      ${bodyHtml}
+      ${summaryBlock}
+    </div>
+
+    <div class="no-print" style="text-align:center;margin-top:16px;">
+      <button onclick="window.print()" style="padding:10px 24px;border:none;border-radius:10px;background:#4f46e5;color:#fff;font-weight:700;cursor:pointer;">
+        Print / Save as PDF
+      </button>
+    </div>
+  </div>
+</body>
+</html>`;
+
+  const win = window.open('', '_blank');
+  if (!win) return;
+  win.document.write(html);
+  win.document.close();
+  setTimeout(() => { try { win.print(); } catch { /* ignore */ } }, 850);
+}
+
+function AnalystConclusionActions({ content }: { content: string }) {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [pointsCount, setPointsCount] = useState<number>(7);
+  const [summary, setSummary] = useState<AnalystExecSummaryResult | null>(null);
+
+  if (!content || !content.trim()) return null;
+
+  const buildKeyPoints = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const res = await fetch('/api/summarize_executive', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text: content,
+          lang: 'fr',
+          count: pointsCount,
+          functional_focus: true,
+        }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        setError(String(data.error));
+        return;
+      }
+      setSummary({
+        preamble: String(data.preamble || ''),
+        bullets: Array.isArray(data.bullets) ? data.bullets : [],
+        requested_count: Number(data.requested_count || pointsCount),
+        actual_count: Number(data.actual_count || (Array.isArray(data.bullets) ? data.bullets.length : 0)),
+      });
+    } catch (exc: any) {
+      setError(String(exc?.message || 'Failed to summarize conclusions.'));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="rounded-xl border border-indigo-100 bg-gradient-to-r from-indigo-50 to-sky-50 p-3">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <p className="text-[11px] font-semibold text-indigo-700">Conclusion actions</p>
+          <p className="text-[10px] text-indigo-500 mt-0.5">
+            Générer un résumé fonctionnel en 5 à 10 points clés et exporter les conclusions en PDF.
+          </p>
+        </div>
+        <button
+          onClick={() => generateAnalystConclusionPDF(content, summary)}
+          className="flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-[11px] font-semibold transition-colors shadow-sm"
+        >
+          <Download size={11} />
+          Export PDF
+        </button>
+      </div>
+
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        <span className="text-[10px] text-slate-500">Points clés</span>
+        <select
+          value={pointsCount}
+          onChange={(e) => setPointsCount(Number(e.target.value))}
+          className="px-2 py-1 text-[11px] border border-indigo-200 rounded-md bg-white text-slate-700"
+        >
+          <option value={5}>5 points</option>
+          <option value={7}>7 points</option>
+          <option value={10}>10 points</option>
+        </select>
+        <button
+          onClick={buildKeyPoints}
+          disabled={loading}
+          className="flex items-center gap-1.5 px-3 py-1.5 bg-sky-600 hover:bg-sky-700 disabled:opacity-60 text-white rounded-lg text-[11px] font-semibold transition-colors shadow-sm"
+        >
+          {loading ? <Loader2 size={11} className="animate-spin" /> : <Zap size={11} />}
+          Résumer ({pointsCount})
+        </button>
+      </div>
+
+      {error && (
+        <div className="mt-2 text-[11px] text-red-600 bg-red-50 border border-red-200 rounded-lg p-2">
+          {error}
+        </div>
+      )}
+
+      {summary && summary.bullets?.length > 0 && (
+        <AnalystExecBulletView result={summary} />
+      )}
+    </div>
+  );
+}
+
 function AnalystMessageView({ msg }: { msg: ChatMessage }) {
   const result = msg.analyst_result;
   if (!result) return null;
   const interrupted = !!result.interrupted;
+  const knowledgeMode = normalizeKnowledgeMode(
+    result.knowledge_mode || (result.no_prompt_context_injection ? 'kb_agentic' : 'kb_context_once'),
+  );
   return (
     <div className="mt-3 space-y-3">
       <div className={clsx(
@@ -2457,11 +2745,9 @@ function AnalystMessageView({ msg }: { msg: ChatMessage }) {
           <span className="px-2 py-1 rounded-full border bg-white text-slate-700 border-slate-200">
             {result.technical_retries_used} free retries used
           </span>
-          {result.no_prompt_context_injection && (
-            <span className="px-2 py-1 rounded-full border bg-violet-50 text-violet-700 border-violet-200">
-              Knowledge agent mode
-            </span>
-          )}
+          <span className="px-2 py-1 rounded-full border bg-violet-50 text-violet-700 border-violet-200">
+            {knowledgeModeLabel(knowledgeMode)}
+          </span>
           {interrupted && (
             <span className="px-2 py-1 rounded-full border bg-amber-100 text-amber-800 border-amber-300">
               Interrupted ({result.interrupt_reason || 'manual'})
@@ -2497,6 +2783,7 @@ function AnalystMessageView({ msg }: { msg: ChatMessage }) {
       ) : null}
 
       <AnalystStepsView steps={result.steps || []} />
+      <AnalystConclusionActions content={result.final_answer || msg.content || ''} />
     </div>
   );
 }
@@ -3352,44 +3639,57 @@ export function AgentsPane() {
               {showParams && (
                 <div className="px-6 pb-4">
                   <div className="grid grid-cols-2 gap-x-6 gap-y-3">
-                    {selectedAgent.parameters.map((p) => (
-                      <div key={p.name}>
-                        <label className="text-xs font-semibold text-slate-600 mb-1 flex items-center gap-1.5">
-                          {p.label}
-                          {isAnalyst && (
-                            <span title={p.description}>
-                              <Info size={12} className="text-sky-400" />
-                            </span>
+                    {selectedAgent.parameters.map((p) => {
+                      const selectOptions = isKnowledgeModeParam(p.name)
+                        ? KNOWLEDGE_MODE_OPTIONS.map((opt) => opt.value)
+                        : (p.options || []);
+                      const selectValue = isKnowledgeModeParam(p.name)
+                        ? normalizeKnowledgeMode(params[p.name] ?? p.default)
+                        : String(params[p.name] ?? p.default ?? '');
+                      return (
+                        <div key={p.name}>
+                          <label className="text-xs font-semibold text-slate-600 mb-1 flex items-center gap-1.5">
+                            {p.label}
+                            {isAnalyst && (
+                              <span title={p.description}>
+                                <Info size={12} className="text-sky-400" />
+                              </span>
+                            )}
+                          </label>
+                          {p.type === 'select' ? (
+                            <select
+                              value={selectValue}
+                              onChange={(e) => setParam(p.name, e.target.value)}
+                              className={clsx(
+                                'w-full px-3 py-1.5 text-xs border rounded-lg bg-white focus:outline-none focus:ring-2 focus:border-transparent',
+                                isAnalyst ? 'border-sky-200 focus:ring-sky-400' : 'border-slate-200 focus:ring-emerald-400',
+                              )}
+                            >
+                              {selectOptions.map((opt) => (
+                                <option key={opt} value={opt}>{getParamOptionLabel(p.name, opt)}</option>
+                              ))}
+                            </select>
+                          ) : (
+                            <input
+                              type={p.type === 'number' ? 'number' : 'text'}
+                              value={params[p.name] as string}
+                              onChange={(e) => setParam(p.name, p.type === 'number' ? Number(e.target.value) : e.target.value)}
+                              placeholder={p.description}
+                              className={clsx(
+                                'w-full px-3 py-1.5 text-xs border rounded-lg bg-white focus:outline-none focus:ring-2 focus:border-transparent',
+                                isAnalyst ? 'border-sky-200 focus:ring-sky-400' : 'border-slate-200 focus:ring-emerald-400',
+                              )}
+                            />
                           )}
-                        </label>
-                        {p.type === 'select' ? (
-                          <select
-                            value={params[p.name] as string}
-                            onChange={(e) => setParam(p.name, e.target.value)}
-                            className={clsx(
-                              'w-full px-3 py-1.5 text-xs border rounded-lg bg-white focus:outline-none focus:ring-2 focus:border-transparent',
-                              isAnalyst ? 'border-sky-200 focus:ring-sky-400' : 'border-slate-200 focus:ring-emerald-400',
-                            )}
-                          >
-                            {p.options?.map((opt) => (
-                              <option key={opt} value={opt}>{opt}</option>
-                            ))}
-                          </select>
-                        ) : (
-                          <input
-                            type={p.type === 'number' ? 'number' : 'text'}
-                            value={params[p.name] as string}
-                            onChange={(e) => setParam(p.name, p.type === 'number' ? Number(e.target.value) : e.target.value)}
-                            placeholder={p.description}
-                            className={clsx(
-                              'w-full px-3 py-1.5 text-xs border rounded-lg bg-white focus:outline-none focus:ring-2 focus:border-transparent',
-                              isAnalyst ? 'border-sky-200 focus:ring-sky-400' : 'border-slate-200 focus:ring-emerald-400',
-                            )}
-                          />
-                        )}
-                        <p className="text-[10px] text-slate-400 mt-0.5">{p.description}</p>
-                      </div>
-                    ))}
+                          <p className="text-[10px] text-slate-400 mt-0.5">{p.description}</p>
+                          {isKnowledgeModeParam(p.name) && (
+                            <p className="text-[10px] text-indigo-500 mt-1">
+                              {knowledgeModeDescription(selectValue)}
+                            </p>
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
                   {isAnalyst && (
                     <div className="mt-3 rounded-xl border border-sky-200 bg-sky-50 p-3 text-xs text-slate-600">

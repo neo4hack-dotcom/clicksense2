@@ -15,6 +15,12 @@ import {
 import { useAppStore } from '../store';
 import clsx from 'clsx';
 import { motion, AnimatePresence } from 'motion/react';
+import {
+  KNOWLEDGE_MODE_OPTIONS,
+  knowledgeModeDescription,
+  knowledgeModeToFlags,
+  normalizeKnowledgeMode,
+} from '../knowledgeMode';
 
 // ── Markdown renderer ──────────────────────────────────────────────────────
 
@@ -666,8 +672,7 @@ export function ChatPane() {
   const [historyOpen, setHistoryOpen] = useState(false);
 
   const [input, setInput] = useState('');
-  const [useKnowledgeBase, setUseKnowledgeBase] = useState(true);
-  const [useKnowledgeAgentMode, setUseKnowledgeAgentMode] = useState(false);
+  const [knowledgeMode, setKnowledgeMode] = useState('kb_context_once');
   const [isLoading, setIsLoading] = useState(false);
   const [isAgentLoading, setIsAgentLoading] = useState(false);
   const [expandedSteps, setExpandedSteps] = useState<Record<number, boolean>>({});
@@ -705,6 +710,7 @@ export function ChatPane() {
     setIsLoading(true);
 
     try {
+      const knowledgeFlags = knowledgeModeToFlags(knowledgeMode);
       const messagesToSend = [
         ...chatHistory,
         { role: 'user', content: text }
@@ -719,7 +725,7 @@ export function ChatPane() {
           tableMetadata,
           tableMappingFilter: selectedTableMappings,
           conversation_id: chatConversationId,
-          use_knowledge_base: useKnowledgeBase,
+          use_knowledge_base: knowledgeFlags.use_knowledge_base,
         }),
       });
 
@@ -770,14 +776,16 @@ export function ChatPane() {
     setSelectedConfirmedTables([]);
 
     try {
+      const knowledgeFlags = knowledgeModeToFlags(knowledgeMode);
       const body: Record<string, unknown> = {
         question: text,
         schema,
         tableMetadata,
         tableMappingFilter: selectedTableMappings,
         maxSteps: agentMaxSteps,
-        use_knowledge_base: useKnowledgeBase,
-        use_knowledge_agent: useKnowledgeAgentMode,
+        knowledge_mode: knowledgeFlags.knowledge_mode,
+        use_knowledge_base: knowledgeFlags.use_knowledge_base,
+        use_knowledge_agent: knowledgeFlags.use_knowledge_agent,
       };
       if (confirmedTables && confirmedTables.length > 0) {
         body.confirmedTables = confirmedTables;
@@ -1673,26 +1681,23 @@ export function ChatPane() {
             <Send size={16} />
           </button>
         </div>
-        <label className="flex items-center gap-2 cursor-pointer select-none w-fit">
-          <input
-            type="checkbox"
-            checked={useKnowledgeBase}
-            onChange={(e) => setUseKnowledgeBase(e.target.checked)}
-            className="w-3.5 h-3.5 rounded accent-emerald-500 cursor-pointer"
-          />
-          <span className="text-xs text-slate-500">Use knowledge base</span>
-        </label>
-        <label className="flex items-center gap-2 cursor-pointer select-none w-fit">
-          <input
-            type="checkbox"
-            checked={useKnowledgeAgentMode}
-            onChange={(e) => setUseKnowledgeAgentMode(e.target.checked)}
-            className="w-3.5 h-3.5 rounded accent-indigo-500 cursor-pointer"
-          />
-          <span className="text-xs text-slate-500">
-            Use knowledge agent mode (no static schema/metadata injection)
-          </span>
-        </label>
+        <div className="space-y-1.5">
+          <label className="text-xs font-medium text-slate-600">Knowledge strategy</label>
+          <select
+            value={knowledgeMode}
+            onChange={(e) => setKnowledgeMode(normalizeKnowledgeMode(e.target.value))}
+            className="w-full px-3 py-2 text-xs border border-slate-200 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-indigo-400"
+          >
+            {KNOWLEDGE_MODE_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+          <p className="text-[11px] text-slate-500">
+            {knowledgeModeDescription(knowledgeMode)}
+          </p>
+        </div>
         <button
           onClick={() => handleAgentSend()}
           disabled={!input.trim() || isLoading || isAgentLoading}
