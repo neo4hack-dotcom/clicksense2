@@ -2265,7 +2265,8 @@ def agent_analysis():
 
     data = request.get_json()
     MAX_AGENT_STEPS = max(1, min(50, int(data.get("maxSteps", 10))))
-    MAX_FREE_RETRIES = max(2, min(10, MAX_AGENT_STEPS))
+    # One technical rephrase retry at most per consumed step.
+    MAX_TECHNICAL_RETRIES = MAX_AGENT_STEPS
 
     user_question = data.get("question", "")
     schema = data.get("schema", {})
@@ -2385,7 +2386,7 @@ def agent_analysis():
         return (knowledge_context or "No knowledge base content available.")[:3000]
 
     def _agent_self_evaluate(step_entry: dict, total_used_steps: int) -> dict:
-        """Score result quality and decide if a corrective retry is useful."""
+        """Score result quality (technical retries are handled separately)."""
         if step_entry.get("type") != "query":
             return {
                 "status": "good",
@@ -2409,7 +2410,7 @@ def agent_analysis():
                 "status": "weak",
                 "score": 35,
                 "reason": "Query returned zero rows; broaden filters or verify dimensions.",
-                "should_retry": total_used_steps < MAX_AGENT_STEPS,
+                "should_retry": False,
                 "should_finish": False,
             }
         if row_count < 3:
@@ -2417,7 +2418,7 @@ def agent_analysis():
                 "status": "weak",
                 "score": 55,
                 "reason": "Very few rows; confidence may be limited.",
-                "should_retry": total_used_steps < MAX_AGENT_STEPS - 1,
+                "should_retry": False,
                 "should_finish": False,
             }
         if row_count > 4000:
@@ -2594,11 +2595,11 @@ No markdown fences. Only raw JSON."""
         return _parse_llm_json(content)
 
     def _run_agent_retry(steps_so_far: list, retry_info: dict) -> dict:
-        """Generate a corrective SQL after a technical or quality issue.
+        """Generate a corrective SQL after a technical SQL failure.
 
         This retry does NOT consume a step credit.
         """
-        retry_mode = retry_info.get("mode", "technical")
+        retry_mode = "technical"
         failed_sql = retry_info.get("failed_sql", "")
         error_msg = retry_info.get("error", "")
         error_class = retry_info.get("error_class", "")
@@ -2619,16 +2620,10 @@ No markdown fences. Only raw JSON."""
                 "reuse table/column hints from previous steps."
             )
 
-        if retry_mode == "quality":
-            issue_block = (
-                "The previous SQL executed but produced weak analytical evidence. "
-                "Generate a BETTER follow-up query with a different angle."
-            )
-        else:
-            issue_block = (
-                "A previous SQL query was rejected by ClickHouse with a technical error. "
-                "Generate a SIMPLER alternative that achieves the same analytical goal."
-            )
+        issue_block = (
+            "A previous SQL query was rejected by ClickHouse with a technical error. "
+            "Generate a SIMPLER alternative that achieves the same analytical goal."
+        )
 
         retry_prompt = f"""You are an autonomous ClickHouse data analyst agent.
 {issue_block}
@@ -2651,7 +2646,6 @@ PREVIOUS STEPS FOR CONTEXT:
 RULES:
 - Read-only SQL only: SELECT/SHOW/DESCRIBE/EXPLAIN/WITH.
 - Use FEWER and SIMPLER functions when fixing technical errors.
-- Produce a genuinely different angle when fixing low-signal results.
 - Avoid nested complexity unless strictly required.
 - Prefer clear date ranges and avoid expensive date transforms in WHERE.
 - Add LIMIT 200 if not present; never exceed LIMIT 5000.
@@ -2690,22 +2684,24 @@ Respond ONLY with valid JSON (no markdown):
     try:
         final_answer = None
         used_steps = 0        # steps counting against the credit budget
-        free_retries = 0      # correction attempts not counting against credits
-        retry_pending = None  # {"mode": "...", "failed_sql": "...", "error": "..."}
+        technical_retries_used = 0  # retries not counting against credits
+        retry_pending = None  # {"failed_sql": "...", "error": "...", "error_class": "..."}
         safety_limit = MAX_AGENT_STEPS * 4  # absolute ceiling to prevent infinite loops
         safety_counter = 0
 
-        while used_steps < MAX_AGENT_STEPS and safety_counter < safety_limit:
+        while safety_counter < safety_limit:
+            if used_steps >= MAX_AGENT_STEPS and not retry_pending:
+                break
             safety_counter += 1
 
             # ── Handle a pending corrective retry (free, no credit consumed) ────
             if retry_pending:
-                if free_retries >= MAX_FREE_RETRIES:
+                if technical_retries_used >= MAX_TECHNICAL_RETRIES:
                     retry_pending = None
                 else:
                     alt_decision = _run_agent_retry(steps, retry_pending)
-                    free_retries += 1
-                    retry_mode = retry_pending.get("mode", "technical")
+                    technical_retries_used += 1
+                    retry_mode = "technical"
                     retry_pending = None
 
                     alt_sql = (alt_decision.get("sql") or "").strip()
@@ -2730,6 +2726,7 @@ Respond ONLY with valid JSON (no markdown):
                                 "ok": True,
                                 "retried": True,
                                 "retry_mode": retry_mode,
+                                "technical_retry_used": True,
                                 "error_class": "",
                             })
                             steps[-1]["self_evaluation"] = _agent_self_evaluate(
@@ -2741,7 +2738,11 @@ Respond ONLY with valid JSON (no markdown):
                                 f" | Corrective retry failed ({retry_mode}): {alt_result['summary']}"
                             )
                             steps[-1]["error_class"] = alt_result.get("error_class", "")
+                            steps[-1]["technical_retry_used"] = True
                     continue
+
+            if used_steps >= MAX_AGENT_STEPS:
+                break
 
             # ── Normal agent step ────────────────────────────────────────────
             decision = _run_agent_step(steps, used_steps)
@@ -2776,6 +2777,7 @@ Respond ONLY with valid JSON (no markdown):
                     "row_count": exec_result.get("total_rows", 0),
                     "ok": exec_result["ok"],
                     "error_class": exec_result.get("error_class", ""),
+                    "technical_retry_used": False,
                 }
                 step_entry["self_evaluation"] = _agent_self_evaluate(step_entry, used_steps)
                 if step_entry["self_evaluation"]["reason"]:
@@ -2786,17 +2788,9 @@ Respond ONLY with valid JSON (no markdown):
 
                 if not exec_result["ok"]:
                     retry_pending = {
-                        "mode": "technical",
                         "failed_sql": normalized_sql or sql,
                         "error": exec_result["summary"],
                         "error_class": exec_result.get("error_class", ""),
-                    }
-                elif step_entry["self_evaluation"].get("should_retry"):
-                    retry_pending = {
-                        "mode": "quality",
-                        "failed_sql": normalized_sql or sql,
-                        "error": step_entry["self_evaluation"]["reason"],
-                        "error_class": "low_signal",
                     }
 
             elif action == "search_knowledge":
@@ -2892,7 +2886,8 @@ Requirements:
             "steps": steps,
             "final_answer": final_answer,
             "total_steps": len(steps),
-            "free_retries_used": free_retries,
+            "technical_retries_used": technical_retries_used,
+            "free_retries_used": technical_retries_used,
         })
 
     except Exception as exc:
