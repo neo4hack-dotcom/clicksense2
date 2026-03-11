@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, KeyboardEvent, CSSProperties } from 'react';
+import { useState, useRef, useEffect, useMemo, KeyboardEvent, CSSProperties } from 'react';
 import {
   Cpu, Send, ChevronDown, ChevronRight, CheckCircle2, XCircle,
   Loader2, Database, FileText, Settings2, Table2, Columns3,
@@ -2514,6 +2514,235 @@ function _escapeHtml(raw: string): string {
     .replace(/'/g, '&#39;');
 }
 
+function _markdownInlineToChatHtml(rawText: string): string {
+  if (!rawText) return '';
+  let text = _escapeHtml(rawText);
+  const stash: string[] = [];
+
+  const hold = (html: string): string => {
+    const token = `__MDTOK_${stash.length}__`;
+    stash.push(html);
+    return token;
+  };
+
+  text = text.replace(/`([^`]+)`/g, (_m, code) => hold(
+    `<code style="font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,'Courier New',monospace;background:#e2e8f0;color:#0f172a;padding:2px 6px;border-radius:6px;font-size:0.92em;">${code}</code>`
+  ));
+
+  text = text.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_m, label, url) => {
+    const rawUrl = String(url || '');
+    if (!/^(https?:\/\/|mailto:)/i.test(rawUrl)) {
+      return hold(`<span style="color:#2563eb;font-weight:600;">${label}</span>`);
+    }
+    const safeUrl = _escapeHtml(rawUrl);
+    return hold(
+      `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer" style="color:#2563eb;text-decoration:none;border-bottom:1px dashed #93c5fd;font-weight:600;">${label}</a>`
+    );
+  });
+
+  text = text
+    .replace(/\*\*([^*]+)\*\*/g, '<strong style="font-weight:700;color:#0f172a;">$1</strong>')
+    .replace(/~~([^~]+)~~/g, '<span style="text-decoration:line-through;opacity:0.8;">$1</span>')
+    .replace(/\*([^*]+)\*/g, '<em style="font-style:italic;color:#334155;">$1</em>');
+
+  return text.replace(/__MDTOK_(\d+)__/g, (_m, i) => stash[Number(i)] || '');
+}
+
+function _isMarkdownTableSeparator(line: string): boolean {
+  const trimmed = (line || '').trim();
+  if (!trimmed.includes('-') || !trimmed.includes('|')) return false;
+  return /^[:|\-\s]+$/.test(trimmed);
+}
+
+function _parseMarkdownTableRow(line: string): string[] {
+  let row = String(line || '').trim();
+  if (row.startsWith('|')) row = row.slice(1);
+  if (row.endsWith('|')) row = row.slice(0, -1);
+  return row.split('|').map((cell) => cell.trim());
+}
+
+function _markdownToChatHtml(markdown: string): string {
+  const src = String(markdown || '').replace(/\r\n/g, '\n');
+  if (!src.trim()) return '<p style="margin:0;color:#334155;">&nbsp;</p>';
+
+  const lines = src.split('\n');
+  let html = '';
+
+  let inCode = false;
+  let codeLang = '';
+  let codeLines: string[] = [];
+  let listMode: null | 'ul' | 'ol' = null;
+  let listItems: string[] = [];
+  let paragraphLines: string[] = [];
+
+  const flushParagraph = () => {
+    if (!paragraphLines.length) return;
+    const merged = paragraphLines.map((l) => _markdownInlineToChatHtml(l)).join('<br/>');
+    html += `<p style="margin:6px 0;color:#334155;line-height:1.75;">${merged}</p>`;
+    paragraphLines = [];
+  };
+
+  const flushList = () => {
+    if (!listMode || !listItems.length) return;
+    const tag = listMode === 'ul' ? 'ul' : 'ol';
+    html += `<${tag} style="margin:8px 0 10px;padding-left:22px;color:#334155;line-height:1.7;">`;
+    for (const item of listItems) {
+      html += `<li style="margin:2px 0 2px 0;">${_markdownInlineToChatHtml(item)}</li>`;
+    }
+    html += `</${tag}>`;
+    listMode = null;
+    listItems = [];
+  };
+
+  const flushCode = () => {
+    if (!codeLines.length) return;
+    const language = _escapeHtml(codeLang || 'code');
+    const code = _escapeHtml(codeLines.join('\n'));
+    html += `
+      <div style="margin:10px 0;border:1px solid #1e293b;border-radius:12px;overflow:hidden;background:#0b1220;">
+        <div style="padding:6px 10px;background:linear-gradient(90deg,#111827,#1e293b);color:#cbd5e1;font-size:10px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;">${language}</div>
+        <pre style="margin:0;padding:12px 14px;overflow:auto;color:#e2e8f0;font-size:12px;line-height:1.6;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,'Courier New',monospace;"><code>${code}</code></pre>
+      </div>
+    `;
+    codeLines = [];
+  };
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    const trimmed = line.trim();
+
+    if (inCode) {
+      if (/^```/.test(trimmed)) {
+        flushCode();
+        inCode = false;
+        codeLang = '';
+      } else {
+        codeLines.push(line);
+      }
+      continue;
+    }
+
+    const codeStart = trimmed.match(/^```([\w+-]*)\s*$/);
+    if (codeStart) {
+      flushParagraph();
+      flushList();
+      inCode = true;
+      codeLang = codeStart[1] || '';
+      continue;
+    }
+
+    const nextLine = i + 1 < lines.length ? lines[i + 1] : '';
+    if (line.includes('|') && _isMarkdownTableSeparator(nextLine)) {
+      flushParagraph();
+      flushList();
+      const headerCells = _parseMarkdownTableRow(line);
+      const bodyRows: string[][] = [];
+      i += 2;
+      while (i < lines.length && lines[i].includes('|') && lines[i].trim() !== '') {
+        bodyRows.push(_parseMarkdownTableRow(lines[i]));
+        i += 1;
+      }
+      i -= 1;
+
+      html += '<div style="margin:10px 0;overflow-x:auto;border:1px solid #e2e8f0;border-radius:12px;">';
+      html += '<table style="border-collapse:collapse;width:100%;min-width:480px;font-size:12px;">';
+      html += '<thead style="background:#f8fafc;"><tr>';
+      for (const cell of headerCells) {
+        html += `<th style="text-align:left;padding:8px 10px;border-bottom:1px solid #e2e8f0;color:#0f172a;font-weight:700;">${_markdownInlineToChatHtml(cell)}</th>`;
+      }
+      html += '</tr></thead><tbody>';
+      for (const row of bodyRows) {
+        html += '<tr>';
+        for (let c = 0; c < headerCells.length; c += 1) {
+          const cell = row[c] ?? '';
+          html += `<td style="padding:7px 10px;border-bottom:1px solid #f1f5f9;color:#334155;vertical-align:top;">${_markdownInlineToChatHtml(cell)}</td>`;
+        }
+        html += '</tr>';
+      }
+      html += '</tbody></table></div>';
+      continue;
+    }
+
+    if (/^[-*_]{3,}$/.test(trimmed)) {
+      flushParagraph();
+      flushList();
+      html += '<hr style="border:none;border-top:1px solid #e2e8f0;margin:12px 0;" />';
+      continue;
+    }
+
+    const heading = line.match(/^(#{1,4})\s+(.+)/);
+    if (heading) {
+      flushParagraph();
+      flushList();
+      const level = heading[1].length;
+      const content = _markdownInlineToChatHtml(heading[2]);
+      if (level === 1) {
+        html += `<h1 style="margin:10px 0 6px;font-size:20px;line-height:1.3;color:#0f172a;font-weight:800;">${content}</h1>`;
+      } else if (level === 2) {
+        html += `<h2 style="margin:10px 0 6px;font-size:17px;line-height:1.35;color:#0f172a;font-weight:800;">${content}</h2>`;
+      } else if (level === 3) {
+        html += `<h3 style="margin:9px 0 5px;font-size:14px;line-height:1.35;color:#1e293b;font-weight:700;">${content}</h3>`;
+      } else {
+        html += `<h4 style="margin:8px 0 4px;font-size:13px;line-height:1.35;color:#334155;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;">${content}</h4>`;
+      }
+      continue;
+    }
+
+    const blockQuote = line.match(/^\s*>\s?(.*)$/);
+    if (blockQuote) {
+      flushParagraph();
+      flushList();
+      const quoteLines = [blockQuote[1]];
+      while (i + 1 < lines.length) {
+        const next = lines[i + 1].match(/^\s*>\s?(.*)$/);
+        if (!next) break;
+        quoteLines.push(next[1]);
+        i += 1;
+      }
+      html += `
+        <blockquote style="margin:10px 0;padding:8px 12px;border-left:3px solid #38bdf8;background:#f0f9ff;border-radius:0 10px 10px 0;color:#0c4a6e;">
+          ${quoteLines.map((l) => _markdownInlineToChatHtml(l)).join('<br/>')}
+        </blockquote>
+      `;
+      continue;
+    }
+
+    const bullet = line.match(/^\s*[-*+]\s+(.+)/);
+    const ordered = line.match(/^\s*\d+[.)]\s+(.+)/);
+    if (bullet || ordered) {
+      flushParagraph();
+      const nextMode: 'ul' | 'ol' = bullet ? 'ul' : 'ol';
+      if (listMode && listMode !== nextMode) flushList();
+      listMode = nextMode;
+      listItems.push((bullet ? bullet[1] : ordered?.[1]) || '');
+      continue;
+    }
+
+    if (!trimmed) {
+      flushParagraph();
+      flushList();
+      continue;
+    }
+
+    paragraphLines.push(trimmed);
+  }
+
+  flushParagraph();
+  flushList();
+  if (inCode) flushCode();
+  return html;
+}
+
+function MarkdownRichText({ content }: { content: string }) {
+  const html = useMemo(() => _markdownToChatHtml(content), [content]);
+  return (
+    <div
+      className="text-sm text-slate-700 max-w-full overflow-x-auto"
+      dangerouslySetInnerHTML={{ __html: html }}
+    />
+  );
+}
+
 function _markdownToReportHtml(markdown: string): string {
   const lines = String(markdown || '').split('\n');
   let html = '';
@@ -2967,6 +3196,7 @@ function AssistantMessage({
 
   const isWrangling = !!msg.wrangling_result || msg.agent_kind === 'wrangling';
   const isAnalyst = !!msg.analyst_result || isWrangling || msg.agent_kind === 'analyst';
+  const isAnalystSessionMessage = msg.agent_kind === 'analyst' || !!msg.analyst_result;
   const isWriter = !!(msg.plan || msg.action_log || msg.synthesis
     || (msg.question && !msg.etl_plan && !msg.files_found) || (msg.status && !msg.etl_plan && !msg.files_found)) && !isAnalyst;
   const isKeyId = msg.suggestions !== undefined;
@@ -3001,7 +3231,11 @@ function AssistantMessage({
             : isEtl ? 'bg-white border-orange-100'
             : 'bg-white border-slate-200',
         )}>
-          <p className="text-sm text-slate-700 whitespace-pre-wrap">{msg.content}</p>
+          {isAnalystSessionMessage ? (
+            <MarkdownRichText content={msg.content} />
+          ) : (
+            <p className="text-sm text-slate-700 whitespace-pre-wrap">{msg.content}</p>
+          )}
           {/* Data dictionary summary */}
           {msg.tables_processed !== undefined && (
             <div className="flex items-center gap-2 mt-2">

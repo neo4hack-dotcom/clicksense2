@@ -176,7 +176,10 @@ export function SettingsPane() {
       const res = await fetch('/api/rag/test-embedding', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(localRag),
+        body: JSON.stringify({
+          ragConfig: localRag,
+          llm: config.llm,
+        }),
       });
       const data = await res.json();
       if (data.error) throw new Error(data.error);
@@ -218,7 +221,10 @@ export function SettingsPane() {
       const res = await fetch('/api/rag/embedding-models', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(localRag),
+        body: JSON.stringify({
+          ragConfig: localRag,
+          llm: config.llm,
+        }),
       });
       const data = await res.json();
       if (data.error) throw new Error(data.error);

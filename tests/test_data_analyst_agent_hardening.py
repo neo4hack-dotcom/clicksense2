@@ -96,6 +96,17 @@ class _DQClient:
         return None
 
 
+class _FakeHttpResponse:
+    def __init__(self, *, ok=True, status_code=200, payload=None, text=""):
+        self.ok = ok
+        self.status_code = status_code
+        self._payload = payload if payload is not None else {}
+        self.text = text
+
+    def json(self):
+        return self._payload
+
+
 @pytest.fixture(autouse=True)
 def _reset_model_cache():
     server._model_context_cache.clear()
@@ -376,6 +387,48 @@ def test_agent_synthesis_has_context_overflow_fallback(client, monkeypatch):
     data = resp.get_json()
     assert "Fallback final answer" in data["final_answer"]
     assert synthesis_calls["count"] == 1
+
+
+def test_agent_final_answer_strips_actionable_recommendations_section(client, monkeypatch):
+    monkeypatch.setattr(server, "get_clickhouse_client", lambda: _OkClient())
+
+    def fake_call(system_prompt, messages, temperature=0.7, language=None):
+        _ = system_prompt
+        _ = temperature
+        _ = language
+        user_msg = messages[-1]["content"]
+        if user_msg == "Build the plan.":
+            return json.dumps({"plan_steps": ["Immediate finish"], "reasoning": "Enough"})
+        if user_msg == "Proceed with the next step.":
+            return json.dumps(
+                {
+                    "action": "finish",
+                    "reasoning": "Sufficient evidence for this test",
+                    "final_answer": (
+                        "## Résumé exécutif\n"
+                        "Vue globale.\n\n"
+                        "## Deep Analysis et insights issus des résultats\n"
+                        "- Insight clé.\n\n"
+                        "## Recommandations actionnables\n"
+                        "- Action 1\n"
+                        "- Action 2\n\n"
+                        "## Conclusion finale détaillée\n"
+                        "Conclusion détaillée."
+                    ),
+                }
+            )
+        if user_msg in {"Synthesise the final answer.", "Final answer now."}:
+            return "Fallback answer."
+        raise AssertionError(f"Unexpected call: {user_msg!r}")
+
+    monkeypatch.setattr(server, "_call_llm", fake_call)
+    resp = client.post("/api/agent", json=_base_agent_payload(maxSteps=2))
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    final_answer = payload["final_answer"]
+    assert "Recommandations actionnables" not in final_answer
+    assert "Deep Analysis et insights issus des résultats" in final_answer
+    assert "Conclusion finale détaillée" in final_answer
 
 
 def test_api_query_can_enforce_simple_compat(client, monkeypatch):
@@ -743,3 +796,99 @@ def test_data_quality_analyze_requires_approval_then_runs_prepared_batches(clien
         json={"prepared_run_id": run_id, "llm_approval": "OUI"},
     )
     assert expired.status_code == 404
+
+
+def test_get_embedding_local_http_uses_same_connection_and_embedding_model(monkeypatch):
+    captured = {"url": "", "json": None, "auth": ""}
+
+    def _fake_post(url, **kwargs):
+        captured["url"] = url
+        captured["json"] = kwargs.get("json")
+        captured["auth"] = (kwargs.get("headers") or {}).get("Authorization", "")
+        return _FakeHttpResponse(
+            ok=True,
+            status_code=200,
+            payload={"data": [{"embedding": [0.1, 0.2, 0.3]}]},
+        )
+
+    monkeypatch.setattr(server, "_http_post", _fake_post)
+
+    vec = server._get_embedding(
+        "hello",
+        rag_cfg={"embeddingModel": "bge-m3"},
+        llm_cfg={
+            "provider": "local_http",
+            "baseUrl": "http://localhost:1234/v1/chat/completions",
+            "apiKey": "tok",
+            "model": "chat-model",
+        },
+    )
+    assert vec == [0.1, 0.2, 0.3]
+    assert captured["url"] == "http://localhost:1234/v1/embeddings"
+    assert captured["json"]["model"] == "bge-m3"
+    assert captured["auth"] == "Bearer tok"
+
+
+def test_embedding_models_local_http_uses_llm_override_base(client, monkeypatch):
+    captured = {"url": "", "auth": ""}
+
+    def _fake_get(url, **kwargs):
+        captured["url"] = url
+        captured["auth"] = (kwargs.get("headers") or {}).get("Authorization", "")
+        return _FakeHttpResponse(
+            ok=True,
+            status_code=200,
+            payload={"data": [{"id": "bge-m3"}, {"id": "text-embedding-3-small"}]},
+        )
+
+    monkeypatch.setattr(server, "_http_get", _fake_get)
+
+    resp = client.post(
+        "/api/rag/embedding-models",
+        json={
+            "llm": {
+                "provider": "local_http",
+                "baseUrl": "http://localhost:8000/v1/chat/completions",
+                "apiKey": "abc",
+            }
+        },
+    )
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["models"] == ["bge-m3", "text-embedding-3-small"]
+    assert captured["url"] == "http://localhost:8000/v1/models"
+    assert captured["auth"] == "Bearer abc"
+
+
+def test_test_embedding_accepts_unsaved_llm_and_rag_overrides(client, monkeypatch):
+    captured = {"model": "", "url": ""}
+
+    def _fake_post(url, **kwargs):
+        captured["url"] = url
+        captured["model"] = (kwargs.get("json") or {}).get("model", "")
+        return _FakeHttpResponse(
+            ok=True,
+            status_code=200,
+            payload={"data": [{"embedding": [0.9, 0.1]}]},
+        )
+
+    monkeypatch.setattr(server, "_http_post", _fake_post)
+
+    resp = client.post(
+        "/api/rag/test-embedding",
+        json={
+            "ragConfig": {"embeddingModel": "bge-small"},
+            "llm": {
+                "provider": "local_http",
+                "baseUrl": "http://localhost:9000/v1/chat/completions",
+                "model": "chat-only-model",
+            },
+        },
+    )
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["success"] is True
+    assert payload["dims"] == 2
+    assert payload["model"] == "bge-small"
+    assert captured["model"] == "bge-small"
+    assert captured["url"] == "http://localhost:9000/v1/embeddings"

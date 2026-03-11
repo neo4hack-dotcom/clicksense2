@@ -203,16 +203,62 @@ def _rows_to_dicts(result) -> list:
 # ---------------------------------------------------------------------------
 # Embedding helper — uses the configured local LLM connection
 # ---------------------------------------------------------------------------
-def _get_embedding(text: str) -> list:
-    """Compute embedding via the configured local LLM endpoint (Ollama or local_http).
+def _resolve_local_http_api_base(raw_base_url: str | None) -> str:
+    """Return the API base root from a local_http URL.
 
-    Uses the same provider/baseUrl as the LLM config so no separate embedding
-    endpoint configuration is required. The embedding model is taken from
-    rag_config['embeddingModel'] (can differ from the chat model).
+    Examples:
+    - http://localhost:8000/v1/chat/completions -> http://localhost:8000
+    - http://host:1234/proxy/v1/chat/completions -> http://host:1234/proxy
+    - localhost:8000/v1/chat/completions -> http://localhost:8000
     """
-    provider = llm_config.get("provider", "ollama")
-    base_url = (llm_config.get("baseUrl") or "").rstrip("/")
-    model = (rag_config.get("embeddingModel") or "").strip() or llm_config.get("model") or "llama3"
+    from urllib.parse import urlparse as _urlparse
+
+    raw = (raw_base_url or "").strip() or "http://localhost:8000"
+    if "://" not in raw:
+        raw = "http://" + raw
+    parsed = _urlparse(raw)
+    if not parsed.netloc:
+        parsed = _urlparse("http://localhost:8000")
+
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    path = parsed.path or ""
+    lower_path = path.lower()
+
+    v1_idx = lower_path.find("/v1")
+    if v1_idx >= 0:
+        prefix = path[:v1_idx]
+    elif lower_path.endswith("/chat/completions"):
+        prefix = path[:-len("/chat/completions")]
+    elif lower_path.endswith("/completions"):
+        prefix = path[:-len("/completions")]
+    elif lower_path.endswith("/models"):
+        prefix = path[:-len("/models")]
+    elif lower_path.endswith("/embeddings"):
+        prefix = path[:-len("/embeddings")]
+    else:
+        prefix = path.rstrip("/")
+
+    return (base + prefix).rstrip("/")
+
+
+def _get_embedding(text: str, rag_cfg: dict | None = None, llm_cfg: dict | None = None) -> list:
+    """Compute an embedding using the current connection with optional runtime overrides.
+
+    - Reuses the same LLM connection (provider/baseUrl/apiKey).
+    - Allows a dedicated embedding model via rag_cfg['embeddingModel'].
+    - Supports temporary unsaved overrides from UI calls.
+    """
+    eff_llm = dict(llm_config)
+    if isinstance(llm_cfg, dict):
+        eff_llm.update(llm_cfg)
+
+    eff_rag = dict(rag_config)
+    if isinstance(rag_cfg, dict):
+        eff_rag.update(rag_cfg)
+
+    provider = (eff_llm.get("provider") or "ollama").strip()
+    base_url = (eff_llm.get("baseUrl") or "").rstrip("/")
+    model = (eff_rag.get("embeddingModel") or "").strip() or eff_llm.get("model") or "llama3"
     headers = {"Content-Type": "application/json"}
 
     if provider == "ollama":
@@ -231,7 +277,7 @@ def _get_embedding(text: str) -> list:
                 return data["embeddings"][0]
         elif resp.status_code == 404 or (not resp.ok and "not found" in resp.text.lower()):
             # Model not found — no point trying the legacy endpoint with the same model
-            is_fallback_model = not (rag_config.get("embeddingModel") or "").strip()
+            is_fallback_model = not (eff_rag.get("embeddingModel") or "").strip()
             if is_fallback_model:
                 raise Exception(
                     f"The LLM model '{model}' does not support embeddings via Ollama. "
@@ -254,7 +300,7 @@ def _get_embedding(text: str) -> list:
             # Detect model-not-found or embedding-unsupported errors and give a
             # clear, actionable message instead of the raw Ollama error.
             is_model_error = resp2.status_code == 404 or "not found" in err_body.lower()
-            is_fallback_model = not (rag_config.get("embeddingModel") or "").strip()
+            is_fallback_model = not (eff_rag.get("embeddingModel") or "").strip()
             if is_model_error:
                 if is_fallback_model:
                     raise Exception(
@@ -274,32 +320,40 @@ def _get_embedding(text: str) -> list:
         raise Exception(f"Unexpected Ollama embedding response: {list(data2.keys())}")
 
     elif provider == "local_http":
-        # OpenAI-compatible /v1/embeddings endpoint derived from the LLM base URL.
-        # The user may have configured the full chat URL (e.g. .../v1/chat/completions),
-        # so we extract the base up to /v1 and append /embeddings.
-        from urllib.parse import urlparse as _urlparse
-        _raw = base_url or "http://localhost:8000"
-        _parsed = _urlparse(_raw)
-        _netloc_base = f"{_parsed.scheme}://{_parsed.netloc}"
-        _path = _parsed.path
-        _v1_idx = _path.lower().find("/v1")
-        if _v1_idx >= 0:
-            _netloc_base = _netloc_base + _path[:_v1_idx]
-        endpoint = _netloc_base.rstrip("/") + "/v1/embeddings"
-        if llm_config.get("apiKey"):
-            headers["Authorization"] = f"Bearer {llm_config['apiKey']}"
-        resp = _http_post(
-            endpoint,
-            json={"model": model, "input": text},
-            headers=headers,
-            timeout=120,
+        api_base = _resolve_local_http_api_base(base_url)
+        candidates = [f"{api_base}/v1/embeddings", f"{api_base}/embeddings"]
+        if eff_llm.get("apiKey"):
+            headers["Authorization"] = f"Bearer {eff_llm['apiKey']}"
+
+        last_error = ""
+        for endpoint in candidates:
+            resp = _http_post(
+                endpoint,
+                json={"model": model, "input": text},
+                headers=headers,
+                timeout=120,
+            )
+            if not resp.ok:
+                last_error = f"{resp.status_code}: {resp.text}"
+                continue
+
+            data = resp.json()
+            if "data" in data and data["data"]:
+                emb = data["data"][0].get("embedding")
+                if isinstance(emb, list):
+                    return emb
+            if isinstance(data.get("embedding"), list):
+                return data["embedding"]
+            if isinstance(data.get("embeddings"), list) and data["embeddings"]:
+                first = data["embeddings"][0]
+                if isinstance(first, list):
+                    return first
+            raise Exception(f"Unexpected embedding response: {list(data.keys())}")
+
+        raise Exception(
+            f"Embedding error on local_http for model '{model}' "
+            f"(tried {', '.join(candidates)}): {last_error}"
         )
-        if not resp.ok:
-            raise Exception(f"Embedding error {resp.status_code}: {resp.text}")
-        data = resp.json()
-        if "data" in data and data["data"]:
-            return data["data"][0]["embedding"]
-        raise Exception(f"Unexpected embedding response: {list(data.keys())}")
 
     else:
         raise Exception(
@@ -1823,11 +1877,17 @@ def test_elasticsearch():
 @app.route("/api/rag/embedding-models", methods=["POST"])
 def get_embedding_models():
     """List models available at the LLM local endpoint for use as embedding models."""
-    provider = llm_config.get("provider", "ollama")
-    base_url = (llm_config.get("baseUrl") or "").rstrip("/")
+    data = request.get_json(silent=True) or {}
+    llm_override = data.get("llm") if isinstance(data.get("llm"), dict) else {}
+    eff_llm = dict(llm_config)
+    if isinstance(llm_override, dict):
+        eff_llm.update(llm_override)
+
+    provider = eff_llm.get("provider", "ollama")
+    base_url = (eff_llm.get("baseUrl") or "").rstrip("/")
     headers = {"Content-Type": "application/json"}
-    if llm_config.get("apiKey"):
-        headers["Authorization"] = f"Bearer {llm_config['apiKey']}"
+    if eff_llm.get("apiKey"):
+        headers["Authorization"] = f"Bearer {eff_llm['apiKey']}"
     try:
         if provider == "ollama":
             ollama_url = base_url or "http://localhost:11434"
@@ -1837,12 +1897,23 @@ def get_embedding_models():
             models = [m.get("name", "") for m in resp.json().get("models", [])]
             return jsonify({"models": [m for m in models if m]})
         elif provider == "local_http":
-            endpoint = base_url or "http://localhost:8000"
-            resp = _http_get(f"{endpoint}/v1/models", headers=headers, timeout=10)
-            if not resp.ok:
-                return jsonify({"models": []})
-            models = [m.get("id") or m.get("name", "") for m in resp.json().get("data", [])]
-            return jsonify({"models": [m for m in models if m]})
+            api_base = _resolve_local_http_api_base(base_url)
+            candidates = [f"{api_base}/v1/models", f"{api_base}/models"]
+            for endpoint in candidates:
+                resp = _http_get(endpoint, headers=headers, timeout=10)
+                if not resp.ok:
+                    continue
+                payload = resp.json()
+                models = [
+                    m.get("id") or m.get("name", "")
+                    for m in (payload.get("data", []) if isinstance(payload.get("data"), list) else [])
+                    if isinstance(m, dict)
+                ]
+                # Fallback shape: {"models":[...]}
+                if not models and isinstance(payload.get("models"), list):
+                    models = [str(m) for m in payload.get("models", []) if str(m).strip()]
+                return jsonify({"models": [m for m in models if m]})
+            return jsonify({"models": []})
         return jsonify({"models": []})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
@@ -1850,10 +1921,38 @@ def get_embedding_models():
 
 @app.route("/api/rag/test-embedding", methods=["POST"])
 def test_embedding():
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
+    rag_override = {}
+    llm_override = {}
+
+    if isinstance(data.get("ragConfig"), dict):
+        rag_override.update(data["ragConfig"])
+    else:
+        for key in ("embeddingModel", "topK", "chunkSize", "esHost", "esIndex", "esUsername", "esPassword"):
+            if key in data:
+                rag_override[key] = data.get(key)
+
+    if isinstance(data.get("llm"), dict):
+        llm_override.update(data["llm"])
+    elif isinstance(data.get("llmConfig"), dict):
+        llm_override.update(data["llmConfig"])
+    else:
+        for key in ("provider", "model", "baseUrl", "apiKey", "contextWindow", "maxOutputTokens"):
+            if key in data:
+                llm_override[key] = data.get(key)
+
     try:
-        embedding = _get_embedding("test")
-        return jsonify({"success": True, "dims": len(embedding)})
+        embedding = _get_embedding(
+            "test",
+            rag_cfg=rag_override or None,
+            llm_cfg=llm_override or None,
+        )
+        return jsonify({
+            "success": True,
+            "dims": len(embedding),
+            "model": (rag_override.get("embeddingModel") or "").strip() or (llm_override.get("model") or llm_config.get("model")),
+            "provider": (llm_override.get("provider") or llm_config.get("provider", "ollama")),
+        })
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
@@ -1861,8 +1960,9 @@ def test_embedding():
 @app.route("/api/rag/index", methods=["POST"])
 def index_knowledge_to_es():
     """Embed all knowledge folders and index them in Elasticsearch."""
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     cfg = data.get("ragConfig", rag_config)
+    llm_override = data.get("llm") or data.get("llmConfig") or None
     db = read_db()
     folders = db.get("knowledge_folders", [])
 
@@ -1871,7 +1971,7 @@ def index_knowledge_to_es():
 
     try:
         # Determine embedding dimension by running one test embedding
-        test_vec = _get_embedding("test")
+        test_vec = _get_embedding("test", rag_cfg=cfg, llm_cfg=llm_override)
         dims = len(test_vec)
         _ensure_es_index(cfg, dims)
 
@@ -1901,7 +2001,11 @@ def index_knowledge_to_es():
 
             chunks = _chunk_text(content, chunk_size)
             for chunk_idx, chunk in enumerate(chunks):
-                embedding = _get_embedding(f"{title}\n\n{chunk}")
+                embedding = _get_embedding(
+                    f"{title}\n\n{chunk}",
+                    rag_cfg=cfg,
+                    llm_cfg=llm_override,
+                )
                 doc = {
                     "folder_id": folder_id,
                     "title": title,
@@ -1931,10 +2035,11 @@ def index_knowledge_to_es():
 @app.route("/api/rag/chat", methods=["POST"])
 def rag_chat():
     """RAG chat: embed query → ES kNN search → LLM augmented generation."""
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     query = data.get("query", "")
     history = data.get("history", [])
     cfg = data.get("ragConfig", rag_config)
+    llm_override = data.get("llm") or data.get("llmConfig") or None
     top_k = int(cfg.get("topK", 5))
 
     if not query:
@@ -1942,7 +2047,7 @@ def rag_chat():
 
     try:
         # 1. Embed the user query
-        query_embedding = _get_embedding(query)
+        query_embedding = _get_embedding(query, rag_cfg=cfg, llm_cfg=llm_override)
 
         # 2. kNN search in Elasticsearch
         host = cfg.get("esHost", "http://localhost:9200").rstrip("/")
@@ -3557,7 +3662,7 @@ Return ONLY JSON:
             max_result_chars=240,
         )
         synth_prompt = f"""You are a senior business data analyst.
-Write a clear and professional final answer with strong FUNCTIONAL focus.
+Write a clear, highly detailed and professional final answer with strong FUNCTIONAL focus.
 Use the same language as the USER QUESTION.
 
 USER QUESTION: {user_question}
@@ -3565,28 +3670,35 @@ USER QUESTION: {user_question}
 STEPS AND RESULTS:
 {chr(10).join(detailed_lines)}
 
-Output structure (plain text section titles, no markdown markers):
-Résumé exécutif:
+Output format: MARKDOWN with explicit section titles (## headings).
+Required sections in this exact order:
+## Résumé exécutif
 Short executive summary for decision-makers.
 
-Explications fonctionnelles:
-Explain business meaning of observed patterns (process, product, revenue, risk, operations).
+## Explications fonctionnelles détaillées
+Explain business meaning of observed patterns (process, product, revenue, risk, operations), with explicit business impacts.
 
-Déductions et conclusions fonctionnelles:
+## Deep Analysis et insights issus des résultats
+Provide deeper analytical insights from the evidence (patterns, ruptures, asymmetries, anomalies, operational implications).
+Each insight must reference concrete observed signals.
+
+## Déductions et conclusions fonctionnelles
 List key deductions and functional conclusions, each tied to evidence.
 
-Faits chiffrés et preuves:
+## Faits chiffrés et preuves
 List quantified facts and references to step evidence.
 
-Recommandations actionnables:
-Pragmatic next actions ordered by priority.
+## Conclusion finale détaillée
+Provide a detailed closing synthesis with implications, what can/cannot be concluded, and a decision-oriented narrative.
 
-Niveau de confiance et limites:
-State confidence and important caveats.
+## Niveau de confiance et limites
+State confidence level and important caveats.
 
 Requirements:
 - Prioritize functional interpretation, not only numbers.
 - Connect conclusions to explicit evidence from the steps.
+- Make the conclusion substantially detailed (not a short paragraph).
+- Do NOT include a section named "Recommandations actionnables" (or equivalent).
 - If data is missing or inconclusive, say it clearly."""
         context_limit = _get_effective_context_limit()
         if _estimate_tokens(synth_prompt) > context_limit:
@@ -3606,7 +3718,9 @@ Requirements:
 - Keep a clear functional/business focus.
 - Mention confidence level.
 - Mention gaps/limitations.
-- Give next best actions."""
+- Include a short "Deep Analysis et insights issus des résultats" section.
+- Include a detailed closing conclusion.
+- Do NOT include "Recommandations actionnables"."""
 
         try:
             return _call_llm(
@@ -3639,6 +3753,43 @@ Requirements:
                     "Synthèse partielle: la génération finale a été limitée par la fenêtre contextuelle du modèle. "
                     "Réduisez le périmètre (tables/période) pour une conclusion plus fiable."
                 )
+
+    def _sanitize_final_answer_text(answer_text: str, steps_so_far: list) -> str:
+        """Normalize final answer formatting and remove disallowed recommendation section."""
+        txt = str(answer_text or "").strip()
+        if not txt:
+            return txt
+
+        # Remove an explicit actionable recommendations section if generated anyway.
+        section_pattern = re.compile(
+            r'(?ims)^\s{0,3}(?:#{1,6}\s*)?(?:recommandations?\s+actionnables?|actionable\s+recommendations?)\s*:?\s*$'
+            r'.*?(?=^\s{0,3}(?:#{1,6}\s+\S|[A-ZÀ-ÖØ-Þ][^:\n]{1,80}:\s*$)|\Z)'
+        )
+        txt = re.sub(section_pattern, "", txt)
+        txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
+
+        # If deep-analysis section is missing, append a compact evidence-backed fallback.
+        has_deep_analysis = re.search(r"(?i)(deep\s+analysis|analyse\s+approfondie|insights\s+issus\s+des\s+résultats)", txt)
+        if not has_deep_analysis:
+            fallback_insights = []
+            for step in steps_so_far:
+                if step.get("type") != "query" or not step.get("ok"):
+                    continue
+                summary = " ".join(str(step.get("result_summary", "")).split())[:180]
+                if not summary:
+                    continue
+                fallback_insights.append(
+                    f"- Step {step.get('step')}: {summary}"
+                )
+                if len(fallback_insights) >= 3:
+                    break
+            if fallback_insights:
+                txt += (
+                    "\n\n## Deep Analysis et insights issus des résultats\n"
+                    + "\n".join(fallback_insights)
+                )
+
+        return txt
 
     initial_plan = _build_initial_agent_plan()
     current_plan_steps = list(initial_plan.get("plan_steps", []))
@@ -3845,7 +3996,9 @@ REACT DISCIPLINE:
 
 FINAL ANSWER QUALITY:
 - The final answer must remain professional and detailed with a strong functional/business focus.
-- Include functional explanations, deductions, and business conclusions in addition to factual metrics.
+- Include functional explanations, deep analytical insights, deductions, and business conclusions in addition to factual metrics.
+- The final answer must be formatted in MARKDOWN using clear section headings (## ...).
+- Never include a section called "Recommandations actionnables".
 
 WORKING MEMORY (TRANSIENT, FOR MULTI-HOP RETRIEVAL):
 {working_memory_block}
@@ -3896,7 +4049,7 @@ For the final answer:
 {{
   "action": "finish",
   "reasoning": "Why you have enough information to conclude",
-  "final_answer": "A detailed, structured answer with functional explanations, deductions, conclusions, quantified facts, actions and confidence"
+  "final_answer": "A detailed markdown answer with functional explanations, deep analysis insights from results, deductions, quantified evidence, a detailed final conclusion, and confidence limits"
 }}
 
 No markdown fences. Only raw JSON."""
@@ -3976,7 +4129,7 @@ For final answer:
 {{
   "action": "finish",
   "reasoning": "Why enough information is available",
-  "final_answer": "Structured answer with functional focus based on gathered evidence"
+  "final_answer": "Structured markdown answer with functional focus, deep insights, detailed conclusion, confidence and limitations"
 }}"""
             compact_total = _estimate_tokens(system_prompt + "Proceed with the next step.")
             if compact_total > context_limit:
@@ -4156,6 +4309,7 @@ Respond ONLY with valid JSON (no markdown):
                         "Ajoutez du contexte puis relancez la session."
                     )
                 )
+                final_answer = _sanitize_final_answer_text(final_answer, steps)
                 return jsonify({
                     "steps": steps,
                     "final_answer": final_answer,
@@ -4441,12 +4595,16 @@ Respond ONLY with valid JSON (no markdown):
             else:
                 # action == "finish"
                 decision_final = str(decision.get("final_answer", "")).strip()
-                final_answer = decision_final if decision_final else None
+                final_answer = (
+                    _sanitize_final_answer_text(decision_final, steps)
+                    if decision_final else None
+                )
                 break
 
         # If the loop exhausted all steps without finish, synthesize from evidence.
         if final_answer is None:
             final_answer = _synthesize_final_answer_from_steps(steps)
+        final_answer = _sanitize_final_answer_text(final_answer, steps)
 
         return jsonify({
             "steps": steps,
