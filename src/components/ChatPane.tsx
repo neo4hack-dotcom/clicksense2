@@ -669,6 +669,9 @@ export function ChatPane() {
   const [isLoading, setIsLoading] = useState(false);
   const [isAgentLoading, setIsAgentLoading] = useState(false);
   const [expandedSteps, setExpandedSteps] = useState<Record<number, boolean>>({});
+  // Table selection state — populated when the backend can't auto-identify tables
+  const [pendingAgentQuestion, setPendingAgentQuestion] = useState<string | null>(null);
+  const [selectedConfirmedTables, setSelectedConfirmedTables] = useState<string[]>([]);
   const [dismissedExecActions, setDismissedExecActions] = useState<Set<number>>(new Set());
 
   // CSV export state
@@ -753,31 +756,49 @@ export function ChatPane() {
     }
   };
 
-  const handleAgentSend = async () => {
-    const text = input.trim();
+  const handleAgentSend = async (overrideQuestion?: string, confirmedTables?: string[]) => {
+    const text = overrideQuestion ?? input.trim();
     if (!text) return;
 
-    setInput('');
-    addChatMessage({ role: 'user', content: text });
+    if (!overrideQuestion) setInput('');
+    if (!overrideQuestion) addChatMessage({ role: 'user', content: text });
     setIsAgentLoading(true);
+    setPendingAgentQuestion(null);
+    setSelectedConfirmedTables([]);
 
     try {
+      const body: Record<string, unknown> = {
+        question: text,
+        schema,
+        tableMetadata,
+        tableMappingFilter: selectedTableMappings,
+        maxSteps: agentMaxSteps,
+      };
+      if (confirmedTables && confirmedTables.length > 0) {
+        body.confirmedTables = confirmedTables;
+      }
+
       const res = await fetch('/api/agent', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          question: text,
-          schema,
-          tableMetadata,
-          tableMappingFilter: selectedTableMappings,
-          maxSteps: agentMaxSteps,
-        }),
+        body: JSON.stringify(body),
       });
 
       const data = await res.json();
 
       if (data.error) {
         addChatMessage({ role: 'assistant', content: `Agent error: ${data.error}` });
+      } else if (data.needs_table_selection) {
+        // Backend couldn't confidently identify the tables — ask the user
+        addChatMessage({
+          role: 'assistant',
+          content: data.question || 'Sélectionnez les tables à analyser :',
+          is_agent: true,
+          needs_table_selection: true,
+          candidate_tables: data.candidate_tables || [],
+          pending_question: text,
+        });
+        setPendingAgentQuestion(text);
       } else {
         addChatMessage({
           role: 'assistant',
@@ -1339,10 +1360,17 @@ export function ChatPane() {
               )}>
                 {msg.is_agent && (
                   <div className="flex items-center gap-1.5 mb-2">
-                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-700 text-[10px] font-semibold uppercase tracking-wide">
-                      <Brain size={9} />
-                      Agent Analysis
-                    </span>
+                    {msg.needs_table_selection ? (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 text-[10px] font-semibold uppercase tracking-wide">
+                        <Database size={9} />
+                        Sélection de table requise
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-700 text-[10px] font-semibold uppercase tracking-wide">
+                        <Brain size={9} />
+                        Agent Analysis
+                      </span>
+                    )}
                     {msg.agent_steps && (
                       <span className="text-[10px] text-indigo-400">{msg.agent_steps.length} step{msg.agent_steps.length > 1 ? 's' : ''}</span>
                     )}
@@ -1359,6 +1387,74 @@ export function ChatPane() {
                     onSelect={handleSend}
                   />
                 )}
+
+                {/* Agent table selection panel */}
+                {msg.needs_table_selection && msg.candidate_tables && msg.candidate_tables.length > 0 && (() => {
+                  const isLastAssistant = chatHistory.slice(i + 1).every(m => m.role !== 'assistant');
+                  // Local selection state tracked via selectedConfirmedTables + pendingAgentQuestion
+                  return (
+                    <div className="mt-3 border border-amber-300 rounded-xl overflow-hidden bg-amber-50">
+                      <div className="px-3 py-2 bg-amber-100 border-b border-amber-200 flex items-center gap-2">
+                        <AlertTriangle size={13} className="text-amber-600 shrink-0" />
+                        <span className="text-xs font-semibold text-amber-700">
+                          Sélectionnez les tables à analyser
+                        </span>
+                      </div>
+                      <div className="p-3 space-y-3">
+                        <div className="flex flex-wrap gap-2">
+                          {msg.candidate_tables.map((tbl) => {
+                            const sel = selectedConfirmedTables.includes(tbl);
+                            return (
+                              <button
+                                key={tbl}
+                                disabled={!isLastAssistant}
+                                onClick={() =>
+                                  setSelectedConfirmedTables(prev =>
+                                    prev.includes(tbl)
+                                      ? prev.filter(t => t !== tbl)
+                                      : [...prev, tbl]
+                                  )
+                                }
+                                className={clsx(
+                                  'flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-mono transition-colors',
+                                  sel
+                                    ? 'bg-indigo-600 border-indigo-600 text-white'
+                                    : 'bg-white border-slate-300 text-slate-700 hover:border-indigo-400 hover:text-indigo-700',
+                                  !isLastAssistant && 'opacity-50 cursor-default',
+                                )}
+                              >
+                                <Database size={10} />
+                                {tbl}
+                                {sel && <CheckCircle2 size={10} className="text-white" />}
+                              </button>
+                            );
+                          })}
+                        </div>
+                        {isLastAssistant && (
+                          <button
+                            disabled={selectedConfirmedTables.length === 0 || isAgentLoading}
+                            onClick={() => {
+                              if (msg.pending_question && selectedConfirmedTables.length > 0) {
+                                handleAgentSend(msg.pending_question, selectedConfirmedTables);
+                              }
+                            }}
+                            className={clsx(
+                              'flex items-center gap-2 px-4 py-1.5 rounded-lg text-xs font-semibold transition-colors',
+                              selectedConfirmedTables.length > 0
+                                ? 'bg-indigo-600 hover:bg-indigo-700 text-white'
+                                : 'bg-slate-200 text-slate-400 cursor-default',
+                            )}
+                          >
+                            {isAgentLoading
+                              ? <><Loader2 size={11} className="animate-spin" /> Analyse en cours…</>
+                              : <><Brain size={11} /> Lancer l'analyse ({selectedConfirmedTables.length} table{selectedConfirmedTables.length > 1 ? 's' : ''})</>
+                            }
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })()}
 
                 {/* SQL block */}
                 {msg.sql && (

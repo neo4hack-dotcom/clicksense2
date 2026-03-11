@@ -1803,18 +1803,24 @@ def _identify_relevant_tables(
     all_tables_schema: dict,
     all_table_metadata: dict,
     table_mappings: dict,
-) -> list:
+) -> dict:
     """Lightweight LLM call to identify which tables are relevant to the user's question.
 
-    Returns a list of table names to include in the agent context.
-    Falls back to all tables on any failure.
+    Returns a dict:
+      {
+        "tables": [list of table names to use],
+        "needs_selection": bool,   # True when the LLM is unsure → ask the user
+        "candidates": [all table names, sorted by likely relevance],
+      }
     """
-    if not all_tables_schema:
-        return []
+    all_table_names = list(all_tables_schema.keys())
 
-    # If only a few tables, skip the identification step (not worth an extra LLM call)
+    if not all_tables_schema:
+        return {"tables": [], "needs_selection": False, "candidates": []}
+
+    # Skip identification for tiny schemas
     if len(all_tables_schema) <= 3:
-        return list(all_tables_schema.keys())
+        return {"tables": all_table_names, "needs_selection": False, "candidates": all_table_names}
 
     # Build a compact one-line summary per table (names + columns, no full schema)
     table_summaries = []
@@ -1825,58 +1831,97 @@ def _identify_relevant_tables(
         description = (meta.get("description", "") if isinstance(meta, dict) else str(meta))[:150]
         line = f"- {tbl}"
         if friendly:
-            line += f' ("{friendly}")'
+            line += f' (alias: "{friendly}")'
         if description:
-            line += f": {description}"
+            line += f" — {description}"
         shown_cols = col_names[:25]
-        line += f"\n  Columns: {', '.join(shown_cols)}"
+        line += f"\n  Colonnes: {', '.join(shown_cols)}"
         if len(col_names) > 25:
-            line += f" … (+{len(col_names) - 25} more)"
+            line += f" … (+{len(col_names) - 25} autres)"
         table_summaries.append(line)
 
     tables_overview = "\n".join(table_summaries)
 
-    identification_prompt = f"""You are a data analyst assistant.
-Given the user's question and the list of available database tables, identify which tables are needed to answer the question.
+    identification_prompt = f"""Tu es un assistant data analyst. Ta seule tâche est d'identifier quelles tables de base de données sont nécessaires pour répondre à la question de l'utilisateur.
 
-AVAILABLE TABLES:
+TABLES DISPONIBLES (noms exacts à réutiliser tels quels) :
 {tables_overview}
 
-USER QUESTION:
+QUESTION UTILISATEUR :
 {question}
 
-INSTRUCTIONS:
-- List ONLY table names that are directly needed (including tables required for JOINs).
-- Do NOT include irrelevant tables.
-- When in doubt, include the table.
+RÈGLES :
+1. Retourne UNIQUEMENT les noms de tables tels qu'ils apparaissent dans la liste ci-dessus (respect de la casse, aucune modification).
+2. Inclus toutes les tables nécessaires pour les JOINs.
+3. Si tu n'es pas sûr de quelle table utiliser, indique confidence = "low".
+4. Si la question ne correspond à aucune table évidente, indique confidence = "low".
 
-Respond ONLY with valid JSON (no markdown):
+Réponds UNIQUEMENT avec du JSON valide (sans markdown) :
 {{
-  "relevant_tables": ["table_name_1", "table_name_2"],
-  "reasoning": "Brief explanation"
+  "relevant_tables": ["nom_exact_table_1", "nom_exact_table_2"],
+  "confidence": "high" | "medium" | "low",
+  "reasoning": "Explication courte"
 }}"""
+
+    # Build a normalized lookup for fuzzy matching: lowercase → real name
+    normalized_lookup = {t.lower().strip(): t for t in all_table_names}
 
     try:
         content = _call_llm(
             identification_prompt,
-            [{"role": "user", "content": "Identify the relevant tables."}],
+            [{"role": "user", "content": "Identifie les tables pertinentes."}],
             temperature=0.0,
         )
         result = _parse_llm_json(content)
         if result and isinstance(result.get("relevant_tables"), list):
-            valid = [t for t in result["relevant_tables"] if t in all_tables_schema]
-            if valid:
+            confidence = result.get("confidence", "medium")
+
+            # First pass: exact match
+            exact_valid = [t for t in result["relevant_tables"] if t in all_tables_schema]
+
+            # Second pass: case-insensitive fuzzy match for names the LLM may have mangled
+            fuzzy_valid = list(exact_valid)
+            for raw in result["relevant_tables"]:
+                norm = raw.lower().strip()
+                if norm in normalized_lookup and normalized_lookup[norm] not in fuzzy_valid:
+                    fuzzy_valid.append(normalized_lookup[norm])
+                    print(f"[Table ID] Fuzzy-matched '{raw}' → '{normalized_lookup[norm]}'")
+
+            if fuzzy_valid:
+                if confidence == "low":
+                    print(
+                        f"[Table ID] Low confidence — will ask user to confirm. "
+                        f"Candidates: {fuzzy_valid}"
+                    )
+                    return {
+                        "tables": fuzzy_valid,
+                        "needs_selection": True,
+                        "candidates": all_table_names,
+                    }
+
                 print(
-                    f"[Table ID] {len(valid)}/{len(all_tables_schema)} tables selected: {valid}"
-                    f" — {result.get('reasoning', '')}"
+                    f"[Table ID] {len(fuzzy_valid)}/{len(all_tables_schema)} tables — "
+                    f"conf={confidence}: {fuzzy_valid} — {result.get('reasoning', '')}"
                 )
-                return valid
+                return {
+                    "tables": fuzzy_valid,
+                    "needs_selection": False,
+                    "candidates": all_table_names,
+                }
+
+            # LLM returned table names that don't match anything → ask user
+            print(
+                f"[Table ID] No valid tables found in LLM response "
+                f"({result.get('relevant_tables')}) — asking user to select"
+            )
+            return {"tables": [], "needs_selection": True, "candidates": all_table_names}
+
     except Exception as exc:
         print(f"[Table ID] Identification failed: {exc}")
 
-    # Fallback: use all tables
-    print("[Table ID] Falling back to all tables")
-    return list(all_tables_schema.keys())
+    # LLM call failed entirely → ask user rather than blindly dumping everything
+    print("[Table ID] LLM call failed — asking user to select tables")
+    return {"tables": [], "needs_selection": True, "candidates": all_table_names}
 
 
 @app.route("/api/agent", methods=["POST"])
@@ -1891,6 +1936,8 @@ def agent_analysis():
     schema = data.get("schema", {})
     table_metadata = data.get("tableMetadata", {})
     table_mapping_filter = data.get("tableMappingFilter", [])
+    # Tables explicitly confirmed by the user via the selection UI (skips auto-identification)
+    confirmed_tables = data.get("confirmedTables", [])
 
     if not user_question.strip():
         return jsonify({"error": "No question provided"}), 400
@@ -1911,13 +1958,36 @@ def agent_analysis():
     all_mappings = {m["table_name"]: m["mapping_name"] for m in db.get("table_mappings", [])}
 
     # ── Step 0: Table identification ──────────────────────────────────────────
-    # Ask the LLM to identify which tables are relevant BEFORE building the
-    # full schema string, so we never send unnecessary context to the model.
-    relevant_tables = _identify_relevant_tables(
-        user_question, schema, table_metadata, all_mappings
-    )
-    schema = {t: cols for t, cols in schema.items() if t in relevant_tables}
-    table_metadata = {t: v for t, v in table_metadata.items() if t in relevant_tables}
+    if confirmed_tables:
+        # User already selected tables through the UI — trust their choice, skip LLM call
+        schema = {t: cols for t, cols in schema.items() if t in confirmed_tables}
+        table_metadata = {t: v for t, v in table_metadata.items() if t in confirmed_tables}
+        print(f"[Table ID] Using user-confirmed tables: {list(schema.keys())}")
+    else:
+        # Ask the LLM to identify which tables are relevant BEFORE building the full
+        # schema string, so we never send unnecessary context to the model.
+        id_result = _identify_relevant_tables(
+            user_question, schema, table_metadata, all_mappings
+        )
+
+        if id_result["needs_selection"]:
+            # LLM is not confident enough — ask the user to pick the tables
+            candidates = id_result["candidates"] or list(schema.keys())
+            print(f"[Table ID] Asking user to confirm tables. Candidates: {candidates}")
+            return jsonify({
+                "needs_table_selection": True,
+                "candidate_tables": candidates,
+                "question": (
+                    "Je n'ai pas pu identifier avec certitude quelles tables concernent "
+                    "votre demande. Merci de sélectionner la ou les tables à analyser :"
+                ),
+                "steps": [],
+                "final_answer": "",
+            })
+
+        relevant_tables = id_result["tables"]
+        schema = {t: cols for t, cols in schema.items() if t in relevant_tables}
+        table_metadata = {t: v for t, v in table_metadata.items() if t in relevant_tables}
 
     # Recompute mapping note after filtering
     mapping_lines = [

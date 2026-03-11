@@ -92,6 +92,9 @@ interface AppState {
       row_count: number;
       ok: boolean;
     }[];
+    needs_table_selection?: boolean;
+    candidate_tables?: string[];
+    pending_question?: string;
   }[];
   addChatMessage: (msg: {
     role: 'user' | 'assistant';
@@ -115,6 +118,9 @@ interface AppState {
       row_count: number;
       ok: boolean;
     }[];
+    needs_table_selection?: boolean;
+    candidate_tables?: string[];
+    pending_question?: string;
   }) => void;
   clearChatHistory: () => void;
   // clearChatHistory also resets conversationId automatically
