@@ -5,8 +5,13 @@ import {
   Brain, ChevronDown, ChevronRight, CheckCircle2, XCircle, Database,
   AlertTriangle, Info, Lightbulb, TrendingUp, TrendingDown, BarChart2, BookOpen,
   Download, FolderOpen, FileText, Zap, ShieldAlert, ShieldCheck,
-  Tag, Calculator, Calendar, Layers, Search, Table2, HelpCircle,
+  Tag, Calculator, Calendar, Layers, Search, Table2, HelpCircle, LineChart, PieChart, AreaChart, SlidersHorizontal,
 } from 'lucide-react';
+import {
+  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Legend,
+  ResponsiveContainer, LineChart as RechartsLineChart, Line,
+  AreaChart as RechartsAreaChart, Area, PieChart as RechartsPieChart, Pie, Cell,
+} from 'recharts';
 import { useAppStore } from '../store';
 import clsx from 'clsx';
 import { motion, AnimatePresence } from 'motion/react';
@@ -630,6 +635,22 @@ function ClarificationPanel({
   );
 }
 
+// ── AI Chart Panel ──────────────────────────────────────────────────────────
+
+const AI_CHART_COLORS = ['#10b981', '#3b82f6', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4'];
+
+interface AiChartPanelState {
+  open: boolean;
+  sql: string;
+  data: any[];
+  loading: boolean;
+  error: string | null;
+  chartType: 'bar' | 'line' | 'area' | 'pie';
+  xKey: string;
+  yKeys: string[];
+  title: string;
+}
+
 export function ChatPane() {
   const {
     chatHistory, addChatMessage, clearChatHistory,
@@ -656,6 +677,10 @@ export function ChatPane() {
   const [exportPath, setExportPath] = useState('');
   const [isExporting, setIsExporting] = useState(false);
   const [exportResult, setExportResult] = useState<{ success: boolean; message: string } | null>(null);
+  const [aiChart, setAiChart] = useState<AiChartPanelState>({
+    open: false, sql: '', data: [], loading: false, error: null,
+    chartType: 'bar', xKey: '', yKeys: [], title: '',
+  });
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const scrollToBottom = () => {
@@ -814,6 +839,28 @@ export function ChatPane() {
     setExportDialogOpen(true);
   };
 
+  const openAiChart = async (sql: string, title: string) => {
+    setAiChart(prev => ({ ...prev, open: true, sql, title, data: [], loading: true, error: null }));
+    try {
+      const res = await fetch('/api/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: sql }),
+      });
+      const d = await res.json();
+      if (d.error) throw new Error(d.error);
+      const data = d.data || [];
+      const keys = data.length > 0 ? Object.keys(data[0]) : [];
+      setAiChart(prev => ({
+        ...prev, loading: false, data,
+        xKey: keys[0] || '',
+        yKeys: keys.slice(1, 4).filter(Boolean),
+      }));
+    } catch (e: any) {
+      setAiChart(prev => ({ ...prev, loading: false, error: e.message }));
+    }
+  };
+
   const handleExportCsv = async () => {
     setIsExporting(true);
     setExportResult(null);
@@ -868,8 +915,130 @@ export function ChatPane() {
     }
   };
 
+  const renderAiChartPanel = () => {
+    if (!aiChart.open) return null;
+    const keys = aiChart.data.length > 0 ? Object.keys(aiChart.data[0]) : [];
+    const numericKeys = keys.filter(k => {
+      const v = aiChart.data[0]?.[k];
+      return typeof v === 'number' || (!isNaN(Number(v)) && v !== '' && v !== null);
+    });
+    const yKeys = aiChart.yKeys.length > 0 ? aiChart.yKeys : (numericKeys.length > 0 ? [numericKeys[0]] : []);
+    const xKey = aiChart.xKey || (keys[0] ?? '');
+    return (
+      <div className="w-80 shrink-0 bg-white border-l border-slate-200 flex flex-col h-full overflow-hidden">
+        <div className="px-3 py-2.5 border-b border-slate-200 bg-gradient-to-r from-violet-600 to-purple-700 flex items-center justify-between shrink-0">
+          <div className="flex items-center gap-2">
+            <BarChart2 size={14} className="text-white" />
+            <span className="text-sm font-semibold text-white">AI Chart</span>
+          </div>
+          <button onClick={() => setAiChart(prev => ({ ...prev, open: false }))} className="text-white/70 hover:text-white p-0.5">
+            <X size={15} />
+          </button>
+        </div>
+        <div className="p-3 border-b border-slate-100 space-y-2 shrink-0 overflow-y-auto" style={{ maxHeight: '180px' }}>
+          <div>
+            <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block mb-1">Chart Type</label>
+            <div className="flex gap-1">
+              {(['bar', 'line', 'area', 'pie'] as const).map(t => (
+                <button key={t} onClick={() => setAiChart(prev => ({ ...prev, chartType: t }))}
+                  className={clsx("flex-1 py-1 rounded text-xs font-medium transition-colors capitalize", aiChart.chartType === t ? "bg-violet-600 text-white" : "bg-slate-100 text-slate-600 hover:bg-slate-200")}>
+                  {t}
+                </button>
+              ))}
+            </div>
+          </div>
+          {aiChart.chartType !== 'pie' && keys.length > 0 && (
+            <div>
+              <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block mb-1">X Axis</label>
+              <select value={aiChart.xKey} onChange={e => setAiChart(prev => ({ ...prev, xKey: e.target.value }))} className="w-full text-xs border border-slate-200 rounded px-2 py-1 bg-slate-50">
+                {keys.map(k => <option key={k} value={k}>{k}</option>)}
+              </select>
+            </div>
+          )}
+          <div>
+            <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block mb-1">{aiChart.chartType === 'pie' ? 'Value' : 'Y Axis'}</label>
+            <div className="flex flex-wrap gap-1">
+              {(aiChart.chartType === 'pie' ? keys : numericKeys).map(k => (
+                <button key={k} onClick={() => {
+                  if (aiChart.chartType === 'pie') {
+                    setAiChart(prev => ({ ...prev, yKeys: [k] }));
+                  } else {
+                    setAiChart(prev => ({ ...prev, yKeys: prev.yKeys.includes(k) ? prev.yKeys.filter(y => y !== k) : [...prev.yKeys, k] }));
+                  }
+                }}
+                  className={clsx("text-[10px] px-1.5 py-0.5 rounded border transition-colors", aiChart.yKeys.includes(k) ? "bg-violet-100 border-violet-300 text-violet-700" : "bg-white border-slate-200 text-slate-500 hover:border-violet-300")}>
+                  {k}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+        <div className="flex-1 min-h-0 overflow-auto p-2">
+          {aiChart.loading ? (
+            <div className="flex items-center justify-center h-32"><Loader2 className="animate-spin text-violet-500" size={20} /></div>
+          ) : aiChart.error ? (
+            <div className="text-xs text-red-600 p-2 bg-red-50 rounded">{aiChart.error}</div>
+          ) : aiChart.data.length === 0 ? (
+            <div className="text-xs text-slate-400 text-center py-8">No data</div>
+          ) : aiChart.chartType === 'bar' ? (
+            <ResponsiveContainer width="100%" height={200}>
+              <BarChart data={aiChart.data}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                <XAxis dataKey={xKey} tick={{ fontSize: 9 }} />
+                <YAxis tick={{ fontSize: 9 }} />
+                <RechartsTooltip contentStyle={{ fontSize: 10 }} />
+                <Legend wrapperStyle={{ fontSize: 10 }} />
+                {yKeys.map((k, i) => <Bar key={k} dataKey={k} fill={AI_CHART_COLORS[i % AI_CHART_COLORS.length]} radius={[3,3,0,0]} />)}
+              </BarChart>
+            </ResponsiveContainer>
+          ) : aiChart.chartType === 'line' ? (
+            <ResponsiveContainer width="100%" height={200}>
+              <RechartsLineChart data={aiChart.data}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                <XAxis dataKey={xKey} tick={{ fontSize: 9 }} />
+                <YAxis tick={{ fontSize: 9 }} />
+                <RechartsTooltip contentStyle={{ fontSize: 10 }} />
+                <Legend wrapperStyle={{ fontSize: 10 }} />
+                {yKeys.map((k, i) => <Line key={k} type="monotone" dataKey={k} stroke={AI_CHART_COLORS[i % AI_CHART_COLORS.length]} strokeWidth={2} dot={false} />)}
+              </RechartsLineChart>
+            </ResponsiveContainer>
+          ) : aiChart.chartType === 'area' ? (
+            <ResponsiveContainer width="100%" height={200}>
+              <RechartsAreaChart data={aiChart.data}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                <XAxis dataKey={xKey} tick={{ fontSize: 9 }} />
+                <YAxis tick={{ fontSize: 9 }} />
+                <RechartsTooltip contentStyle={{ fontSize: 10 }} />
+                <Legend wrapperStyle={{ fontSize: 10 }} />
+                {yKeys.map((k, i) => <Area key={k} type="monotone" dataKey={k} stroke={AI_CHART_COLORS[i % AI_CHART_COLORS.length]} fill={AI_CHART_COLORS[i % AI_CHART_COLORS.length]} fillOpacity={0.2} strokeWidth={2} />)}
+              </RechartsAreaChart>
+            </ResponsiveContainer>
+          ) : (() => {
+            const valueKey = yKeys[0] || xKey;
+            const nameKey = keys.find(k => k !== valueKey) || xKey;
+            return (
+              <ResponsiveContainer width="100%" height={200}>
+                <RechartsPieChart>
+                  <Pie data={aiChart.data} dataKey={valueKey} nameKey={nameKey} cx="50%" cy="50%" outerRadius={70} innerRadius={35} paddingAngle={2}>
+                    {aiChart.data.map((_, idx) => <Cell key={idx} fill={AI_CHART_COLORS[idx % AI_CHART_COLORS.length]} />)}
+                  </Pie>
+                  <RechartsTooltip contentStyle={{ fontSize: 10 }} />
+                  <Legend wrapperStyle={{ fontSize: 10 }} />
+                </RechartsPieChart>
+              </ResponsiveContainer>
+            );
+          })()}
+        </div>
+        {aiChart.data.length > 0 && (
+          <div className="px-3 py-1.5 border-t border-slate-100 text-[10px] text-slate-400 shrink-0">{aiChart.data.length} rows loaded</div>
+        )}
+      </div>
+    );
+  };
+
   return (
-    <div className="flex flex-col h-full bg-slate-50 border-r border-slate-200">
+    <div className="flex flex-col h-full bg-slate-50 border-r border-slate-200" style={aiChart.open ? { flexDirection: 'row', flexWrap: 'nowrap' } : {}}>
+      <div className={clsx("flex flex-col min-w-0", aiChart.open ? "flex-1" : "h-full")}>
       {/* Header */}
       <div className="border-b border-slate-200 bg-white shrink-0">
         <div className="p-4 flex items-center justify-between">
@@ -1219,6 +1388,14 @@ export function ChatPane() {
                           <Play size={11} />
                           Run
                         </button>
+                        <button
+                          onClick={() => openAiChart(msg.sql!, chatHistory[i - 1]?.content || 'Chart')}
+                          className="flex items-center gap-1 text-xs bg-violet-600 hover:bg-violet-500 text-white px-2.5 py-1 rounded-md transition-colors"
+                          title="Create AI chart from this query"
+                        >
+                          <BarChart2 size={11} />
+                          AI Chart
+                        </button>
                       </div>
                     </div>
                     <pre className="p-3 text-xs font-mono text-emerald-400 overflow-x-auto">
@@ -1471,6 +1648,8 @@ export function ChatPane() {
           </div>
         </div>
       )}
+      </div>
+      {renderAiChartPanel()}
     </div>
   );
 }

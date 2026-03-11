@@ -149,6 +149,9 @@ interface AppState {
 
   agentMaxSteps: number;
   setAgentMaxSteps: (steps: number) => void;
+
+  consoleOpen: boolean;
+  setConsoleOpen: (open: boolean) => void;
 }
 
 export const useAppStore = create<AppState>((set) => ({
@@ -221,4 +224,7 @@ export const useAppStore = create<AppState>((set) => ({
 
   agentMaxSteps: 10,
   setAgentMaxSteps: (agentMaxSteps) => set({ agentMaxSteps }),
+
+  consoleOpen: false,
+  setConsoleOpen: (consoleOpen) => set({ consoleOpen }),
 }));

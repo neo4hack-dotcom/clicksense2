@@ -24,8 +24,8 @@ import { CSS } from '@dnd-kit/utilities';
 import {
   GripVertical, X, Table, BarChart2, PieChart, LineChart, Play, Sparkles, Star, RefreshCw,
   Maximize2, Minimize2, Palette, ArrowUp, ArrowDown, Filter, RotateCcw, Search, Plus,
-  History, Brain, AlertTriangle, Lightbulb, TrendingUp, Grid3X3, AreaChart, ScatterChart,
-  ChevronRight, Clock, LayoutGrid, Activity, Telescope, ChevronDown, CheckCircle2,
+  Brain, AlertTriangle, Lightbulb, TrendingUp, Grid3X3, AreaChart, ScatterChart,
+  ChevronRight, LayoutGrid, Activity, Telescope, ChevronDown, CheckCircle2,
   Database, Hash, Type, Calendar, ToggleLeft, Percent, Layers, Download, FolderOpen, Loader2
 } from 'lucide-react';
 import {
@@ -213,12 +213,6 @@ interface AiAnalysisState {
   sql: string;
 }
 
-interface HistoryEntry {
-  id: number;
-  query_text: string;
-  sql: string;
-  created_at: string;
-}
 
 interface ColumnStat {
   name: string;
@@ -267,11 +261,7 @@ export function BuilderPane() {
   const [showColorPicker, setShowColorPicker] = useState<string | null>(null);
   const [fieldSearch, setFieldSearch] = useState('');
   const [tableSearch, setTableSearch] = useState('');
-  const [showHistory, setShowHistory] = useState(false);
-  const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>([]);
-  const [loadingHistory, setLoadingHistory] = useState(false);
-  const [showTableSearchPopup, setShowTableSearchPopup] = useState(false);
-  const [tableSearchPopupQuery, setTableSearchPopupQuery] = useState('');
+  const [expandedTables, setExpandedTables] = useState<Set<string>>(new Set());
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const [chartOverflows, setChartOverflows] = useState(false);
 
@@ -516,46 +506,6 @@ export function BuilderPane() {
       setQueryConfig({ ...queryConfig, measures: [...queryConfig.measures, { column: col, agg }] });
     }
     setAddMeasureFor(null);
-  };
-
-  // Fetch query history (use currentUser.id or default to 1)
-  const fetchHistory = async () => {
-    setLoadingHistory(true);
-    try {
-      const userId = currentUser?.id ?? 1;
-      const res = await fetch(`/api/history/${userId}`);
-      const data = await res.json();
-      setHistoryEntries(Array.isArray(data) ? data : []);
-    } catch (e) {
-      console.error(e);
-    } finally {
-      setLoadingHistory(false);
-    }
-  };
-
-  const handleShowHistory = () => {
-    setShowHistory(v => !v);
-    if (!showHistory) fetchHistory();
-  };
-
-  // Replay a historical query
-  const replayHistoryEntry = async (sql: string) => {
-    setIsExecuting(true);
-    setShowHistory(false);
-    try {
-      const res = await fetch('/api/query', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: sql }),
-      });
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
-      setQueryResult(data.data);
-    } catch (error: any) {
-      alert(`Query Error: ${error.message}`);
-    } finally {
-      setIsExecuting(false);
-    }
   };
 
   // Drill-through: run SELECT * — works with or without dimensions
@@ -1386,17 +1336,6 @@ export function BuilderPane() {
               Clear
             </button>
             <button
-              onClick={handleShowHistory}
-              className={clsx(
-                "flex items-center gap-1.5 border px-3 py-1.5 rounded-lg text-sm font-medium transition-colors shadow-sm",
-                showHistory ? "bg-slate-800 border-slate-700 text-white" : "bg-white border-slate-200 text-slate-600 hover:bg-slate-50"
-              )}
-              title="Query History"
-            >
-              <History size={14} />
-              History
-            </button>
-            <button
               onClick={openAIExplore}
               className="flex items-center gap-1.5 bg-gradient-to-r from-indigo-500 to-purple-600 hover:from-indigo-600 hover:to-purple-700 text-white px-3 py-1.5 rounded-lg text-sm font-medium transition-all shadow-sm"
               title="AI Explore — profile a table with AI"
@@ -1553,18 +1492,14 @@ export function BuilderPane() {
       <div className="flex-1 flex overflow-hidden">
         {/* Schema Sidebar */}
         <div className="w-80 bg-white border-r border-slate-200 flex flex-col h-full">
-          {/* Table Selector */}
-          <div className="p-4 border-b border-slate-200 shrink-0">
-            <div className="flex items-center justify-between mb-2">
-              <h3 className="text-sm font-semibold text-slate-800">Select Table</h3>
-              <div className="flex items-center gap-1">
-                <button
-                  onClick={() => { setTableSearchPopupQuery(''); setShowTableSearchPopup(true); }}
-                  className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors"
-                  title="Browse tables & columns"
-                >
-                  <Telescope size={14} />
-                </button>
+          {/* Unified Tables & Columns Browser */}
+          <div className="shrink-0">
+            <div className="px-3 pt-3 pb-2 border-b border-slate-100">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-sm font-semibold text-slate-800 flex items-center gap-1.5">
+                  Tables
+                  <span className="text-[10px] font-normal text-slate-400 bg-slate-100 px-1.5 py-0.5 rounded-full">{tables.length}</span>
+                </h3>
                 <button
                   onClick={handleRefreshSchema}
                   disabled={isRefreshingSchema}
@@ -1574,39 +1509,95 @@ export function BuilderPane() {
                   <RefreshCw size={14} className={isRefreshingSchema ? "animate-spin" : ""} />
                 </button>
               </div>
-            </div>
-            {/* Table search */}
-            <div className="relative mb-2">
-              <Search size={12} className="absolute left-2 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
-              <input
-                type="text"
-                placeholder="Search tables…"
-                value={tableSearch}
-                onChange={(e) => setTableSearch(e.target.value)}
-                className="w-full text-xs pl-6 pr-6 py-1.5 border border-slate-200 rounded-md focus:ring-1 focus:ring-emerald-500 outline-none bg-slate-50"
-              />
-              {tableSearch && (
-                <button onClick={() => setTableSearch('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600">
-                  <X size={11} />
-                </button>
-              )}
-            </div>
-            <div className="max-h-[38px] overflow-y-auto border border-slate-200 rounded-lg bg-slate-50">
-              {tables.filter(t => !tableSearch || t.toLowerCase().includes(tableSearch.toLowerCase())).map(t => (
-                <div
-                  key={t}
-                  onClick={() => handleTableSelect(t)}
-                  className={clsx("px-3 py-1.5 text-sm cursor-pointer flex items-center justify-between hover:bg-slate-100 border-b border-slate-100 last:border-0", selectedTable === t && "bg-emerald-50 text-emerald-700 font-medium")}
-                >
-                  <span className="truncate">{t}</span>
-                  <button
-                    onClick={(e) => { e.stopPropagation(); toggleFavorite(t); }}
-                    className={clsx("shrink-0 p-1 rounded hover:bg-slate-200", tableMetadata[t]?.is_favorite ? "text-amber-400" : "text-slate-300")}
-                  >
-                    <Star size={14} fill={tableMetadata[t]?.is_favorite ? "currentColor" : "none"} />
+              <div className="relative">
+                <Search size={12} className="absolute left-2 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
+                <input
+                  type="text"
+                  placeholder="Search tables or columns…"
+                  value={tableSearch}
+                  onChange={(e) => setTableSearch(e.target.value)}
+                  className="w-full text-xs pl-6 pr-6 py-1.5 border border-slate-200 rounded-md focus:ring-1 focus:ring-emerald-500 outline-none bg-slate-50"
+                />
+                {tableSearch && (
+                  <button onClick={() => setTableSearch('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600">
+                    <X size={11} />
                   </button>
-                </div>
-              ))}
+                )}
+              </div>
+            </div>
+            <div className="overflow-y-auto border-b border-slate-200" style={{ maxHeight: '280px' }}>
+              {tables
+                .filter(t => {
+                  if (!tableSearch) return true;
+                  const q = tableSearch.toLowerCase();
+                  if (t.toLowerCase().includes(q)) return true;
+                  return (schema[t] || []).some((c: any) => c.name.toLowerCase().includes(q) || c.type.toLowerCase().includes(q));
+                })
+                .map(t => {
+                  const cols: any[] = schema[t] || [];
+                  const q = tableSearch.toLowerCase();
+                  const isExp = expandedTables.has(t);
+                  const matchedCols = q ? cols.filter((c: any) => c.name.toLowerCase().includes(q) || c.type.toLowerCase().includes(q)) : [];
+                  const showCols = isExp || matchedCols.length > 0;
+                  const displayCols = isExp ? cols : matchedCols;
+                  return (
+                    <div key={t} className="border-b border-slate-100 last:border-0">
+                      <div className={clsx(
+                        "flex items-center gap-1 pl-1.5 pr-2 py-1.5 hover:bg-slate-50 transition-colors",
+                        selectedTable === t ? "bg-emerald-50" : ""
+                      )}>
+                        <button
+                          onClick={() => setExpandedTables(prev => {
+                            const n = new Set(prev);
+                            if (n.has(t)) n.delete(t); else n.add(t);
+                            return n;
+                          })}
+                          className="p-0.5 text-slate-400 hover:text-slate-600 shrink-0"
+                          title={isExp || matchedCols.length > 0 ? "Collapse" : "Expand columns"}
+                        >
+                          {(isExp || matchedCols.length > 0) ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+                        </button>
+                        <div
+                          className="flex-1 flex items-center gap-1.5 min-w-0 cursor-pointer py-0.5"
+                          onClick={() => handleTableSelect(t)}
+                        >
+                          <Table size={11} className={clsx("shrink-0", selectedTable === t ? "text-emerald-600" : "text-slate-400")} />
+                          <span className={clsx("text-sm truncate", selectedTable === t ? "text-emerald-700 font-semibold" : "text-slate-700")}>{t}</span>
+                          <span className="text-[10px] text-slate-400 shrink-0 ml-auto">{cols.length}</span>
+                        </div>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); toggleFavorite(t); }}
+                          className={clsx("shrink-0 p-1 rounded hover:bg-slate-200", tableMetadata[t]?.is_favorite ? "text-amber-400" : "text-slate-300")}
+                        >
+                          <Star size={12} fill={tableMetadata[t]?.is_favorite ? "currentColor" : "none"} />
+                        </button>
+                      </div>
+                      {showCols && displayCols.length > 0 && (
+                        <div className="bg-slate-50/80">
+                          {(isExp ? displayCols.slice(0, 25) : displayCols).map((col: any) => {
+                            const isNumeric = col.type.includes('Int') || col.type.includes('Float') || col.type.includes('Decimal');
+                            const isDate = col.type.includes('Date') || col.type.includes('Time');
+                            return (
+                              <div
+                                key={col.name}
+                                className="flex items-center gap-2 pl-6 pr-3 py-1 hover:bg-blue-50 cursor-pointer transition-colors"
+                                onClick={() => handleTableSelect(t)}
+                              >
+                                <div className={clsx("w-1.5 h-1.5 rounded-full shrink-0", isDate ? "bg-amber-400" : isNumeric ? "bg-blue-400" : "bg-emerald-400")} />
+                                <span className="text-xs text-slate-700 font-mono truncate">{col.name}</span>
+                                <span className="text-[10px] text-slate-400 ml-auto font-mono shrink-0">{col.type.split('(')[0]}</span>
+                              </div>
+                            );
+                          })}
+                          {isExp && cols.length > 25 && (
+                            <div className="pl-6 pr-3 py-1 text-[10px] text-slate-400 italic">+{cols.length - 25} more…</div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })
+              }
             </div>
           </div>
 
@@ -1706,45 +1697,6 @@ export function BuilderPane() {
             )}
           </div>
         </div>
-
-        {/* History Panel (slide-in from right) */}
-        {showHistory && (
-          <div className="w-80 bg-white border-l border-slate-200 flex flex-col h-full overflow-hidden shrink-0">
-            <div className="p-4 border-b border-slate-200 flex items-center justify-between bg-white shrink-0">
-              <div className="flex items-center gap-2">
-                <History size={16} className="text-slate-600" />
-                <h3 className="text-sm font-semibold text-slate-800">Query History</h3>
-              </div>
-              <button onClick={() => setShowHistory(false)} className="text-slate-400 hover:text-slate-600"><X size={16} /></button>
-            </div>
-            <div className="flex-1 overflow-y-auto p-3 space-y-2">
-              {loadingHistory ? (
-                <div className="text-sm text-slate-400 text-center py-8">Loading…</div>
-              ) : historyEntries.length === 0 ? (
-                <div className="text-sm text-slate-400 text-center py-8 italic">No history yet.</div>
-              ) : (
-                historyEntries.map(entry => (
-                  <div key={entry.id} className="group bg-slate-50 border border-slate-200 rounded-lg p-3 hover:border-slate-300 transition-colors">
-                    <div className="flex items-start justify-between gap-2 mb-1">
-                      <div className="flex items-center gap-1 text-[10px] text-slate-400">
-                        <Clock size={10} />
-                        {new Date(entry.created_at).toLocaleString()}
-                      </div>
-                      <button
-                        onClick={() => replayHistoryEntry(entry.sql)}
-                        className="shrink-0 opacity-0 group-hover:opacity-100 transition-opacity text-[10px] font-medium bg-emerald-100 text-emerald-700 hover:bg-emerald-200 px-2 py-0.5 rounded border border-emerald-200 flex items-center gap-1"
-                        title="Replay this query"
-                      >
-                        <Play size={9} /> Run
-                      </button>
-                    </div>
-                    <pre className="text-[10px] text-slate-600 whitespace-pre-wrap break-all font-mono leading-relaxed line-clamp-4 overflow-hidden">{entry.sql}</pre>
-                  </div>
-                ))
-              )}
-            </div>
-          </div>
-        )}
 
         {/* Results Area */}
         <div className="flex-1 p-6 overflow-y-auto overflow-x-auto bg-slate-50/50 flex flex-col gap-4 min-w-0">
@@ -1928,88 +1880,6 @@ export function BuilderPane() {
             </div>
             <div className="p-3 border-t border-slate-100 bg-slate-50 text-xs text-slate-400 shrink-0 font-mono">
               SELECT * FROM {selectedTable} … — {drillThrough.data.length} rows
-            </div>
-          </div>
-        </div>,
-        document.body
-      )}
-
-      {/* ------------------------------------------------------------------ */}
-      {/* Table Search Popup                                                   */}
-      {/* ------------------------------------------------------------------ */}
-      {showTableSearchPopup && createPortal(
-        <div className="fixed inset-0 z-[350] flex items-center justify-center bg-black/50 backdrop-blur-sm p-4" onClick={() => setShowTableSearchPopup(false)}>
-          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[80vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
-            <div className="p-4 border-b border-slate-200 flex items-center justify-between shrink-0">
-              <div className="flex items-center gap-2">
-                <Database size={16} className="text-blue-600" />
-                <h3 className="text-sm font-bold text-slate-800">Browse Tables & Columns</h3>
-                <span className="text-xs text-slate-400 bg-slate-100 px-2 py-0.5 rounded-full">{tables.length} tables</span>
-              </div>
-              <button onClick={() => setShowTableSearchPopup(false)} className="text-slate-400 hover:text-slate-600 p-1.5 hover:bg-slate-100 rounded-md">
-                <X size={16} />
-              </button>
-            </div>
-            <div className="p-3 border-b border-slate-100 shrink-0">
-              <div className="relative">
-                <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
-                <input
-                  type="text"
-                  autoFocus
-                  placeholder="Search tables or columns…"
-                  value={tableSearchPopupQuery}
-                  onChange={e => setTableSearchPopupQuery(e.target.value)}
-                  className="w-full text-sm pl-9 pr-4 py-2 border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none bg-slate-50"
-                />
-              </div>
-            </div>
-            <div className="flex-1 overflow-y-auto p-3 space-y-2">
-              {tables
-                .filter(t => {
-                  const q = tableSearchPopupQuery.toLowerCase();
-                  if (!q) return true;
-                  if (t.toLowerCase().includes(q)) return true;
-                  return schema[t]?.some((col: any) => col.name.toLowerCase().includes(q) || col.type.toLowerCase().includes(q));
-                })
-                .map(t => {
-                  const q = tableSearchPopupQuery.toLowerCase();
-                  const cols: any[] = schema[t] || [];
-                  const matchedCols = q ? cols.filter((c: any) => c.name.toLowerCase().includes(q) || c.type.toLowerCase().includes(q)) : cols;
-                  return (
-                    <div key={t} className="border border-slate-200 rounded-xl overflow-hidden">
-                      <div
-                        className={clsx("flex items-center gap-2 px-4 py-2.5 cursor-pointer transition-colors", selectedTable === t ? "bg-emerald-50 border-b border-emerald-100" : "bg-slate-50 border-b border-slate-100 hover:bg-slate-100")}
-                        onClick={() => { handleTableSelect(t); setShowTableSearchPopup(false); }}
-                      >
-                        <Table size={14} className={selectedTable === t ? "text-emerald-600" : "text-slate-400"} />
-                        <span className={clsx("text-sm font-semibold", selectedTable === t ? "text-emerald-700" : "text-slate-700")}>{t}</span>
-                        <span className="ml-auto text-xs text-slate-400">{cols.length} cols</span>
-                        {tableMetadata[t]?.description && (
-                          <span className="text-xs text-slate-400 italic truncate max-w-[200px]">{tableMetadata[t].description}</span>
-                        )}
-                        {tableMetadata[t]?.is_favorite && <Star size={12} className="text-amber-400 shrink-0" fill="currentColor" />}
-                      </div>
-                      {matchedCols.length > 0 && (
-                        <div className="divide-y divide-slate-50">
-                          {matchedCols.slice(0, tableSearchPopupQuery ? matchedCols.length : 8).map((col: any) => {
-                            const isNumeric = col.type.includes('Int') || col.type.includes('Float') || col.type.includes('Decimal');
-                            const isDate = col.type.includes('Date') || col.type.includes('Time');
-                            return (
-                              <div key={col.name} className="flex items-center gap-3 px-6 py-1.5 hover:bg-blue-50 cursor-pointer transition-colors" onClick={() => { handleTableSelect(t); setShowTableSearchPopup(false); }}>
-                                <div className={clsx("w-2 h-2 rounded-full shrink-0", isDate ? "bg-amber-400" : isNumeric ? "bg-blue-400" : "bg-emerald-400")} />
-                                <span className="text-xs text-slate-700 font-mono font-medium">{col.name}</span>
-                                <span className="text-xs text-slate-400 ml-auto font-mono">{col.type}</span>
-                              </div>
-                            );
-                          })}
-                          {!tableSearchPopupQuery && cols.length > 8 && (
-                            <div className="px-6 py-1.5 text-xs text-slate-400 italic">+{cols.length - 8} more columns…</div>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
             </div>
           </div>
         </div>,

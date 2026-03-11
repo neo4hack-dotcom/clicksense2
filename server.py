@@ -31,6 +31,29 @@ PORT = int(os.environ.get("PORT", 3000))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DIST_DIR = os.path.join(BASE_DIR, "dist")
 
+# ---------------------------------------------------------------------------
+# In-memory console log buffer (real-time log streaming)
+# ---------------------------------------------------------------------------
+import threading as _threading
+_console_buffer: list = []
+_console_lock = _threading.Lock()
+_CONSOLE_MAX = 500
+
+def _log(msg: str, level: str = "info", source: str = "system") -> None:
+    """Append a timestamped log entry to the in-memory console buffer and print it."""
+    import datetime as _dt
+    entry = {
+        "ts": _dt.datetime.now().strftime("%H:%M:%S"),
+        "level": level,
+        "source": source,
+        "msg": str(msg),
+    }
+    with _console_lock:
+        _console_buffer.append(entry)
+        if len(_console_buffer) > _CONSOLE_MAX:
+            del _console_buffer[0]
+    print(f"[{entry['ts']}] [{level.upper():<5}] [{source}] {msg}")
+
 app = Flask(__name__, static_folder=DIST_DIR, static_url_path="")
 
 
@@ -245,10 +268,18 @@ def _get_embedding(text: str) -> list:
         raise Exception(f"Unexpected Ollama embedding response: {list(data2.keys())}")
 
     elif provider == "local_http":
-        # OpenAI-compatible /v1/embeddings endpoint derived from the LLM base URL
-        endpoint = base_url or "http://localhost:8000"
-        if "/v1/embeddings" not in endpoint:
-            endpoint = endpoint.rstrip("/") + "/v1/embeddings"
+        # OpenAI-compatible /v1/embeddings endpoint derived from the LLM base URL.
+        # The user may have configured the full chat URL (e.g. .../v1/chat/completions),
+        # so we extract the base up to /v1 and append /embeddings.
+        from urllib.parse import urlparse as _urlparse
+        _raw = base_url or "http://localhost:8000"
+        _parsed = _urlparse(_raw)
+        _netloc_base = f"{_parsed.scheme}://{_parsed.netloc}"
+        _path = _parsed.path
+        _v1_idx = _path.lower().find("/v1")
+        if _v1_idx >= 0:
+            _netloc_base = _netloc_base + _path[:_v1_idx]
+        endpoint = _netloc_base.rstrip("/") + "/v1/embeddings"
         if llm_config.get("apiKey"):
             headers["Authorization"] = f"Bearer {llm_config['apiKey']}"
         resp = _http_post(
@@ -1604,6 +1635,11 @@ DATE HANDLING — CRITICAL:
 - For date grouping/truncation, use toYYYYMM() or formatDateTime() only if strictly necessary; prefer BETWEEN ranges.
 - Never wrap date columns in transformation functions inside WHERE clauses.
 
+SQL QUERY — PRIORITY RULE:
+The SQL query is ALWAYS the primary deliverable. Even for descriptive or analytical questions,
+generate a SQL query that retrieves the relevant data. Never respond with text only when a SQL query
+can answer the question. The "sql" field is mandatory in every non-clarification response.
+
 When NOT ambiguous, return ONLY this JSON:
 {{
   "sql": "SELECT ...",
@@ -1620,6 +1656,8 @@ Do not include markdown formatting. Just the raw JSON.
         print(f"Chat error: {exc}")
         return jsonify({"error": str(exc)}), 500
 
+    conversation_id = data.get("conversationId") or str(uuid.uuid4())
+    _log(f"Chat SQL generated for conversation {conversation_id[:8]}", source="chat")
     try:
         parsed = _parse_llm_json(content)
     except ValueError:
@@ -3084,6 +3122,21 @@ AGENTS_CATALOG = [
         ],
     },
 ]
+
+
+@app.route("/api/console-logs", methods=["GET"])
+def get_console_logs():
+    """Return buffered console logs for the frontend Console panel."""
+    since = int(request.args.get("since", -1))
+    with _console_lock:
+        total = len(_console_buffer)
+        if since < 0:
+            logs = list(_console_buffer[-100:])
+            start_idx = max(0, total - 100)
+        else:
+            logs = list(_console_buffer[since + 1:])
+            start_idx = since + 1
+    return jsonify({"logs": logs, "next_idx": start_idx + len(logs) - 1, "total": total})
 
 
 @app.route("/api/agents", methods=["GET"])
@@ -4978,6 +5031,67 @@ def _etl_generate_action(session: dict, step: dict, client, database: str) -> di
     return result
 
 
+def _etl_generate_action_with_error(session: dict, step: dict, client, database: str, error: str) -> dict:
+    """LLM generates an alternative action when the previous SQL attempt failed."""
+    plan = session["plan"]
+    action_log = session["action_log"]
+    files_info = session.get("files_info", [])
+
+    try:
+        res = client.query(f"SHOW TABLES FROM `{database}`")
+        all_tables = [row[0] for row in res.result_rows]
+    except Exception:
+        all_tables = []
+
+    files_summary = []
+    for f in files_info[:5]:
+        cols_str = ", ".join(f.get("columns", [])[:6])
+        files_summary.append(f"{f['relative']} → colonnes: {cols_str}")
+
+    last_error = step.get("_last_error", error)
+    last_sql = step.get("_last_sql", "")
+
+    system_prompt = (
+        "Tu es un expert ETL ClickHouse. La dernière tentative d'action a échoué. "
+        "Tu dois proposer une approche alternative pour accomplir le même objectif. "
+        "Tu réponds UNIQUEMENT avec du JSON valide, sans markdown ni texte supplémentaire."
+    )
+    user_content = (
+        f"Base: {database}\n"
+        f"Tables existantes: {', '.join(all_tables[:20])}\n\n"
+        f"Fichiers: {chr(10).join(files_summary)}\n\n"
+        f"Objectif global: {plan.get('objective', '')}\n\n"
+        f"Étape {step['id']}: {step['description']}\n"
+        f"Type: {step.get('type', '')}\n"
+        f"Table cible: {step.get('target_table', '')}\n\n"
+        f"SQL qui a échoué:\n{last_sql[:300]}\n\n"
+        f"Erreur obtenue:\n{last_error[:300]}\n\n"
+        f"Génère une approche alternative pour cette étape ETL.\n"
+        "RÈGLES:\n"
+        "- CREATE TABLE → uniquement des tables BOT_ETL_*\n"
+        "- Utilise ENGINE = MergeTree() ORDER BY tuple()\n"
+        "- Adapte les types de colonnes pour éviter l'erreur\n"
+        "- Si l'erreur indique une incompatibilité de type, corrige le cast\n\n"
+        "Réponds UNIQUEMENT avec ce JSON:\n"
+        "{\n"
+        '  "sql": "SQL ClickHouse alternatif",\n'
+        '  "explanation": "explication de l\'alternative",\n'
+        '  "action_type": "type_action",\n'
+        '  "target_table": "BOT_ETL_nom ou null",\n'
+        '  "needs_user_input": false,\n'
+        '  "question": null\n'
+        "}\n"
+    )
+    try:
+        raw = _call_llm(system_prompt, [{"role": "user", "content": user_content}], temperature=0.1)
+        result = _parse_llm_json(raw)
+        if not result:
+            return {"sql": None, "explanation": "Alternative LLM parsing failed"}
+        return result
+    except Exception as exc:
+        return {"sql": None, "explanation": f"Alternative generation error: {exc}"}
+
+
 def _etl_execute_sql(client, database: str, sql: str) -> tuple[bool, str, list]:
     """Execute a SQL statement and return (ok, error, preview_rows)."""
     if not sql or not sql.strip():
@@ -5413,6 +5527,7 @@ def _run_etl_agent():
             # Execute remaining steps
             while action_index < len(steps) and len(session["action_log"]) < max_actions:
                 step = steps[action_index]
+                _log(f"ETL executing step {step['id']}/{len(steps)}: {step['description'][:60]}", source="etl-agent")
                 action_index += 1
                 session["action_index"] = action_index
 
@@ -5523,10 +5638,37 @@ def _run_etl_agent():
                     session["action_log"].append(entry)
                     continue
 
-                # Standard SQL execution
+                # Standard SQL execution — with retry on failure
                 sql = action.get("sql", "")
                 if sql:
                     ok, err, rows = _etl_execute_sql(client, database, sql)
+                    _log(f"ETL step {step['id']} SQL: {'OK' if ok else 'FAIL: ' + err[:80]}", source="etl-agent")
+
+                    # Retry up to 2 times if the step fails and credits remain
+                    retry_count = 0
+                    while not ok and retry_count < 2 and len(session["action_log"]) < max_actions:
+                        retry_count += 1
+                        _log(f"ETL step {step['id']} retry {retry_count} after error: {err[:80]}", source="etl-agent", level="warn")
+                        # Re-generate action with error context
+                        step_with_error = dict(step)
+                        step_with_error["_last_error"] = err
+                        step_with_error["_last_sql"] = sql
+                        # Inject error into session action log for context
+                        session["action_log"].append({
+                            "step_id": step["id"],
+                            "description": f"[retry {retry_count}] {step['description']}",
+                            "action_detail": f"FAILED: {sql[:150]}",
+                            "ok": False,
+                            "result_preview": err[:200],
+                            "rows_affected": None,
+                        })
+                        # Ask LLM for alternative approach
+                        alt_action = _etl_generate_action_with_error(session, step_with_error, client, database, err)
+                        sql = alt_action.get("sql", "")
+                        if not sql:
+                            break
+                        ok, err, rows = _etl_execute_sql(client, database, sql)
+                        _log(f"ETL step {step['id']} retry {retry_count} result: {'OK' if ok else 'FAIL: ' + err[:60]}", source="etl-agent")
 
                     # Track created tables
                     if ok and sql.strip().upper().startswith("CREATE TABLE"):
