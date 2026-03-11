@@ -2,8 +2,10 @@ import os
 import json
 import uuid
 import re
+import math
 import requests as http_requests
 import urllib3
+from collections import Counter
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 from dotenv import load_dotenv
@@ -5764,6 +5766,1528 @@ def _run_ai_data_analyst_session_agent():
             )
         return jsonify(payload)
 
+
+# In-memory session store for the Data Wrangling session agent
+_data_wrangling_sessions: dict = {}
+_data_wrangling_sessions_lock = _threading.Lock()
+_DATA_WRANGLING_MAX_EVENTS = 800
+_DATA_WRANGLING_SCHEMA_CACHE_TTL_SEC = 180
+_DW_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_DW_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+)
+_DW_DATE_LITERAL_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _dw_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _dw_coerce_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "oui"}
+    return bool(value)
+
+
+def _dw_coerce_int(value, default: int, min_value: int, max_value: int) -> int:
+    parsed = _parse_int_like(value, default)
+    return max(min_value, min(max_value, parsed))
+
+
+def _dw_safe_identifier(name: str) -> str:
+    return f"`{str(name or '').replace('`', '``')}`"
+
+
+def _dw_parse_date_literal(value) -> str:
+    txt = str(value or "").strip()
+    if not txt:
+        return ""
+    if not _DW_DATE_LITERAL_RE.match(txt):
+        return ""
+    return txt
+
+
+def _dw_normalize_params(raw_params: dict | None) -> dict:
+    params = raw_params or {}
+    return {
+        "table": str(params.get("table", "") or "").strip(),
+        "date_column": str(params.get("date_column", "") or "").strip(),
+        "date_start": _dw_parse_date_literal(params.get("date_start", "")),
+        "date_end": _dw_parse_date_literal(params.get("date_end", "")),
+        "max_rows": _dw_coerce_int(params.get("max_rows", 5000), 5000, 50, 500000),
+        "batch_size": _dw_coerce_int(params.get("batch_size", 400), 400, 50, 5000),
+        "max_steps": _dw_coerce_int(params.get("max_steps", 24), 24, 2, 200),
+        "row_start": _dw_coerce_int(params.get("row_start", 0), 0, 0, 100000000),
+        "export_excel": _dw_coerce_bool(params.get("export_excel", "no"), False),
+        "export_path": str(params.get("export_path", "") or "").strip(),
+        "reset_watermark": _dw_coerce_bool(params.get("reset_watermark", "no"), False),
+        "use_knowledge_base": _dw_coerce_bool(params.get("use_knowledge_base", "yes"), True),
+        "auto_run": _dw_coerce_bool(params.get("auto_run", "yes"), True),
+    }
+
+
+def _dw_log_event(session: dict, message: str, level: str = "info", kind: str = "runtime") -> None:
+    level_norm = str(level or "info").lower()
+    if level_norm not in {"info", "warn", "error"}:
+        level_norm = "info"
+    entry = {
+        "seq": int(session.get("event_seq", 0)) + 1,
+        "ts": _dw_now_iso(),
+        "level": level_norm,
+        "kind": str(kind or "runtime"),
+        "message": str(message or "").strip(),
+    }
+    session["event_seq"] = entry["seq"]
+    session.setdefault("event_log", []).append(entry)
+    if len(session["event_log"]) > _DATA_WRANGLING_MAX_EVENTS:
+        session["event_log"] = session["event_log"][-_DATA_WRANGLING_MAX_EVENTS:]
+    session["updated_at"] = entry["ts"]
+    try:
+        _log(
+            f"[{session.get('id', '?')[:8]}] {entry['message']}",
+            level=level_norm,
+            source="data-wrangling",
+        )
+    except Exception:
+        pass
+
+
+def _dw_session_payload(session: dict) -> dict:
+    return {
+        "session_id": session.get("id"),
+        "status": session.get("status", "idle"),
+        "running": bool(session.get("running", False)),
+        "pause_requested": bool(session.get("pause_requested", False)),
+        "stop_requested": bool(session.get("stop_requested", False)),
+        "pending_user_inputs": len(session.get("pending_user_inputs", [])),
+        "memory_summary": session.get("memory_summary", ""),
+        "event_log": session.get("event_log", [])[-240:],
+        "response_seq": int(session.get("response_seq", 0)),
+        "latest_assistant": session.get("latest_assistant"),
+        "last_result": session.get("last_result"),
+        "params": session.get("params", {}),
+        "created_at": session.get("created_at"),
+        "updated_at": session.get("updated_at"),
+    }
+
+
+def _dw_publish_message(session: dict, content: str, wrangling_result: dict | None = None, error: str = "") -> None:
+    txt = str(content or "").strip()
+    if not txt:
+        return
+    payload = {
+        "content": txt,
+        "wrangling_result": wrangling_result or None,
+        "error": str(error or "").strip(),
+    }
+    session["latest_assistant"] = payload
+    session["response_seq"] = int(session.get("response_seq", 0)) + 1
+    session.setdefault("conversation", []).append({
+        "role": "assistant",
+        "content": txt,
+        "ts": _dw_now_iso(),
+    })
+    session["conversation"] = session["conversation"][-100:]
+    session["updated_at"] = _dw_now_iso()
+
+
+def _dw_extract_response_payload(resp_obj):
+    status_code = 200
+    response = resp_obj
+    if isinstance(resp_obj, tuple):
+        response = resp_obj[0]
+        if len(resp_obj) > 1 and isinstance(resp_obj[1], int):
+            status_code = resp_obj[1]
+    if hasattr(response, "status_code"):
+        status_code = int(getattr(response, "status_code", status_code) or status_code)
+    if hasattr(response, "get_json"):
+        data = response.get_json(silent=True) or {}
+    else:
+        data = {}
+    return status_code, data
+
+
+def _dw_get_schema_with_cache(session: dict) -> dict:
+    now_ts = datetime.now(timezone.utc).timestamp()
+    cached_schema = session.get("cached_schema")
+    cached_ts = float(session.get("cached_schema_ts", 0) or 0)
+    if cached_schema and (now_ts - cached_ts) <= _DATA_WRANGLING_SCHEMA_CACHE_TTL_SEC:
+        return cached_schema
+    schema = _da_fetch_schema_for_agent()
+    session["cached_schema"] = schema
+    session["cached_schema_ts"] = now_ts
+    return schema
+
+
+def _dw_match_table(schema_map: dict, requested_table: str) -> str:
+    req = str(requested_table or "").strip()
+    if not req:
+        return ""
+    if req in schema_map:
+        return req
+    lower_map = {str(k).lower(): k for k in schema_map.keys()}
+    if req.lower() in lower_map:
+        return str(lower_map[req.lower()])
+    short_map = {}
+    for key in schema_map.keys():
+        short = str(key).split(".")[-1].lower()
+        short_map.setdefault(short, key)
+    return str(short_map.get(req.lower(), ""))
+
+
+def _dw_pick_order_column(columns: list[dict], preferred_date_col: str = "") -> str:
+    col_names = [str(c.get("name", "")).strip() for c in columns if str(c.get("name", "")).strip()]
+    if not col_names:
+        return ""
+    if preferred_date_col and preferred_date_col in col_names:
+        return preferred_date_col
+    for candidate in col_names:
+        lower = candidate.lower()
+        if lower == "id":
+            return candidate
+    for candidate in col_names:
+        lower = candidate.lower()
+        if lower.endswith("_id"):
+            return candidate
+    return col_names[0]
+
+
+def _dw_build_scope_where(params: dict, available_cols: set[str]) -> str:
+    date_col = str(params.get("date_column", "")).strip()
+    start = str(params.get("date_start", "")).strip()
+    end = str(params.get("date_end", "")).strip()
+    if not date_col or date_col not in available_cols:
+        return ""
+    if start and end:
+        return f"WHERE {_dw_safe_identifier(date_col)} BETWEEN '{start}' AND '{end}'"
+    if start:
+        return f"WHERE {_dw_safe_identifier(date_col)} = '{start}'"
+    if end:
+        return f"WHERE {_dw_safe_identifier(date_col)} = '{end}'"
+    return ""
+
+
+def _dw_scope_key(table: str, params: dict) -> str:
+    date_col = str(params.get("date_column", "")).strip() or "-"
+    date_start = str(params.get("date_start", "")).strip() or "-"
+    date_end = str(params.get("date_end", "")).strip() or "-"
+    return f"{table}|{date_col}|{date_start}|{date_end}"
+
+
+def _dw_read_watermarks() -> list:
+    db = read_db()
+    raw = db.get("wrangling_watermarks", [])
+    return raw if isinstance(raw, list) else []
+
+
+def _dw_get_watermark(scope_key: str) -> dict:
+    for row in _dw_read_watermarks():
+        if str(row.get("scope_key", "")) == scope_key:
+            return row
+    return {}
+
+
+def _dw_upsert_watermark(scope_key: str, payload: dict) -> None:
+    db = read_db()
+    items = db.get("wrangling_watermarks", [])
+    if not isinstance(items, list):
+        items = []
+    found = False
+    for idx, row in enumerate(items):
+        if str(row.get("scope_key", "")) == scope_key:
+            merged = dict(row)
+            merged.update(payload or {})
+            merged["scope_key"] = scope_key
+            items[idx] = merged
+            found = True
+            break
+    if not found:
+        row = {"scope_key": scope_key}
+        row.update(payload or {})
+        items.append(row)
+    db["wrangling_watermarks"] = items[-4000:]
+    write_db(db)
+
+
+def _dw_get_table_metadata(table_name: str) -> dict:
+    db = read_db()
+    for row in db.get("table_metadata", []):
+        if str(row.get("table_name", "")).strip() == table_name:
+            return row
+    return {}
+
+
+def _dw_get_knowledge_hint(
+    question: str,
+    table_name: str,
+    table_description: str,
+    use_knowledge_base: bool,
+) -> str:
+    if not use_knowledge_base:
+        return ""
+    seed = " ".join(
+        part for part in [
+            question or "",
+            table_name or "",
+            table_description or "",
+            "anomalie format valeur métier qualité",
+        ] if part
+    )
+    try:
+        hit = _get_knowledge_context_by_similarity(seed, top_k=int(rag_config.get("topK", 5)))
+        if hit:
+            return _truncate_text_to_budget(hit, 1300)
+    except Exception as exc:
+        print(f"[Wrangling] KB retrieval warning: {exc}")
+    return ""
+
+
+def _dw_compact_sql_check_summary(name: str, sql: str, result: dict) -> str:
+    status = "OK" if result.get("ok") else "FAIL"
+    return (
+        f"[{status}] {name}: sql={str(sql)[:180]} "
+        f"→ {str(result.get('summary', ''))[:280]}"
+    )
+
+
+def _dw_plan_with_llm(
+    question: str,
+    table_name: str,
+    columns: list[dict],
+    where_clause: str,
+    knowledge_hint: str,
+    max_steps: int,
+) -> dict:
+    column_hints = []
+    for col in columns[:80]:
+        column_hints.append({
+            "name": str(col.get("name", "")),
+            "type": str(col.get("type", "")),
+        })
+    prompt = f"""You are designing a ClickHouse data-wrangling inspection plan.
+Minimize token usage and maximize anomaly detection quality.
+
+TASK:
+- Build a concise action plan for anomaly detection on a single table.
+- Propose only simple read-only SQL checks.
+
+SCOPE:
+- table: {table_name}
+- optional where clause: {where_clause or "(none)"}
+- max actionable steps: {max_steps}
+
+USER REQUEST:
+{question}
+
+TABLE COLUMNS:
+{json.dumps(column_hints, ensure_ascii=False)}
+
+KNOWLEDGE HINTS:
+{knowledge_hint or "(none)"}
+
+RULES:
+- Keep SQL simple and compatible.
+- Read-only SQL only.
+- Add LIMIT <= 5000 where relevant.
+- Date predicates must use BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD' or = 'YYYY-MM-DD'.
+- No advanced ClickHouse functions.
+
+Return ONLY JSON:
+{{
+  "plan_steps": ["step 1", "step 2", "step 3"],
+  "focus_columns": ["col_a", "col_b"],
+  "sql_checks": [
+    {{"name": "check name", "sql": "SELECT ... FROM {table_name} ... LIMIT 200"}}
+  ],
+  "reasoning": "short rationale"
+}}"""
+    safe_prompt = _truncate_text_to_budget(prompt, int(_get_effective_context_limit() * 0.58))
+    content = _call_llm(
+        safe_prompt,
+        [{"role": "user", "content": "Build wrangling plan."}],
+        temperature=0.1,
+    )
+    parsed = _parse_llm_json(content)
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _dw_fallback_plan(columns: list[dict], max_steps: int) -> dict:
+    top_cols = [str(c.get("name", "")) for c in columns[:8] if str(c.get("name", ""))]
+    return {
+        "plan_steps": [
+            "Calculer la distribution de null/vides et cardinalité.",
+            "Scanner les lignes en batch pour outliers de format/taille/valeur.",
+            "Vérifier cohérences croisées (dates, identifiants) et conclure.",
+        ][:max(1, min(3, max_steps))],
+        "focus_columns": top_cols[:10],
+        "sql_checks": [],
+        "reasoning": "Fallback deterministic wrangling plan",
+    }
+
+
+def _dw_finalize_plan(raw_plan: dict, columns: list[dict], max_steps: int) -> dict:
+    col_set = {str(c.get("name", "")) for c in columns}
+    plan_steps = []
+    for item in (raw_plan.get("plan_steps") if isinstance(raw_plan, dict) else []) or []:
+        text = " ".join(str(item or "").split())
+        if not text:
+            continue
+        if len(text) > 180:
+            text = text[:180].rstrip() + "..."
+        if text.lower() in {p.lower() for p in plan_steps}:
+            continue
+        plan_steps.append(text)
+        if len(plan_steps) >= max(1, min(6, max_steps)):
+            break
+    focus_columns = []
+    for col in (raw_plan.get("focus_columns") if isinstance(raw_plan, dict) else []) or []:
+        c = str(col or "").strip()
+        if c in col_set and c not in focus_columns:
+            focus_columns.append(c)
+        if len(focus_columns) >= 24:
+            break
+    sql_checks = []
+    for row in (raw_plan.get("sql_checks") if isinstance(raw_plan, dict) else []) or []:
+        if not isinstance(row, dict):
+            continue
+        name = " ".join(str(row.get("name", "")).split())[:120]
+        sql = str(row.get("sql", "")).strip()
+        if not sql:
+            continue
+        sql_checks.append({"name": name or "SQL check", "sql": sql})
+        if len(sql_checks) >= 6:
+            break
+    return {
+        "plan_steps": plan_steps,
+        "focus_columns": focus_columns,
+        "sql_checks": sql_checks,
+        "reasoning": str((raw_plan or {}).get("reasoning", ""))[:220],
+    }
+
+
+def _dw_parse_any_date(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    try:
+        import datetime as _dt
+        if isinstance(value, _dt.date):
+            return value
+    except Exception:
+        pass
+    txt = str(value).strip()
+    if not txt:
+        return None
+    txt = txt.replace("T", " ")
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(txt[:19], fmt).date()
+        except Exception:
+            continue
+    return None
+
+
+def _dw_export_anomalies_excel(anomalies: list[dict], output_path: str) -> str:
+    if not anomalies:
+        return ""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+
+    target_path = output_path.strip() or os.path.join(
+        BASE_DIR, ".data", f"wrangling_anomalies_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    )
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Anomalies"
+    headers = [
+        "table",
+        "line_number",
+        "column",
+        "issue_type",
+        "severity",
+        "value_preview",
+        "reference",
+    ]
+    ws.append(headers)
+    header_fill = PatternFill("solid", fgColor="0B4F6C")
+    header_font = Font(color="FFFFFF", bold=True)
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    for row in anomalies:
+        ws.append([
+            row.get("table", ""),
+            row.get("line_number", ""),
+            row.get("column", ""),
+            row.get("issue_type", ""),
+            row.get("severity", ""),
+            row.get("value_preview", ""),
+            row.get("reference", ""),
+        ])
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:G{ws.max_row}"
+    widths = {"A": 30, "B": 13, "C": 24, "D": 20, "E": 12, "F": 34, "G": 70}
+    for key, width in widths.items():
+        ws.column_dimensions[key].width = width
+    wb.save(target_path)
+    return target_path
+
+
+def _dw_detect_batch_anomalies(
+    rows: list[dict],
+    *,
+    table_name: str,
+    line_offset: int,
+    column_types: dict,
+    focus_columns: set[str],
+    column_state: dict,
+    primary_id_column: str,
+    primary_id_seen: set,
+    date_pairs: list[tuple[str, str]],
+) -> list[dict]:
+    anomalies = []
+
+    def _severity_from_score(score: float) -> str:
+        if score >= 0.9:
+            return "high"
+        if score >= 0.6:
+            return "medium"
+        return "low"
+
+    for idx, row in enumerate(rows):
+        line_number = line_offset + idx + 1
+        if not isinstance(row, dict):
+            continue
+
+        if primary_id_column:
+            pid = row.get(primary_id_column)
+            if pid is not None and str(pid).strip() != "":
+                pid_fp = str(pid).strip()
+                if pid_fp in primary_id_seen:
+                    anomalies.append({
+                        "table": table_name,
+                        "line_number": line_number,
+                        "column": primary_id_column,
+                        "issue_type": "duplicate_primary_id",
+                        "severity": "high",
+                        "value_preview": str(pid)[:120],
+                        "reference": "Duplicate primary identifier detected in scan scope.",
+                    })
+                else:
+                    primary_id_seen.add(pid_fp)
+
+        for col_name, value in row.items():
+            cname = str(col_name or "")
+            if not cname:
+                continue
+            cstate = column_state.setdefault(cname, {
+                "seen": 0,
+                "nulls": 0,
+                "empty": 0,
+                "len_n": 0,
+                "len_mean": 0.0,
+                "len_m2": 0.0,
+                "num_n": 0,
+                "num_mean": 0.0,
+                "num_m2": 0.0,
+                "freq": Counter(),
+            })
+            prev_seen = int(cstate.get("seen", 0))
+            prev_nulls = int(cstate.get("nulls", 0))
+            prev_empty = int(cstate.get("empty", 0))
+            lower = cname.lower()
+            in_focus = cname in focus_columns or lower in {c.lower() for c in focus_columns}
+            ctype = str(column_types.get(cname, "")).lower()
+
+            if value is None:
+                if prev_seen >= 60:
+                    null_rate = prev_nulls / max(1, prev_seen)
+                    if null_rate < 0.02:
+                        anomalies.append({
+                            "table": table_name,
+                            "line_number": line_number,
+                            "column": cname,
+                            "issue_type": "unexpected_null",
+                            "severity": "medium",
+                            "value_preview": "NULL",
+                            "reference": f"Observed NULL whereas historical null-rate was {null_rate:.2%}.",
+                        })
+                cstate["seen"] = prev_seen + 1
+                cstate["nulls"] = prev_nulls + 1
+                continue
+
+            txt = str(value).strip()
+            if txt == "":
+                if prev_seen >= 60:
+                    empty_rate = prev_empty / max(1, prev_seen)
+                    if empty_rate < 0.02:
+                        anomalies.append({
+                            "table": table_name,
+                            "line_number": line_number,
+                            "column": cname,
+                            "issue_type": "unexpected_empty",
+                            "severity": "medium",
+                            "value_preview": "(empty)",
+                            "reference": f"Observed empty value whereas historical empty-rate was {empty_rate:.2%}.",
+                        })
+                cstate["seen"] = prev_seen + 1
+                cstate["empty"] = prev_empty + 1
+                continue
+
+            # Format anomalies for known business-like fields
+            if "email" in lower and txt and not _DW_EMAIL_RE.match(txt):
+                anomalies.append({
+                    "table": table_name,
+                    "line_number": line_number,
+                    "column": cname,
+                    "issue_type": "invalid_email_format",
+                    "severity": "high",
+                    "value_preview": txt[:120],
+                    "reference": "Value does not match expected email format.",
+                })
+            if ("phone" in lower or "tel" in lower) and txt:
+                digits = re.sub(r"\D+", "", txt)
+                if len(digits) < 8 or len(digits) > 15:
+                    anomalies.append({
+                        "table": table_name,
+                        "line_number": line_number,
+                        "column": cname,
+                        "issue_type": "invalid_phone_length",
+                        "severity": "medium",
+                        "value_preview": txt[:120],
+                        "reference": "Phone-like field has an unusual number of digits.",
+                    })
+            if "uuid" in lower and txt and not _DW_UUID_RE.match(txt):
+                anomalies.append({
+                    "table": table_name,
+                    "line_number": line_number,
+                    "column": cname,
+                    "issue_type": "invalid_uuid_format",
+                    "severity": "high",
+                    "value_preview": txt[:120],
+                    "reference": "UUID-like field does not match canonical UUID format.",
+                })
+
+            # Length outlier on string-like columns.
+            if not any(k in ctype for k in ("int", "float", "decimal")):
+                length_val = len(txt)
+                len_n = int(cstate.get("len_n", 0))
+                len_mean = float(cstate.get("len_mean", 0.0))
+                len_m2 = float(cstate.get("len_m2", 0.0))
+                if len_n >= 40:
+                    len_var = (len_m2 / max(1, len_n - 1)) if len_n > 1 else 0.0
+                    len_std = math.sqrt(max(0.0, len_var))
+                    if len_std > 0:
+                        z = abs((length_val - len_mean) / len_std)
+                        if z >= 5.0 and in_focus:
+                            anomalies.append({
+                                "table": table_name,
+                                "line_number": line_number,
+                                "column": cname,
+                                "issue_type": "length_outlier",
+                                "severity": _severity_from_score(min(1.0, z / 8)),
+                                "value_preview": txt[:120],
+                                "reference": f"Length {length_val} is an outlier (z-score {z:.2f}).",
+                            })
+                # Update length stats
+                len_n_new = len_n + 1
+                delta = length_val - len_mean
+                len_mean_new = len_mean + delta / len_n_new
+                len_m2_new = len_m2 + delta * (length_val - len_mean_new)
+                cstate["len_n"] = len_n_new
+                cstate["len_mean"] = len_mean_new
+                cstate["len_m2"] = len_m2_new
+
+            # Numeric outlier
+            num_val = _coerce_float(value)
+            if num_val is not None:
+                num_n = int(cstate.get("num_n", 0))
+                num_mean = float(cstate.get("num_mean", 0.0))
+                num_m2 = float(cstate.get("num_m2", 0.0))
+                if num_n >= 40:
+                    var = (num_m2 / max(1, num_n - 1)) if num_n > 1 else 0.0
+                    std = math.sqrt(max(0.0, var))
+                    if std > 0:
+                        z = abs((num_val - num_mean) / std)
+                        if z >= 5.0:
+                            anomalies.append({
+                                "table": table_name,
+                                "line_number": line_number,
+                                "column": cname,
+                                "issue_type": "numeric_outlier",
+                                "severity": _severity_from_score(min(1.0, z / 8)),
+                                "value_preview": str(value)[:120],
+                                "reference": f"Value {num_val:.6g} is a numeric outlier (z-score {z:.2f}).",
+                            })
+                num_n_new = num_n + 1
+                delta_num = num_val - num_mean
+                num_mean_new = num_mean + delta_num / num_n_new
+                num_m2_new = num_m2 + delta_num * (num_val - num_mean_new)
+                cstate["num_n"] = num_n_new
+                cstate["num_mean"] = num_mean_new
+                cstate["num_m2"] = num_m2_new
+
+            # Rare category check on focused columns
+            freq = cstate.get("freq", Counter())
+            if not isinstance(freq, Counter):
+                freq = Counter()
+            if prev_seen >= 200 and in_focus and len(freq) >= 6 and freq.get(txt, 0) == 0:
+                anomalies.append({
+                    "table": table_name,
+                    "line_number": line_number,
+                    "column": cname,
+                    "issue_type": "rare_category",
+                    "severity": "low",
+                    "value_preview": txt[:120],
+                    "reference": "Previously unseen category after a large baseline.",
+                })
+            if len(freq) < 600 or txt in freq:
+                freq[txt] += 1
+            cstate["freq"] = freq
+            cstate["seen"] = prev_seen + 1
+
+        # Cross-field date coherence checks
+        for start_col, end_col in date_pairs:
+            start_val = row.get(start_col)
+            end_val = row.get(end_col)
+            d1 = _dw_parse_any_date(start_val)
+            d2 = _dw_parse_any_date(end_val)
+            if d1 and d2 and d1 > d2:
+                anomalies.append({
+                    "table": table_name,
+                    "line_number": line_number,
+                    "column": f"{start_col} -> {end_col}",
+                    "issue_type": "date_order_inconsistency",
+                    "severity": "high",
+                    "value_preview": f"{start_val} > {end_val}",
+                    "reference": "Start-like date is greater than end-like date.",
+                })
+
+    return anomalies
+
+
+def _dw_build_date_pairs(column_names: list[str]) -> list[tuple[str, str]]:
+    lowers = {c.lower(): c for c in column_names}
+    pairs = []
+    for col in column_names:
+        lower = col.lower()
+        candidate = ""
+        if "start" in lower:
+            candidate = lower.replace("start", "end")
+        elif "from" in lower:
+            candidate = lower.replace("from", "to")
+        elif "debut" in lower:
+            candidate = lower.replace("debut", "fin")
+        if candidate and candidate in lowers:
+            pairs.append((col, lowers[candidate]))
+    uniq = []
+    seen = set()
+    for a, b in pairs:
+        key = f"{a}|{b}"
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append((a, b))
+    return uniq[:20]
+
+
+def _dw_summarize_with_llm(
+    question: str,
+    table_name: str,
+    plan_steps: list[str],
+    anomaly_type_counter: Counter,
+    anomalies_preview: list[dict],
+    knowledge_hint: str,
+    scanned_range_start: int,
+    scanned_range_end: int,
+) -> str:
+    anomalies_compact = []
+    for row in anomalies_preview[:25]:
+        anomalies_compact.append(
+            f"L{row.get('line_number')} {row.get('column')}: {row.get('issue_type')} | {row.get('reference')}"
+        )
+    counter_lines = [f"- {k}: {v}" for k, v in anomaly_type_counter.most_common(12)]
+    prompt = f"""You are a senior Data Quality analyst.
+Write a concise but high-value French synthesis.
+
+QUESTION:
+{question}
+
+TABLE:
+{table_name}
+
+SCANNED LINE RANGE:
+{scanned_range_start} -> {scanned_range_end}
+
+PLAN STEPS:
+{chr(10).join(f"- {s}" for s in plan_steps[:8])}
+
+ANOMALY COUNTS:
+{chr(10).join(counter_lines) if counter_lines else "- none"}
+
+REPRESENTATIVE ANOMALIES:
+{chr(10).join(anomalies_compact) if anomalies_compact else "(none)"}
+
+KNOWLEDGE HINTS:
+{knowledge_hint or "(none)"}
+
+Output requirements:
+- 1 short executive paragraph.
+- 3 to 6 bullet findings with precise references (line and column).
+- explain why some anomalies are subtle or hard to detect manually.
+- include a confidence level and next remediation actions.
+No markdown title."""
+    safe_prompt = _truncate_text_to_budget(prompt, int(_get_effective_context_limit() * 0.56))
+    return _call_llm(
+        safe_prompt,
+        [{"role": "user", "content": "Draft final wrangling synthesis."}],
+        temperature=0.2,
+        language="fr",
+    )
+
+
+def _dw_should_interrupt(session: dict) -> str:
+    if session.get("stop_requested"):
+        return "stopped"
+    if session.get("pause_requested"):
+        return "paused"
+    return ""
+
+
+def _dw_start_worker_if_needed(session: dict) -> bool:
+    if session.get("running"):
+        return False
+    if not session.get("pending_user_inputs"):
+        return False
+    session["running"] = True
+    session["status"] = "running"
+    session["run_seq"] = int(session.get("run_seq", 0)) + 1
+    run_seq = int(session["run_seq"])
+    session["updated_at"] = _dw_now_iso()
+    t = _threading.Thread(
+        target=_dw_worker_loop,
+        args=(session.get("id"), run_seq),
+        daemon=True,
+    )
+    session["worker"] = t
+    t.start()
+    return True
+
+
+def _dw_rethink_sql_check(check_name: str, sql: str, error_text: str, scope_where: str) -> str:
+    prompt = f"""A planned wrangling SQL check failed.
+Fix it with a simpler read-only ClickHouse query.
+
+Check name: {check_name}
+Previous SQL:
+{sql}
+Error:
+{error_text}
+Scope where clause:
+{scope_where or "(none)"}
+
+Rules:
+- Keep read-only SQL.
+- Keep it simple and compatible.
+- LIMIT <= 5000.
+- If date filter is needed use BETWEEN or equality date literals.
+
+Return JSON only:
+{{
+  "sql": "SELECT ...",
+  "reasoning": "short fix rationale"
+}}"""
+    safe_prompt = _truncate_text_to_budget(prompt, int(_get_effective_context_limit() * 0.45))
+    content = _call_llm(
+        safe_prompt,
+        [{"role": "user", "content": "Fix failed check SQL."}],
+        temperature=0.1,
+    )
+    parsed = _parse_llm_json(content)
+    return str((parsed or {}).get("sql", "")).strip()
+
+
+def _dw_worker_loop(session_id: str, run_seq: int) -> None:
+    while True:
+        with _data_wrangling_sessions_lock:
+            session = _data_wrangling_sessions.get(session_id)
+            if not session:
+                return
+            if int(session.get("run_seq", 0)) != int(run_seq):
+                return
+            if session.get("stop_requested"):
+                session["running"] = False
+                session["status"] = "stopped"
+                _dw_log_event(session, "Run cancelled before start (stop requested).", "warn", "control")
+                return
+            if session.get("pause_requested"):
+                session["running"] = False
+                session["status"] = "paused"
+                _dw_log_event(session, "Run paused before start.", "warn", "control")
+                return
+            if not session.get("pending_user_inputs"):
+                session["running"] = False
+                if session.get("status") not in {"paused", "stopped", "error"}:
+                    session["status"] = "idle"
+                session["updated_at"] = _dw_now_iso()
+                return
+
+            question = str(session["pending_user_inputs"].pop(0)).strip()
+            params = dict(session.get("params", {}))
+            session.setdefault("conversation", []).append({
+                "role": "user",
+                "content": question,
+                "ts": _dw_now_iso(),
+            })
+            _dw_log_event(
+                session,
+                f"Run #{run_seq}: wrangling started for '{question[:120]}'",
+                "info",
+                "run",
+            )
+            _dw_publish_message(
+                session,
+                "Run lancé: préparation du plan de nettoyage et définition du scope d'analyse.",
+                None,
+                "",
+            )
+
+        try:
+            with _data_wrangling_sessions_lock:
+                live = _data_wrangling_sessions.get(session_id)
+                if not live or int(live.get("run_seq", 0)) != int(run_seq):
+                    return
+                schema_map = _dw_get_schema_with_cache(live)
+
+            requested_table = str(params.get("table", "")).strip()
+            matched_table = _dw_match_table(schema_map, requested_table)
+            if not matched_table:
+                raise ValueError(
+                    f"Table introuvable: '{requested_table}'. Renseignez le paramètre table exactement."
+                )
+
+            columns = schema_map.get(matched_table) or []
+            if not columns:
+                raise ValueError(f"Aucune colonne détectée pour la table '{matched_table}'.")
+
+            col_names = [str(c.get("name", "")).strip() for c in columns if str(c.get("name", "")).strip()]
+            col_set = set(col_names)
+            col_types = {str(c.get("name", "")).strip(): str(c.get("type", "")) for c in columns}
+            order_col = _dw_pick_order_column(columns, str(params.get("date_column", "")).strip())
+            if not order_col:
+                raise ValueError("Impossible de déterminer une colonne d'ordre pour le scan.")
+            where_clause = _dw_build_scope_where(params, col_set)
+
+            table_meta = _dw_get_table_metadata(matched_table)
+            table_desc = str(table_meta.get("description", "") or "")
+            knowledge_hint = _dw_get_knowledge_hint(
+                question,
+                matched_table,
+                table_desc,
+                bool(params.get("use_knowledge_base", True)),
+            )
+
+            try:
+                raw_plan = _dw_plan_with_llm(
+                    question,
+                    matched_table,
+                    columns,
+                    where_clause,
+                    knowledge_hint,
+                    int(params.get("max_steps", 24)),
+                )
+                plan = _dw_finalize_plan(raw_plan, columns, int(params.get("max_steps", 24)))
+            except Exception as plan_exc:
+                plan = _dw_fallback_plan(columns, int(params.get("max_steps", 24)))
+                with _data_wrangling_sessions_lock:
+                    live = _data_wrangling_sessions.get(session_id)
+                    if live and int(live.get("run_seq", 0)) == int(run_seq):
+                        _dw_log_event(
+                            live,
+                            f"LLM planning fallback activated ({plan_exc}).",
+                            "warn",
+                            "planning",
+                        )
+
+            if not plan.get("plan_steps"):
+                plan = _dw_fallback_plan(columns, int(params.get("max_steps", 24)))
+            focus_columns = set(plan.get("focus_columns") or [])
+            if not focus_columns:
+                focus_columns = set(col_names[: min(20, len(col_names))])
+
+            with _data_wrangling_sessions_lock:
+                live = _data_wrangling_sessions.get(session_id)
+                if not live or int(live.get("run_seq", 0)) != int(run_seq):
+                    return
+                plan_text = "\n".join(f"{idx+1}. {step}" for idx, step in enumerate(plan.get("plan_steps", [])))
+                _dw_publish_message(
+                    live,
+                    (
+                        f"Plan initial prêt pour `{matched_table}`.\n"
+                        f"{plan_text}\n\n"
+                        f"Colonnes focus: {', '.join(sorted(list(focus_columns))[:16])}"
+                    ),
+                    None,
+                    "",
+                )
+                _dw_log_event(live, f"Plan initialized with {len(plan.get('plan_steps', []))} steps.", "info", "planning")
+
+            # Execute planned SQL checks first (LLM call only at start, then ClickHouse-first flow)
+            check_outputs = []
+            client = get_clickhouse_client()
+            safe_table = _dw_safe_identifier(matched_table)
+            planned_checks = plan.get("sql_checks") or []
+            for check_idx, check in enumerate(planned_checks[:6]):
+                check_name = str(check.get("name", f"check_{check_idx+1}"))
+                check_sql = str(check.get("sql", "")).strip()
+                if not check_sql:
+                    continue
+                interrupt_reason = ""
+                with _data_wrangling_sessions_lock:
+                    live = _data_wrangling_sessions.get(session_id)
+                    if not live or int(live.get("run_seq", 0)) != int(run_seq):
+                        return
+                    interrupt_reason = _dw_should_interrupt(live)
+                if interrupt_reason:
+                    raise RuntimeError(f"Run interrupted: {interrupt_reason}")
+
+                rendered_sql = (
+                    check_sql
+                    .replace("{table}", safe_table)
+                    .replace("{table_name}", safe_table)
+                    .replace("{where}", where_clause)
+                    .replace("{where_clause}", where_clause)
+                )
+                res = _execute_sql_guarded(
+                    rendered_sql,
+                    read_only=True,
+                    enforce_simple_compat=True,
+                    max_preview_rows=10,
+                    max_execution_time=15,
+                    default_limit=300,
+                    hard_limit_cap=5000,
+                    client=client,
+                )
+                if not res.get("ok"):
+                    fixed_sql = ""
+                    try:
+                        fixed_sql = _dw_rethink_sql_check(check_name, rendered_sql, res.get("summary", ""), where_clause)
+                    except Exception:
+                        fixed_sql = ""
+                    if fixed_sql:
+                        res = _execute_sql_guarded(
+                            fixed_sql,
+                            read_only=True,
+                            enforce_simple_compat=True,
+                            max_preview_rows=10,
+                            max_execution_time=15,
+                            default_limit=300,
+                            hard_limit_cap=5000,
+                            client=client,
+                        )
+                        rendered_sql = fixed_sql
+                check_outputs.append({
+                    "name": check_name,
+                    "sql": rendered_sql,
+                    "ok": bool(res.get("ok")),
+                    "summary": str(res.get("summary", ""))[:700],
+                })
+                with _data_wrangling_sessions_lock:
+                    live = _data_wrangling_sessions.get(session_id)
+                    if not live or int(live.get("run_seq", 0)) != int(run_seq):
+                        return
+                    _dw_log_event(
+                        live,
+                        _dw_compact_sql_check_summary(check_name, rendered_sql, res),
+                        "info" if res.get("ok") else "warn",
+                        "sql-check",
+                    )
+                    _dw_publish_message(
+                        live,
+                        (
+                            f"Check SQL `{check_name}` {'OK' if res.get('ok') else 'FAIL'}\n"
+                            f"{str(res.get('summary', ''))[:320]}"
+                        ),
+                        None,
+                        "",
+                    )
+
+            scope_key = _dw_scope_key(matched_table, params)
+            row_start_param = int(params.get("row_start", 0) or 0)
+            watermark = _dw_get_watermark(scope_key)
+            if _dw_coerce_bool(params.get("reset_watermark", False), False):
+                start_offset = row_start_param
+            else:
+                saved_offset = _parse_int_like(watermark.get("next_offset", 0), 0) if watermark else 0
+                start_offset = max(row_start_param, saved_offset)
+
+            max_rows = int(params.get("max_rows", 5000))
+            batch_size = int(params.get("batch_size", 400))
+            max_steps = int(params.get("max_steps", 24))
+            scan_cap = max(1, max_rows)
+
+            selected_cols = col_names[: min(140, len(col_names))]
+            select_cols_sql = ", ".join(_dw_safe_identifier(c) for c in selected_cols)
+            order_sql = _dw_safe_identifier(order_col)
+
+            column_state = {}
+            primary_id_column = ""
+            for c in selected_cols:
+                if c.lower() == "id":
+                    primary_id_column = c
+                    break
+            date_pairs = _dw_build_date_pairs(selected_cols)
+            primary_seen = set()
+            anomalies = []
+            anomaly_types = Counter()
+
+            current_offset = start_offset
+            total_scanned = 0
+            step_count = 0
+            range_start = start_offset + 1
+            range_end = start_offset
+
+            while total_scanned < scan_cap and step_count < max_steps:
+                step_count += 1
+                interrupt_reason = ""
+                with _data_wrangling_sessions_lock:
+                    live = _data_wrangling_sessions.get(session_id)
+                    if not live or int(live.get("run_seq", 0)) != int(run_seq):
+                        return
+                    interrupt_reason = _dw_should_interrupt(live)
+                if interrupt_reason:
+                    break
+
+                remaining = scan_cap - total_scanned
+                fetch_n = max(1, min(batch_size, remaining))
+                sql = (
+                    f"SELECT {select_cols_sql} "
+                    f"FROM {safe_table} "
+                    f"{where_clause} "
+                    f"ORDER BY {order_sql} "
+                    f"LIMIT {fetch_n} OFFSET {current_offset}"
+                )
+                run = _execute_sql_guarded(
+                    sql,
+                    read_only=True,
+                    enforce_simple_compat=True,
+                    max_preview_rows=5,
+                    max_execution_time=20,
+                    default_limit=fetch_n,
+                    hard_limit_cap=5000,
+                    client=client,
+                )
+                if not run.get("ok"):
+                    with _data_wrangling_sessions_lock:
+                        live = _data_wrangling_sessions.get(session_id)
+                        if live and int(live.get("run_seq", 0)) == int(run_seq):
+                            _dw_log_event(
+                                live,
+                                f"Batch query failed at offset {current_offset}: {run.get('summary', '')[:220]}",
+                                "warn",
+                                "scan",
+                            )
+                            _dw_publish_message(
+                                live,
+                                (
+                                    "Échec technique pendant le scan; tentative de poursuite avec batch suivant plus petit.\n"
+                                    + str(run.get("summary", ""))[:260]
+                                ),
+                                None,
+                                "",
+                            )
+                    batch_size = max(50, int(batch_size * 0.6))
+                    if batch_size <= 60:
+                        break
+                    continue
+
+                rows = run.get("rows") or []
+                if not rows:
+                    break
+                batch_start = current_offset + 1
+                batch_end = current_offset + len(rows)
+                range_end = batch_end
+
+                batch_anomalies = _dw_detect_batch_anomalies(
+                    rows,
+                    table_name=matched_table,
+                    line_offset=current_offset,
+                    column_types=col_types,
+                    focus_columns=focus_columns,
+                    column_state=column_state,
+                    primary_id_column=primary_id_column,
+                    primary_id_seen=primary_seen,
+                    date_pairs=date_pairs,
+                )
+                anomalies.extend(batch_anomalies)
+                for a in batch_anomalies:
+                    anomaly_types[str(a.get("issue_type", "unknown"))] += 1
+                anomalies = anomalies[:12000]
+
+                current_offset += len(rows)
+                total_scanned += len(rows)
+
+                watermark_payload = {
+                    "table": matched_table,
+                    "date_column": str(params.get("date_column", "")),
+                    "date_start": str(params.get("date_start", "")),
+                    "date_end": str(params.get("date_end", "")),
+                    "next_offset": int(current_offset),
+                    "last_scanned_range_start": int(range_start),
+                    "last_scanned_range_end": int(range_end),
+                    "updated_at": _dw_now_iso(),
+                }
+                _dw_upsert_watermark(scope_key, watermark_payload)
+
+                top_findings = batch_anomalies[:2]
+                finding_text = "\n".join(
+                    f"- L{f.get('line_number')} `{f.get('column')}`: {f.get('issue_type')} ({f.get('severity')})"
+                    for f in top_findings
+                )
+                with _data_wrangling_sessions_lock:
+                    live = _data_wrangling_sessions.get(session_id)
+                    if not live or int(live.get("run_seq", 0)) != int(run_seq):
+                        return
+                    live["memory_summary"] = (
+                        f"Table {matched_table} | scope {range_start}-{range_end} "
+                        f"| scanned={total_scanned}/{scan_cap} rows | anomalies={len(anomalies)}"
+                    )
+                    _dw_log_event(
+                        live,
+                        (
+                            f"Batch {step_count}: scanned lines {batch_start}-{batch_end} "
+                            f"({len(rows)} rows), findings +{len(batch_anomalies)} "
+                            f"(total {len(anomalies)})."
+                        ),
+                        "info",
+                        "scan",
+                    )
+                    _dw_publish_message(
+                        live,
+                        (
+                            f"Batch {step_count} terminé ({batch_start}-{batch_end}). "
+                            f"Anomalies détectées: +{len(batch_anomalies)} (total {len(anomalies)})."
+                            + (f"\nFindings clés:\n{finding_text}" if finding_text else "")
+                        ),
+                        None,
+                        "",
+                    )
+
+                if step_count == max(1, max_steps // 2):
+                    with _data_wrangling_sessions_lock:
+                        live = _data_wrangling_sessions.get(session_id)
+                        if live and int(live.get("run_seq", 0)) == int(run_seq):
+                            judgement = (
+                                "Trajectoire efficace: anomalies pertinentes détectées."
+                                if len(anomalies) > 0
+                                else "Peu d'anomalies détectées; poursuite avec focus distributionnel."
+                            )
+                            _dw_log_event(live, f"Mid-course review: {judgement}", "info", "review")
+                            _dw_publish_message(live, f"Réévaluation mi-parcours: {judgement}", None, "")
+
+            final_anomalies = anomalies[:4000]
+            export_path = ""
+            if _dw_coerce_bool(params.get("export_excel", False), False) and final_anomalies:
+                try:
+                    export_path = _dw_export_anomalies_excel(final_anomalies, str(params.get("export_path", "")))
+                except Exception as exp_exc:
+                    with _data_wrangling_sessions_lock:
+                        live = _data_wrangling_sessions.get(session_id)
+                        if live and int(live.get("run_seq", 0)) == int(run_seq):
+                            _dw_log_event(live, f"Excel export failed: {exp_exc}", "warn", "export")
+
+            final_text = ""
+            try:
+                final_text = _dw_summarize_with_llm(
+                    question,
+                    matched_table,
+                    plan.get("plan_steps", []),
+                    anomaly_types,
+                    final_anomalies,
+                    knowledge_hint,
+                    range_start,
+                    range_end,
+                )
+            except Exception:
+                top_issue = ", ".join(f"{k}:{v}" for k, v in anomaly_types.most_common(5)) or "none"
+                final_text = (
+                    f"Scan terminé sur `{matched_table}` (lignes {range_start}-{range_end}). "
+                    f"{len(final_anomalies)} anomalies détectées. Types principaux: {top_issue}. "
+                    "Consultez les références ligne/colonne et corrigez en priorité les anomalies de sévérité élevée."
+                )
+
+            with _data_wrangling_sessions_lock:
+                live = _data_wrangling_sessions.get(session_id)
+                if not live or int(live.get("run_seq", 0)) != int(run_seq):
+                    return
+                interrupt_reason = _dw_should_interrupt(live)
+                wr_result = {
+                    "table": matched_table,
+                    "scope": {
+                        "date_column": str(params.get("date_column", "")),
+                        "date_start": str(params.get("date_start", "")),
+                        "date_end": str(params.get("date_end", "")),
+                        "line_start": int(range_start),
+                        "line_end": int(range_end),
+                    },
+                    "plan_steps": plan.get("plan_steps", []),
+                    "focus_columns": sorted(list(focus_columns))[:30],
+                    "sql_checks": check_outputs,
+                    "scanned_rows": int(total_scanned),
+                    "anomaly_count": len(final_anomalies),
+                    "anomaly_type_counts": dict(anomaly_types),
+                    "anomalies_preview": final_anomalies[:120],
+                    "watermark": {
+                        "scope_key": scope_key,
+                        "next_offset": int(current_offset),
+                        "last_scanned_range_start": int(range_start),
+                        "last_scanned_range_end": int(range_end),
+                    },
+                    "export_excel_path": export_path,
+                    "interrupted": bool(interrupt_reason),
+                    "interrupt_reason": interrupt_reason or "",
+                }
+                live["last_result"] = wr_result
+                live["memory_summary"] = (
+                    f"Table {matched_table} | last range {range_start}-{range_end} | "
+                    f"anomalies={len(final_anomalies)} | watermark next_offset={current_offset}"
+                )
+                _dw_publish_message(live, final_text, wr_result, "")
+                if interrupt_reason == "paused":
+                    live["status"] = "paused"
+                    live["running"] = False
+                    _dw_log_event(live, "Run paused after interruption request.", "warn", "control")
+                elif interrupt_reason == "stopped":
+                    live["status"] = "stopped"
+                    live["running"] = False
+                    _dw_log_event(live, "Run stopped after interruption request.", "warn", "control")
+                else:
+                    live["status"] = "completed"
+                    live["running"] = False
+                    _dw_log_event(
+                        live,
+                        f"Run completed: scanned_rows={total_scanned}, anomalies={len(final_anomalies)}.",
+                        "info",
+                        "run",
+                    )
+        except Exception as run_exc:
+            with _data_wrangling_sessions_lock:
+                live = _data_wrangling_sessions.get(session_id)
+                if not live or int(live.get("run_seq", 0)) != int(run_seq):
+                    return
+                err_txt = str(run_exc)
+                live["running"] = False
+                live["status"] = "error"
+                _dw_log_event(live, f"Run failed: {err_txt}", "error", "run")
+                _dw_publish_message(live, f"Erreur Data Wrangling: {err_txt}", None, err_txt)
+
+        with _data_wrangling_sessions_lock:
+            session = _data_wrangling_sessions.get(session_id)
+            if not session or int(session.get("run_seq", 0)) != int(run_seq):
+                return
+            if session.get("stop_requested"):
+                session["running"] = False
+                session["status"] = "stopped"
+                session["updated_at"] = _dw_now_iso()
+                return
+            if session.get("pause_requested"):
+                session["running"] = False
+                session["status"] = "paused"
+                session["updated_at"] = _dw_now_iso()
+                return
+            should_continue = bool(
+                session.get("params", {}).get("auto_run", True)
+                and session.get("pending_user_inputs")
+            )
+            if should_continue:
+                session["running"] = True
+                session["status"] = "running"
+                session["updated_at"] = _dw_now_iso()
+                _dw_log_event(session, "Continuing with queued follow-up question.", "info", "queue")
+                continue
+            session["running"] = False
+            if session.get("status") not in {"paused", "stopped", "error"}:
+                session["status"] = "idle"
+            session["updated_at"] = _dw_now_iso()
+            return
+
+
+def _run_data_wrangling_agent():
+    data = request.get_json(silent=True) or {}
+    params_raw = data.get("params", {}) or {}
+    control = str(data.get("control", "")).strip().lower()
+    session_id = str(data.get("session_id", "")).strip()
+    messages = data.get("messages", []) or []
+
+    last_user_text = ""
+    if isinstance(messages, list):
+        for m in reversed(messages):
+            if str(m.get("role", "")) == "user":
+                last_user_text = str(m.get("content", "")).strip()
+                if last_user_text:
+                    break
+
+    with _data_wrangling_sessions_lock:
+        if session_id and session_id in _data_wrangling_sessions:
+            session = _data_wrangling_sessions[session_id]
+        else:
+            session_id = str(uuid.uuid4())
+            session = {
+                "id": session_id,
+                "created_at": _dw_now_iso(),
+                "updated_at": _dw_now_iso(),
+                "status": "idle",
+                "running": False,
+                "pause_requested": False,
+                "stop_requested": False,
+                "params": _dw_normalize_params(params_raw),
+                "conversation": [],
+                "pending_user_inputs": [],
+                "memory_summary": "",
+                "event_log": [],
+                "event_seq": 0,
+                "response_seq": 0,
+                "latest_assistant": None,
+                "last_result": None,
+                "cached_schema": None,
+                "cached_schema_ts": 0,
+                "run_seq": 0,
+                "worker": None,
+            }
+            _data_wrangling_sessions[session_id] = session
+            _dw_log_event(session, "New data wrangling session created.", "info", "session")
+
+        merged_params = dict(session.get("params", {}))
+        merged_params.update(_dw_normalize_params(params_raw))
+        session["params"] = merged_params
+        session["updated_at"] = _dw_now_iso()
+
+        if control == "status":
+            payload = _dw_session_payload(session)
+            payload["content"] = "Runtime status fetched."
+            return jsonify(payload)
+
+        if control == "pause":
+            session["pause_requested"] = True
+            if session.get("running"):
+                session["status"] = "pausing"
+                _dw_log_event(session, "Pause requested (will apply between scan steps).", "warn", "control")
+                content = "Pause requested. The wrangling process will pause at the next checkpoint."
+            else:
+                session["status"] = "paused"
+                _dw_log_event(session, "Session paused.", "warn", "control")
+                content = "Session paused. You can add context then click Resume."
+            payload = _dw_session_payload(session)
+            payload["content"] = content
+            return jsonify(payload)
+
+        if control == "stop":
+            session["stop_requested"] = True
+            if session.get("running"):
+                session["status"] = "stopping"
+                _dw_log_event(session, "Stop requested (will apply between scan steps).", "warn", "control")
+                content = "Stop requested. Current scan will stop at the next checkpoint."
+            else:
+                session["running"] = False
+                session["status"] = "stopped"
+                _dw_log_event(session, "Session stopped.", "warn", "control")
+                content = "Session stopped."
+            payload = _dw_session_payload(session)
+            payload["content"] = content
+            return jsonify(payload)
+
+        if control == "resume":
+            session["pause_requested"] = False
+            session["stop_requested"] = False
+            if last_user_text:
+                session["pending_user_inputs"].append(last_user_text)
+                session.setdefault("conversation", []).append({
+                    "role": "user",
+                    "content": last_user_text,
+                    "ts": _dw_now_iso(),
+                })
+                _dw_log_event(session, "User added context while resuming.", "info", "input")
+            started = _dw_start_worker_if_needed(session)
+            payload = _dw_session_payload(session)
+            payload["content"] = "Session resumed. Wrangling run started." if started else "Session resumed. No pending message to process."
+            return jsonify(payload)
+
+        if control == "run":
+            session["pause_requested"] = False
+            session["stop_requested"] = False
+            if last_user_text:
+                session["pending_user_inputs"].append(last_user_text)
+                session.setdefault("conversation", []).append({
+                    "role": "user",
+                    "content": last_user_text,
+                    "ts": _dw_now_iso(),
+                })
+                _dw_log_event(session, "Queued new user request for wrangling run.", "info", "input")
+            started = _dw_start_worker_if_needed(session)
+            payload = _dw_session_payload(session)
+            payload["content"] = "Run started." if started else "No pending message to run."
+            return jsonify(payload)
+
+        if control == "note":
+            if last_user_text:
+                session.setdefault("conversation", []).append({
+                    "role": "user",
+                    "content": last_user_text,
+                    "ts": _dw_now_iso(),
+                })
+                session["conversation"] = session["conversation"][-100:]
+                _dw_log_event(session, "Context note captured while paused.", "info", "input")
+            payload = _dw_session_payload(session)
+            payload["content"] = "Context note saved. Resume when ready."
+            return jsonify(payload)
+
+        if not last_user_text:
+            payload = _dw_session_payload(session)
+            payload["content"] = "No user message provided."
+            return jsonify(payload), 400
+
+        session.setdefault("conversation", []).append({
+            "role": "user",
+            "content": last_user_text,
+            "ts": _dw_now_iso(),
+        })
+        session["conversation"] = session["conversation"][-100:]
+        if session.get("status") == "paused" or session.get("pause_requested"):
+            payload = _dw_session_payload(session)
+            payload["content"] = "Context saved (paused). Click Resume to continue."
+            return jsonify(payload)
+
+        session.setdefault("pending_user_inputs", []).append(last_user_text)
+        _dw_log_event(session, f"Queued wrangling request: '{last_user_text[:120]}'", "info", "input")
+        started = False
+        if session.get("params", {}).get("auto_run", True):
+            session["pause_requested"] = False
+            session["stop_requested"] = False
+            started = _dw_start_worker_if_needed(session)
+        payload = _dw_session_payload(session)
+        payload["content"] = (
+            "Wrangling started. Follow live findings in chat and runtime logs."
+            if started
+            else (
+                "Message queued. Click Run to start."
+                if not session.get("running")
+                else "Message queued while another wrangling run is in progress."
+            )
+        )
+        return jsonify(payload)
+
 AGENTS_CATALOG = [
     {
         "id": "ai-data-analyst",
@@ -5825,6 +7349,112 @@ AGENTS_CATALOG = [
                 "options": ["yes", "no"],
                 "default": "yes",
                 "description": "Lance automatiquement une exécution après chaque nouveau message utilisateur.",
+            },
+        ],
+    },
+    {
+        "id": "data-wrangling",
+        "name": "Nettoyage et Préparation (Data Wrangling)",
+        "description": (
+            "Agent de data wrangling orienté qualité: planifie son audit, scanne ligne par ligne et champ par champ "
+            "sur un scope ciblé, détecte des anomalies subtiles (format, outliers, cohérences croisées), "
+            "publie ses findings en direct dans le chat et maintient un watermark par table/scope."
+        ),
+        "parameters": [
+            {
+                "name": "table",
+                "label": "Table cible",
+                "type": "string",
+                "default": "",
+                "description": "Nom technique de la table à scanner (obligatoire).",
+            },
+            {
+                "name": "date_column",
+                "label": "Colonne date (optionnelle)",
+                "type": "string",
+                "default": "",
+                "description": "Colonne date utilisée pour restreindre le scope (BETWEEN ou =).",
+            },
+            {
+                "name": "date_start",
+                "label": "Date début (YYYY-MM-DD)",
+                "type": "string",
+                "default": "",
+                "description": "Date de début de scope (optionnel).",
+            },
+            {
+                "name": "date_end",
+                "label": "Date fin (YYYY-MM-DD)",
+                "type": "string",
+                "default": "",
+                "description": "Date de fin de scope (optionnel).",
+            },
+            {
+                "name": "row_start",
+                "label": "Ligne de départ",
+                "type": "number",
+                "default": 0,
+                "description": "Offset de départ dans le scan (utilisé avec watermark).",
+            },
+            {
+                "name": "max_rows",
+                "label": "Nombre de lignes à scanner",
+                "type": "number",
+                "default": 5000,
+                "description": "Volume max analysé par run.",
+            },
+            {
+                "name": "batch_size",
+                "label": "Taille de batch",
+                "type": "number",
+                "default": 400,
+                "description": "Nombre de lignes lues par batch.",
+            },
+            {
+                "name": "max_steps",
+                "label": "Maximum steps",
+                "type": "number",
+                "default": 24,
+                "description": "Nombre max d'itérations de scan/review.",
+            },
+            {
+                "name": "use_knowledge_base",
+                "label": "Use knowledge base",
+                "type": "select",
+                "options": ["yes", "no"],
+                "default": "yes",
+                "description": "Utilise la knowledge base pour guider les checks fonctionnels.",
+            },
+            {
+                "name": "reset_watermark",
+                "label": "Reset watermark",
+                "type": "select",
+                "options": ["no", "yes"],
+                "default": "no",
+                "description": "Si yes: ignore le watermark sauvegardé et rescane depuis row_start.",
+            },
+            {
+                "name": "export_excel",
+                "label": "Export anomalies to Excel",
+                "type": "select",
+                "options": ["no", "yes"],
+                "default": "no",
+                "description": "Export optionnel des anomalies détectées dans un fichier .xlsx formaté.",
+            },
+            {
+                "name": "export_path",
+                "label": "Excel export path",
+                "type": "string",
+                "default": "",
+                "description": "Chemin serveur du fichier .xlsx (vide = chemin auto).",
+            },
+            {
+                "name": "auto_run",
+                "label": "Auto-run after message",
+                "type": "select",
+                "options": ["yes", "no"],
+                "default": "yes",
+                "description": "Lance automatiquement un run à chaque nouveau message.",
             },
         ],
     },
@@ -6004,6 +7634,8 @@ def agent_chat(agent_id):
     """Dispatch a chat message to the requested agent."""
     if agent_id == "ai-data-analyst":
         return _run_ai_data_analyst_session_agent()
+    if agent_id == "data-wrangling":
+        return _run_data_wrangling_agent()
     if agent_id == "data-dictionary":
         return _run_data_dictionary_agent()
     if agent_id == "clickhouse-writer":

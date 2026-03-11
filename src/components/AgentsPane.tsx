@@ -251,9 +251,47 @@ interface AnalystRuntimeState {
   latest_assistant?: {
     content: string;
     analyst_result?: AnalystResult | null;
+    wrangling_result?: WranglingResult | null;
     error?: string;
   } | null;
-  last_result?: AnalystResult | null;
+  last_result?: AnalystResult | WranglingResult | null;
+}
+
+interface WranglingAnomaly {
+  table: string;
+  line_number: number;
+  column: string;
+  issue_type: string;
+  severity: 'low' | 'medium' | 'high' | string;
+  value_preview: string;
+  reference: string;
+}
+
+interface WranglingResult {
+  table: string;
+  scope: {
+    date_column?: string;
+    date_start?: string;
+    date_end?: string;
+    line_start?: number;
+    line_end?: number;
+  };
+  plan_steps: string[];
+  focus_columns: string[];
+  sql_checks: Array<{ name: string; sql: string; ok: boolean; summary: string }>;
+  scanned_rows: number;
+  anomaly_count: number;
+  anomaly_type_counts: Record<string, number>;
+  anomalies_preview: WranglingAnomaly[];
+  watermark?: {
+    scope_key?: string;
+    next_offset?: number;
+    last_scanned_range_start?: number;
+    last_scanned_range_end?: number;
+  };
+  export_excel_path?: string;
+  interrupted?: boolean;
+  interrupt_reason?: string;
 }
 
 interface ChatMessage {
@@ -290,6 +328,8 @@ interface ChatMessage {
   optional_suggestions?: { label: string; value: string }[];
   // AI Data Analyst session fields
   analyst_result?: AnalystResult;
+  wrangling_result?: WranglingResult;
+  agent_kind?: 'analyst' | 'wrangling';
   analyst_runtime_status?: string;
   analyst_memory_summary?: string;
 }
@@ -298,29 +338,37 @@ interface ChatMessage {
 
 function AgentCard({ agent, selected, onClick }: { agent: Agent; selected: boolean; onClick: () => void }) {
   const isAnalyst = agent.id === 'ai-data-analyst';
+  const isWrangling = agent.id === 'data-wrangling';
   const isWriter = agent.id === 'clickhouse-writer';
   const isKeyId = agent.id === 'key-identifier';
   const isEtl = agent.id === 'etl-agent';
 
-  const iconEl = isAnalyst ? <Activity size={16} /> : isWriter ? <Zap size={16} /> : isKeyId ? <GitFork size={16} /> : isEtl ? <Upload size={16} /> : <Cpu size={16} />;
+  const iconEl = isWrangling
+    ? <Layers size={16} />
+    : isAnalyst ? <Activity size={16} /> : isWriter ? <Zap size={16} /> : isKeyId ? <GitFork size={16} /> : isEtl ? <Upload size={16} /> : <Cpu size={16} />;
 
-  const selectedBg = isAnalyst ? 'border-sky-500 bg-sky-500/10'
+  const selectedBg = isWrangling ? 'border-cyan-500 bg-cyan-500/10'
+    : isAnalyst ? 'border-sky-500 bg-sky-500/10'
     : isWriter ? 'border-violet-500 bg-violet-500/10'
     : isKeyId ? 'border-indigo-500 bg-indigo-500/10'
     : isEtl ? 'border-orange-500 bg-orange-500/10'
     : 'border-emerald-500 bg-emerald-500/10';
-  const hoverBg = isAnalyst ? 'hover:border-sky-300'
+  const hoverBg = isWrangling ? 'hover:border-cyan-300'
+    : isAnalyst ? 'hover:border-sky-300'
     : isWriter ? 'hover:border-violet-300' : isKeyId ? 'hover:border-indigo-300'
     : isEtl ? 'hover:border-orange-300' : 'hover:border-emerald-300';
-  const iconSelected = isAnalyst ? 'bg-sky-500 text-white'
+  const iconSelected = isWrangling ? 'bg-cyan-500 text-white'
+    : isAnalyst ? 'bg-sky-500 text-white'
     : isWriter ? 'bg-violet-500 text-white' : isKeyId ? 'bg-indigo-500 text-white'
     : isEtl ? 'bg-orange-500 text-white' : 'bg-emerald-500 text-white';
-  const iconHover = isAnalyst ? 'group-hover:bg-sky-100 group-hover:text-sky-600'
+  const iconHover = isWrangling ? 'group-hover:bg-cyan-100 group-hover:text-cyan-600'
+    : isAnalyst ? 'group-hover:bg-sky-100 group-hover:text-sky-600'
     : isWriter ? 'group-hover:bg-violet-100 group-hover:text-violet-600'
     : isKeyId ? 'group-hover:bg-indigo-100 group-hover:text-indigo-600'
     : isEtl ? 'group-hover:bg-orange-100 group-hover:text-orange-600'
     : 'group-hover:bg-emerald-100 group-hover:text-emerald-600';
-  const textColor = isAnalyst ? 'text-sky-700'
+  const textColor = isWrangling ? 'text-cyan-700'
+    : isAnalyst ? 'text-sky-700'
     : isWriter ? 'text-violet-700' : isKeyId ? 'text-indigo-700'
     : isEtl ? 'text-orange-700' : 'text-emerald-700';
 
@@ -2453,6 +2501,71 @@ function AnalystMessageView({ msg }: { msg: ChatMessage }) {
   );
 }
 
+function WranglingMessageView({ msg }: { msg: ChatMessage }) {
+  const result = msg.wrangling_result;
+  if (!result) return null;
+  const typeEntries = Object.entries(result.anomaly_type_counts || {}).slice(0, 8);
+  const sampleFindings = (result.anomalies_preview || []).slice(0, 12);
+  return (
+    <div className="mt-3 space-y-3">
+      <div className="rounded-xl border border-cyan-200 bg-cyan-50 p-3">
+        <div className="flex flex-wrap items-center gap-2 text-[11px]">
+          <span className="px-2 py-1 rounded-full border bg-white text-slate-700 border-slate-200">
+            Table: {result.table}
+          </span>
+          <span className="px-2 py-1 rounded-full border bg-white text-slate-700 border-slate-200">
+            {result.scanned_rows} row{result.scanned_rows > 1 ? 's' : ''} scanned
+          </span>
+          <span className="px-2 py-1 rounded-full border bg-white text-slate-700 border-slate-200">
+            {result.anomaly_count} anomal{result.anomaly_count > 1 ? 'ies' : 'y'}
+          </span>
+          {result.export_excel_path && (
+            <span className="px-2 py-1 rounded-full border bg-emerald-50 text-emerald-700 border-emerald-200">
+              Excel: {result.export_excel_path}
+            </span>
+          )}
+        </div>
+        <p className="text-xs text-slate-600 mt-2">
+          Scope lines: {result.scope?.line_start ?? '?'} → {result.scope?.line_end ?? '?'} ·
+          Watermark next offset: {result.watermark?.next_offset ?? '?'}
+        </p>
+      </div>
+
+      {typeEntries.length > 0 && (
+        <div className="rounded-xl border border-slate-200 bg-white p-3">
+          <p className="text-xs font-semibold text-slate-700 mb-2">Anomaly type distribution</p>
+          <div className="flex flex-wrap gap-2">
+            {typeEntries.map(([k, v]) => (
+              <span key={k} className="px-2 py-1 rounded-full border border-cyan-200 bg-cyan-50 text-cyan-700 text-[11px]">
+                {k}: {v}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {sampleFindings.length > 0 && (
+        <div className="rounded-xl border border-slate-200 overflow-hidden">
+          <div className="px-3 py-2 text-xs font-semibold text-slate-700 bg-slate-50 border-b border-slate-200">
+            Sample findings with precise references
+          </div>
+          <div className="max-h-72 overflow-y-auto divide-y divide-slate-100 bg-white">
+            {sampleFindings.map((f, i) => (
+              <div key={`${f.line_number}-${f.column}-${i}`} className="p-3 text-xs">
+                <p className="text-slate-700 font-medium">
+                  L{f.line_number} · {f.column} · {f.issue_type}
+                </p>
+                <p className="text-slate-500 mt-1">{f.reference}</p>
+                <p className="text-slate-400 mt-1 truncate">Value: {f.value_preview}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function AnalystRuntimePanel({
   runtime,
   showPanel,
@@ -2565,7 +2678,8 @@ function AssistantMessage({
     );
   }
 
-  const isAnalyst = !!msg.analyst_result;
+  const isWrangling = !!msg.wrangling_result || msg.agent_kind === 'wrangling';
+  const isAnalyst = !!msg.analyst_result || isWrangling || msg.agent_kind === 'analyst';
   const isWriter = !!(msg.plan || msg.action_log || msg.synthesis
     || (msg.question && !msg.etl_plan && !msg.files_found) || (msg.status && !msg.etl_plan && !msg.files_found)) && !isAnalyst;
   const isKeyId = msg.suggestions !== undefined;
@@ -2576,9 +2690,11 @@ function AssistantMessage({
     <div className="flex gap-3 justify-start">
       <div className={clsx(
         'p-2 rounded-full flex-shrink-0 self-start mt-1',
-        isAnalyst ? 'bg-sky-100' : isWriter ? 'bg-violet-100' : isKeyId ? 'bg-indigo-100' : isEtl ? 'bg-orange-100' : 'bg-emerald-100',
+        isWrangling ? 'bg-cyan-100' : isAnalyst ? 'bg-sky-100' : isWriter ? 'bg-violet-100' : isKeyId ? 'bg-indigo-100' : isEtl ? 'bg-orange-100' : 'bg-emerald-100',
       )}>
-        {isAnalyst
+        {isWrangling
+          ? <Layers size={14} className="text-cyan-700" />
+          : isAnalyst
           ? <Activity size={14} className="text-sky-600" />
           : isWriter
           ? <Zap size={14} className="text-violet-600" />
@@ -2591,7 +2707,8 @@ function AssistantMessage({
       <div className="flex-1 max-w-full overflow-hidden">
         <div className={clsx(
           'border rounded-xl px-4 py-3 shadow-sm',
-          isAnalyst ? 'bg-white border-sky-100'
+          isWrangling ? 'bg-white border-cyan-100'
+            : isAnalyst ? 'bg-white border-sky-100'
             : isWriter ? 'bg-white border-violet-100'
             : isKeyId ? 'bg-white border-indigo-100'
             : isEtl ? 'bg-white border-orange-100'
@@ -2627,8 +2744,10 @@ function AssistantMessage({
           )}
           {isAnalyst && msg.analyst_runtime_status && (
             <div className="flex items-center gap-2 mt-2">
-              <Activity size={13} className="text-sky-500" />
-              <span className="text-xs text-sky-700 font-medium">
+              {isWrangling
+                ? <Layers size={13} className="text-cyan-500" />
+                : <Activity size={13} className="text-sky-500" />}
+              <span className={clsx('text-xs font-medium', isWrangling ? 'text-cyan-700' : 'text-sky-700')}>
                 Session status: {msg.analyst_runtime_status}
               </span>
             </div>
@@ -2684,6 +2803,9 @@ function AssistantMessage({
         {isAnalyst && (
           <AnalystMessageView msg={msg} />
         )}
+        {isWrangling && (
+          <WranglingMessageView msg={msg} />
+        )}
       </div>
     </div>
   );
@@ -2707,6 +2829,7 @@ export function AgentsPane() {
   const [showAnalystRuntimePanel, setShowAnalystRuntimePanel] = useState(true);
   const analystSeenResponseSeqRef = useRef(0);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const isRuntimeAgentId = (id?: string | null) => id === 'ai-data-analyst' || id === 'data-wrangling';
 
   useEffect(() => {
     fetch('/api/agents')
@@ -2740,6 +2863,7 @@ export function AgentsPane() {
 
   function applyAnalystRuntimeResponse(data: any, options?: { injectStatusMessage?: boolean }) {
     if (!data) return;
+    const runtimeAgentKind = selectedAgent?.id === 'data-wrangling' ? 'wrangling' : 'analyst';
     if (data.session_id) setSessionId(data.session_id);
     const runtime: AnalystRuntimeState = {
       status: data.status || 'idle',
@@ -2761,10 +2885,18 @@ export function AgentsPane() {
       && runtime.latest_assistant
       && runtime.latest_assistant.content
     ) {
+      const fallbackAnalyst = runtimeAgentKind === 'analyst'
+        ? (runtime.last_result as AnalystResult | undefined)
+        : undefined;
+      const fallbackWrangling = runtimeAgentKind === 'wrangling'
+        ? (runtime.last_result as WranglingResult | undefined)
+        : undefined;
       setMessages(prev => [...prev, {
         role: 'assistant',
         content: runtime.latest_assistant?.content || 'Analysis complete.',
-        analyst_result: runtime.latest_assistant?.analyst_result || runtime.last_result || undefined,
+        analyst_result: runtime.latest_assistant?.analyst_result || fallbackAnalyst,
+        wrangling_result: runtime.latest_assistant?.wrangling_result || fallbackWrangling,
+        agent_kind: runtimeAgentKind,
         analyst_runtime_status: runtime.status,
         error: runtime.latest_assistant?.error || undefined,
       }]);
@@ -2775,13 +2907,14 @@ export function AgentsPane() {
       setMessages(prev => [...prev, {
         role: 'assistant',
         content: data.content,
+        agent_kind: runtimeAgentKind,
         analyst_runtime_status: runtime.status,
       }]);
     }
   }
 
   async function sendAnalystControl(control: 'status' | 'pause' | 'resume' | 'stop' | 'run') {
-    if (!selectedAgent || selectedAgent.id !== 'ai-data-analyst') return;
+    if (!selectedAgent || !isRuntimeAgentId(selectedAgent.id)) return;
     setAnalystControlBusy(true);
     try {
       const body: Record<string, unknown> = {
@@ -2823,7 +2956,7 @@ export function AgentsPane() {
   }
 
   useEffect(() => {
-    if (!selectedAgent || selectedAgent.id !== 'ai-data-analyst') return;
+    if (!selectedAgent || !isRuntimeAgentId(selectedAgent.id)) return;
     if (!sessionId) return;
     const runtimeStatus = analystRuntime?.status || '';
     const shouldPoll = !!analystRuntime?.running || ['running', 'pausing', 'stopping'].includes(runtimeStatus);
@@ -2831,7 +2964,7 @@ export function AgentsPane() {
 
     const timer = window.setInterval(async () => {
       try {
-        const res = await fetch('/api/agents/ai-data-analyst/chat', {
+        const res = await fetch(`/api/agents/${selectedAgent.id}/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -2862,7 +2995,7 @@ export function AgentsPane() {
     const text = (overrideContent ?? input).trim();
     if (!text || !selectedAgent) return;
     if (analystControlBusy) return;
-    if (selectedAgent.id !== 'ai-data-analyst' && loading) return;
+    if (!isRuntimeAgentId(selectedAgent.id) && loading) return;
 
     const userMsg: ChatMessage = { role: 'user', content: text };
     setMessages(prev => [...prev, userMsg]);
@@ -2873,14 +3006,14 @@ export function AgentsPane() {
     try {
       const allMsgs = [...messages, userMsg];
       const body: Record<string, unknown> = {
-        messages: selectedAgent.id === 'ai-data-analyst'
+        messages: isRuntimeAgentId(selectedAgent.id)
           ? [{ role: 'user', content: text }]
           : allMsgs.map(m => ({ role: m.role, content: m.content })),
         params,
       };
       if (sessionId) body.session_id = sessionId;
 
-      if (selectedAgent.id === 'ai-data-analyst' && analystRuntime?.status === 'paused') {
+      if (isRuntimeAgentId(selectedAgent.id) && analystRuntime?.status === 'paused') {
         body.control = 'note';
       }
 
@@ -2896,7 +3029,7 @@ export function AgentsPane() {
 
       if (data.error) {
         setMessages(prev => [...prev, { role: 'assistant', content: data.error, error: data.error }]);
-      } else if (selectedAgent.id === 'ai-data-analyst') {
+      } else if (isRuntimeAgentId(selectedAgent.id)) {
         applyAnalystRuntimeResponse(data, { injectStatusMessage: true });
         keepLoading = !!data.running;
       } else if (selectedAgent.id === 'clickhouse-writer') {
@@ -2969,8 +3102,8 @@ export function AgentsPane() {
 
   async function resetConversation() {
     try {
-      if (selectedAgent?.id === 'ai-data-analyst' && sessionId) {
-        await fetch('/api/agents/ai-data-analyst/chat', {
+      if (isRuntimeAgentId(selectedAgent?.id) && sessionId && selectedAgent?.id) {
+        await fetch(`/api/agents/${selectedAgent.id}/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -2992,7 +3125,8 @@ export function AgentsPane() {
     setAnalystControlBusy(false);
   }
 
-  const isAnalyst = selectedAgent?.id === 'ai-data-analyst';
+  const isWranglingAgent = selectedAgent?.id === 'data-wrangling';
+  const isAnalyst = isRuntimeAgentId(selectedAgent?.id);
   const isWriter = selectedAgent?.id === 'clickhouse-writer';
   const isKeyId = selectedAgent?.id === 'key-identifier';
   const isEtl = selectedAgent?.id === 'etl-agent';
@@ -3018,6 +3152,21 @@ export function AgentsPane() {
       last_result: null,
     })
     : null;
+  const runtimeHeaderBorder = isWranglingAgent ? 'border-cyan-100' : 'border-sky-100';
+  const runtimeHeaderIconBg = isWranglingAgent ? 'bg-cyan-500' : 'bg-sky-500';
+  const runtimeBadgeClass = isWranglingAgent
+    ? 'bg-cyan-50 border-cyan-200 text-cyan-700'
+    : 'bg-sky-50 border-sky-200 text-sky-700';
+  const runtimeRunBtnClass = isWranglingAgent
+    ? 'border-cyan-200 text-cyan-700 bg-cyan-50 hover:bg-cyan-100'
+    : 'border-sky-200 text-sky-700 bg-sky-50 hover:bg-sky-100';
+  const runtimeInputBorderClass = isWranglingAgent
+    ? 'border-cyan-200 focus:ring-cyan-400'
+    : 'border-sky-200 focus:ring-sky-400';
+  const runtimeUserBubbleClass = isWranglingAgent ? 'bg-cyan-600' : 'bg-sky-600';
+  const runtimeLoaderBgClass = isWranglingAgent ? 'bg-cyan-100' : 'bg-sky-100';
+  const runtimeLoaderTextClass = isWranglingAgent ? 'text-cyan-600' : 'text-sky-600';
+  const runtimeLoaderDotClass = isWranglingAgent ? 'bg-cyan-400' : 'bg-sky-400';
 
   // ── Render ────────────────────────────────────────────────────────────
 
@@ -3098,10 +3247,11 @@ export function AgentsPane() {
           {/* Agent header */}
           <div className={clsx(
             'bg-white border-b px-6 py-3 flex items-center gap-3 flex-shrink-0',
-            isAnalyst ? 'border-sky-100' : isWriter ? 'border-violet-100' : isKeyId ? 'border-indigo-100' : isEtl ? 'border-orange-100' : 'border-slate-200',
+            isAnalyst ? runtimeHeaderBorder : isWriter ? 'border-violet-100' : isKeyId ? 'border-indigo-100' : isEtl ? 'border-orange-100' : 'border-slate-200',
           )}>
-            <div className={clsx('p-2 rounded-lg', isAnalyst ? 'bg-sky-500' : isWriter ? 'bg-violet-600' : isKeyId ? 'bg-indigo-500' : isEtl ? 'bg-orange-500' : 'bg-emerald-500')}>
-              {isAnalyst ? <Activity size={16} className="text-white" />
+            <div className={clsx('p-2 rounded-lg', isAnalyst ? runtimeHeaderIconBg : isWriter ? 'bg-violet-600' : isKeyId ? 'bg-indigo-500' : isEtl ? 'bg-orange-500' : 'bg-emerald-500')}>
+              {isAnalyst
+                ? (isWranglingAgent ? <Layers size={16} className="text-white" /> : <Activity size={16} className="text-white" />)
                 : isWriter ? <Zap size={16} className="text-white" />
                   : isKeyId ? <GitFork size={16} className="text-white" />
                     : isEtl ? <Upload size={16} className="text-white" />
@@ -3117,7 +3267,7 @@ export function AgentsPane() {
                 <span className={clsx(
                   'px-2 py-1 rounded-full text-[10px] border',
                   analystStatus === 'running'
-                    ? 'bg-sky-50 border-sky-200 text-sky-700'
+                    ? runtimeBadgeClass
                     : analystStatus === 'paused'
                       ? 'bg-amber-50 border-amber-200 text-amber-700'
                       : analystStatus === 'stopped'
@@ -3129,7 +3279,10 @@ export function AgentsPane() {
                 <button
                   onClick={() => sendAnalystControl('run')}
                   disabled={!analystCanRun}
-                  className="px-2.5 py-1.5 text-[11px] rounded-lg border border-sky-200 text-sky-700 bg-sky-50 hover:bg-sky-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-1.5"
+                  className={clsx(
+                    'px-2.5 py-1.5 text-[11px] rounded-lg border disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-1.5',
+                    runtimeRunBtnClass,
+                  )}
                   title="Run queued message(s)"
                 >
                   <Play size={12} />
@@ -3259,26 +3412,41 @@ export function AgentsPane() {
                     {isAnalyst ? (
                       <>
                         <div className="p-4 bg-sky-50 rounded-2xl mb-4">
-                          <Activity size={36} className="text-sky-400" />
+                          {isWranglingAgent
+                            ? <Layers size={36} className="text-cyan-400" />
+                            : <Activity size={36} className="text-sky-400" />}
                         </div>
                         <p className="text-sm text-slate-600 font-semibold mb-1">
-                          AI Data Analyst Session Agent
+                          {isWranglingAgent ? 'Nettoyage et Préparation (Data Wrangling)' : 'AI Data Analyst Session Agent'}
                         </p>
                         <p className="text-xs text-slate-400 max-w-md leading-relaxed mb-4">
-                          Ask one complex question or chain follow-ups in the same thread. The agent plans SQL actions,
-                          self-evaluates mid-run, and keeps compact memory for stable local LLM usage.
+                          {isWranglingAgent
+                            ? 'Définissez un scope précis (table/date/lignes). L’agent planifie, scanne ligne/champ, publie ses findings en direct, garde un watermark et peut exporter les anomalies en Excel.'
+                            : 'Ask one complex question or chain follow-ups in the same thread. The agent plans SQL actions, self-evaluates mid-run, and keeps compact memory for stable local LLM usage.'}
                         </p>
                         <div className="flex flex-wrap gap-2 justify-center">
-                          {[
-                            'Compare weekly revenue between January and February 2025',
-                            'Identify the 5 products with the biggest margin drop this quarter',
-                            'Continue from previous result and explain anomalies by country',
-                            'Pause after first findings so I can provide more business context',
-                          ].map(s => (
+                          {(isWranglingAgent
+                            ? [
+                              'Scope: table=fact_orders, date_column=order_date, Jan 2025, 10000 rows. Detect subtle anomalies.',
+                              'Scan customers table from watermark and focus on email/phone/id anomalies.',
+                              'Analyze lines 50000-80000 of transactions and export anomalies to Excel.',
+                              'Run wrangling then pause after first 3 batches for business feedback.',
+                            ]
+                            : [
+                              'Compare weekly revenue between January and February 2025',
+                              'Identify the 5 products with the biggest margin drop this quarter',
+                              'Continue from previous result and explain anomalies by country',
+                              'Pause after first findings so I can provide more business context',
+                            ]).map(s => (
                             <button
                               key={s}
                               onClick={() => setInput(s)}
-                              className="px-3 py-1.5 text-xs bg-white border border-sky-200 rounded-full text-sky-700 hover:border-sky-400 hover:bg-sky-50 transition-colors text-left"
+                              className={clsx(
+                                'px-3 py-1.5 text-xs bg-white border rounded-full transition-colors text-left',
+                                isWranglingAgent
+                                  ? 'border-cyan-200 text-cyan-700 hover:border-cyan-400 hover:bg-cyan-50'
+                                  : 'border-sky-200 text-sky-700 hover:border-sky-400 hover:bg-sky-50',
+                              )}
                             >
                               {s}
                             </button>
@@ -3408,7 +3576,7 @@ export function AgentsPane() {
                       <div className="flex justify-end">
                         <div className={clsx(
                           'text-white rounded-xl px-4 py-2.5 max-w-md text-sm',
-                          isAnalyst ? 'bg-sky-600' : isWriter ? 'bg-violet-600' : isEtl ? 'bg-orange-500' : 'bg-emerald-500',
+                          isAnalyst ? runtimeUserBubbleClass : isWriter ? 'bg-violet-600' : isEtl ? 'bg-orange-500' : 'bg-emerald-500',
                         )}>
                           {msg.content}
                         </div>
@@ -3427,23 +3595,23 @@ export function AgentsPane() {
                   <div className="flex gap-3 justify-start">
                     <div className={clsx(
                       'p-2 rounded-full flex-shrink-0',
-                      isAnalyst ? 'bg-sky-100' : isWriter ? 'bg-violet-100' : isEtl ? 'bg-orange-100' : 'bg-emerald-100',
+                      isAnalyst ? runtimeLoaderBgClass : isWriter ? 'bg-violet-100' : isEtl ? 'bg-orange-100' : 'bg-emerald-100',
                     )}>
                       <Loader2 size={14} className={clsx(
                         'animate-spin',
-                        isAnalyst ? 'text-sky-600' : isWriter ? 'text-violet-600' : isEtl ? 'text-orange-600' : 'text-emerald-600',
+                        isAnalyst ? runtimeLoaderTextClass : isWriter ? 'text-violet-600' : isEtl ? 'text-orange-600' : 'text-emerald-600',
                       )} />
                     </div>
                     <div className="bg-white border border-slate-200 rounded-xl px-4 py-3 shadow-sm">
                       <div className="flex items-center gap-2 text-sm text-slate-400">
-                        <span>{isAnalyst ? 'Analyst agent planning and executing SQL chain' : isWriter ? 'Agent planning and executing' : isEtl ? 'ETL agent analyzing and importing' : 'Analysis in progress'}</span>
+                        <span>{isAnalyst ? (isWranglingAgent ? 'Wrangling agent scanning rows and detecting anomalies' : 'Analyst agent planning and executing SQL chain') : isWriter ? 'Agent planning and executing' : isEtl ? 'ETL agent analyzing and importing' : 'Analysis in progress'}</span>
                         <span className="flex gap-0.5">
                           {[0, 150, 300].map(d => (
                             <span
                               key={d}
                               className={clsx(
                                 'w-1 h-1 rounded-full animate-bounce',
-                                isAnalyst ? 'bg-sky-400' : isWriter ? 'bg-violet-400' : isEtl ? 'bg-orange-400' : 'bg-emerald-400',
+                                isAnalyst ? runtimeLoaderDotClass : isWriter ? 'bg-violet-400' : isEtl ? 'bg-orange-400' : 'bg-emerald-400',
                               )}
                               style={{ animationDelay: `${d}ms` }}
                             />
@@ -3469,7 +3637,10 @@ export function AgentsPane() {
                     <button
                       onClick={() => sendAnalystControl('run')}
                       disabled={!analystCanRun}
-                      className="px-2.5 py-1.5 text-[11px] rounded-lg border border-sky-200 text-sky-700 bg-sky-50 hover:bg-sky-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-1.5"
+                      className={clsx(
+                        'px-2.5 py-1.5 text-[11px] rounded-lg border disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-1.5',
+                        runtimeRunBtnClass,
+                      )}
                     >
                       <Play size={12} />
                       Run
@@ -3518,7 +3689,9 @@ export function AgentsPane() {
                       isAnalyst
                         ? (analystStatus === 'paused'
                           ? 'Session paused: add a note/context, then click Resume…'
-                          : 'Ask a business question, then chain follow-ups in this same thread…')
+                          : (isWranglingAgent
+                            ? 'Define scope (table/date/rows) and launch wrangling scan…'
+                            : 'Ask a business question, then chain follow-ups in this same thread…'))
                         : isWriter
                           ? 'Describe your analysis in natural language…'
                           : isEtl
@@ -3530,7 +3703,7 @@ export function AgentsPane() {
                     className={clsx(
                       'flex-1 resize-none px-4 py-3 text-sm border rounded-xl bg-slate-50 focus:outline-none focus:ring-2 focus:border-transparent disabled:opacity-50 transition-colors',
                       isAnalyst
-                        ? 'border-sky-200 focus:ring-sky-400'
+                        ? runtimeInputBorderClass
                         : isWriter
                           ? 'border-violet-200 focus:ring-violet-400'
                           : isEtl
@@ -3544,7 +3717,7 @@ export function AgentsPane() {
                     className={clsx(
                       'p-3 disabled:bg-slate-200 disabled:cursor-not-allowed text-white rounded-xl transition-colors flex-shrink-0',
                       isAnalyst
-                        ? 'bg-sky-600 hover:bg-sky-700'
+                        ? (isWranglingAgent ? 'bg-cyan-600 hover:bg-cyan-700' : 'bg-sky-600 hover:bg-sky-700')
                         : isWriter
                           ? 'bg-violet-600 hover:bg-violet-700'
                           : isEtl
@@ -3558,7 +3731,7 @@ export function AgentsPane() {
                 <p className="text-[10px] text-slate-400 mt-1.5 ml-1">
                   Enter to send · Shift+Enter for new line
                   {isAnalyst && (
-                    <span className="ml-2 text-sky-500 font-medium">
+                    <span className={clsx('ml-2 font-medium', isWranglingAgent ? 'text-cyan-500' : 'text-sky-500')}>
                       · Status: {analystStatus} · Pending queue: {analystRuntime?.pending_user_inputs || 0}
                     </span>
                   )}
