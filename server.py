@@ -134,6 +134,9 @@ llm_config = {
     "model": "llama3",
     "baseUrl": "http://localhost:11434",
     "apiKey": "",
+    # Optional runtime overrides (mainly useful for local_http / n8n transports)
+    "contextWindow": "",
+    "maxOutputTokens": "",
 }
 
 knowledge_base = ""
@@ -576,9 +579,10 @@ _CONTEXT_SAFETY_RATIO = 0.72
 _CONTEXT_OUTPUT_RESERVE = 256
 
 # For generic HTTP LLM providers, avoid optimistic context assumptions unless
-# the user explicitly sets a context window.
-_HTTP_CONTEXT_FALLBACK = 4096
-_HTTP_CONTEXT_AUTO_CAP = 8192
+# the user explicitly sets a context window. Many local OpenAI-compatible
+# runtimes are configured around 2k-4k even when model architecture supports more.
+_HTTP_CONTEXT_FALLBACK = 3072
+_HTTP_CONTEXT_AUTO_CAP = 4096
 
 
 def _estimate_tokens(text: str) -> int:
@@ -1094,6 +1098,115 @@ def _validate_simple_clickhouse_sql(statement: str) -> None:
         )
 
 
+def _normalize_sql_fingerprint(sql: str) -> str:
+    """Build a semantic-ish fingerprint to detect near-duplicate SQL attempts."""
+    raw = (sql or "").strip().lower()
+    if not raw:
+        return ""
+    # Remove comments
+    raw = re.sub(r"--.*?$", " ", raw, flags=re.MULTILINE)
+    raw = re.sub(r"/\*[\s\S]*?\*/", " ", raw)
+    # Normalize literals to reduce false negatives on trivial value changes
+    raw = re.sub(r"'(?:''|[^'])*'", "?", raw)
+    raw = re.sub(r"\b\d+(?:\.\d+)?\b", "?", raw)
+    # Normalize spacing/punctuation
+    raw = re.sub(r"\s+", " ", raw).strip().rstrip(";")
+    return raw
+
+
+def _force_limit_for_retry(sql: str, preferred_limit: int = 200, hard_cap: int = 5000) -> str:
+    """Force a bounded LIMIT in retries to reduce timeout/memory failures."""
+    statement = (sql or "").strip().rstrip(";")
+    if not statement:
+        return statement
+    limit_match = re.search(r"\bLIMIT\s+(\d+)\b", statement, flags=re.IGNORECASE)
+    if limit_match:
+        current = int(limit_match.group(1))
+        # In retry mode, prefer smaller result sets.
+        target = max(1, min(preferred_limit, hard_cap, current))
+        return re.sub(
+            r"\bLIMIT\s+\d+\b",
+            f"LIMIT {target}",
+            statement,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+    return f"{statement}\nLIMIT {max(1, min(preferred_limit, hard_cap))}"
+
+
+def _apply_sql_retry_playbook(
+    sql: str,
+    *,
+    error_class: str,
+    error_text: str = "",
+) -> str:
+    """Apply deterministic SQL simplifications before spending an LLM retry."""
+    statement = (sql or "").strip().rstrip(";")
+    if not statement:
+        return ""
+
+    err = (error_class or "").strip().lower()
+    candidate = ""
+
+    if err in {"timeout", "memory_limit"}:
+        # Remove ORDER BY to reduce sorting overhead and force a smaller LIMIT.
+        no_order = re.sub(
+            r"\bORDER\s+BY\b[\s\S]*?(?=\bLIMIT\b|$)",
+            " ",
+            statement,
+            flags=re.IGNORECASE,
+        )
+        candidate = _force_limit_for_retry(no_order, preferred_limit=200, hard_cap=5000)
+    elif err == "simple_compat":
+        simplified = statement
+        # Rewrites for common non-compatible aggregates.
+        simplified = re.sub(
+            r"\bcountIf\s*\(([^()]+)\)",
+            r"sum(if(\1, 1, 0))",
+            simplified,
+            flags=re.IGNORECASE,
+        )
+        simplified = re.sub(
+            r"\bsumIf\s*\(\s*([^,()]+)\s*,\s*([^()]+)\)",
+            r"sum(if(\2, \1, 0))",
+            simplified,
+            flags=re.IGNORECASE,
+        )
+        # If date comparators are used with literals, degrade to BETWEEN same date.
+        simplified = re.sub(
+            rf"(\b[\w`.]+\b)\s*(?:>=|<=|>|<)\s*({_DATE_LITERAL_PATTERN})",
+            r"\1 BETWEEN \2 AND \2",
+            simplified,
+            flags=re.IGNORECASE,
+        )
+        candidate = _force_limit_for_retry(simplified, preferred_limit=500, hard_cap=5000)
+    elif err == "syntax_error":
+        # Minimal cleanup only.
+        candidate = statement
+    elif err == "aggregation_error":
+        # Keep query shape but reduce volume to improve stability.
+        candidate = _force_limit_for_retry(statement, preferred_limit=300, hard_cap=5000)
+
+    if not candidate:
+        return ""
+    if _normalize_sql_fingerprint(candidate) == _normalize_sql_fingerprint(statement):
+        return ""
+
+    # Keep only syntactically acceptable read-only single statement here.
+    try:
+        checked = _normalize_sql_for_execution(
+            candidate,
+            read_only=True,
+            default_limit=500,
+            hard_limit_cap=5000,
+        )
+        if err == "simple_compat":
+            _validate_simple_clickhouse_sql(checked)
+        return checked
+    except Exception:
+        return ""
+
+
 def _normalize_sql_for_execution(
     sql: str,
     *,
@@ -1479,6 +1592,7 @@ def update_config():
             clickhouse_config["databases"] = [ch["database"]]
     if data.get("llm"):
         llm_config.update(data["llm"])
+        _model_context_cache.clear()
     if "knowledge" in data:
         knowledge_base = data["knowledge"]
     return jsonify({"success": True})
@@ -2136,9 +2250,11 @@ def delete_saved_query(query_id):
 def execute_query():
     data = request.get_json()
     query = data["query"]
+    enforce_simple_compat = bool(data.get("enforce_simple_compat", False))
     exec_result = _execute_sql_guarded(
         query,
         read_only=True,
+        enforce_simple_compat=enforce_simple_compat,
         max_preview_rows=200,
         max_execution_time=15,
         default_limit=2000,
@@ -2175,19 +2291,17 @@ def chat():
     # LLM instead of the full knowledge base, reducing token usage and noise.
     db = read_db()
     folders = db.get("knowledge_folders", [])
+    user_messages = [m for m in messages if m.get("role") == "user"]
+    last_user_query = user_messages[-1]["content"] if user_messages else ""
 
     if not use_knowledge_base:
         knowledge_context = ""
     else:
-        # Derive the query text from the last user message for similarity search
-        _user_messages = [m for m in messages if m.get("role") == "user"]
-        _last_user_query = _user_messages[-1]["content"] if _user_messages else ""
-
         # Attempt similarity search first; fall back to full content if unavailable
         knowledge_context = None
-        if _last_user_query and folders:
+        if last_user_query and folders:
             knowledge_context = _get_knowledge_context_by_similarity(
-                _last_user_query, top_k=int(rag_config.get("topK", 5))
+                last_user_query, top_k=int(rag_config.get("topK", 5))
             )
 
         if not knowledge_context:
@@ -2488,6 +2602,82 @@ Database schema hint (truncated):
                     parsed["options"] = values
             except Exception as exc:
                 print(f"value_selection DB lookup failed: {exc}")
+
+    # Post-validation: enforce read-only + simple compatibility SQL policy.
+    # This keeps /api/chat output aligned with the agent execution constraints.
+    if not parsed.get("needs_clarification") and parsed.get("sql"):
+        candidate_sql = str(parsed.get("sql", "")).strip()
+        try:
+            normalized_sql = _normalize_sql_for_execution(
+                candidate_sql,
+                read_only=True,
+                default_limit=1000,
+                hard_limit_cap=5000,
+            )
+            _validate_simple_clickhouse_sql(normalized_sql)
+            parsed["sql"] = normalized_sql
+        except Exception as compat_exc:
+            rewrite_prompt = f"""Rewrite the SQL so it is ClickHouse simple-compatible.
+
+USER QUESTION:
+{last_user_query}
+
+INVALID SQL:
+{candidate_sql}
+
+VALIDATION ERROR:
+{compat_exc}
+
+RULES:
+- Read-only SQL only (SELECT/SHOW/DESCRIBE/EXPLAIN/WITH).
+- Use only simple functions: COUNT, SUM, AVG, MIN, MAX, COUNT DISTINCT, ROUND, COALESCE, IF.
+- No advanced functions (windowFunnel, retention, sequenceMatch, argMax, topK, uniqHLL12, quantiles*, JSONExtract*, sumIf, countIf).
+- Date filters must use BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD' or = 'YYYY-MM-DD'.
+- No year()/month()/toYear()/toMonth()/date_trunc()/toStartOf*().
+- No >, <, >=, <= with date literals.
+- Keep LIMIT <= 5000.
+
+Return JSON only:
+{{
+  "sql": "SELECT ...",
+  "explanation": "Brief explanation.",
+  "suggestedVisual": "table" | "bar" | "line" | "pie"
+}}"""
+            try:
+                fixed_content = _call_llm(
+                    rewrite_prompt,
+                    [{"role": "user", "content": "Rewrite now."}],
+                    temperature=0.1,
+                )
+                fixed = _parse_llm_json(fixed_content)
+                fixed_sql = str(fixed.get("sql", "")).strip()
+                if not fixed_sql:
+                    raise ValueError("No rewritten SQL returned.")
+                normalized_fixed = _normalize_sql_for_execution(
+                    fixed_sql,
+                    read_only=True,
+                    default_limit=1000,
+                    hard_limit_cap=5000,
+                )
+                _validate_simple_clickhouse_sql(normalized_fixed)
+                parsed["sql"] = normalized_fixed
+                parsed["explanation"] = (
+                    fixed.get("explanation")
+                    or parsed.get("explanation")
+                    or "SQL rewritten to satisfy compatibility constraints."
+                )
+                if fixed.get("suggestedVisual"):
+                    parsed["suggestedVisual"] = fixed.get("suggestedVisual")
+                parsed["compatibility_rewrite"] = True
+            except Exception as rewrite_exc:
+                return jsonify({
+                    "error": (
+                        "Generated SQL is not compatible with the enforced ClickHouse policy "
+                        f"and auto-rewrite failed: {rewrite_exc}"
+                    ),
+                    "error_class": "simple_compat",
+                    "invalid_sql": candidate_sql,
+                }), 400
 
     return jsonify(parsed)
 
@@ -2874,6 +3064,8 @@ Return ONLY JSON:
   "reasoning": "short strategy rationale"
 }}"""
         try:
+            max_plan_tokens = int(_get_effective_context_limit() * 0.55)
+            plan_prompt = _truncate_text_to_budget(plan_prompt, max_plan_tokens)
             content = _call_llm(
                 plan_prompt,
                 [{"role": "user", "content": "Build the plan."}],
@@ -2931,6 +3123,8 @@ Return ONLY JSON:
   "updated_plan_steps": ["next step 1", "next step 2"]
 }}"""
         try:
+            max_review_tokens = int(_get_effective_context_limit() * 0.5)
+            review_prompt = _truncate_text_to_budget(review_prompt, max_review_tokens)
             content = _call_llm(
                 review_prompt,
                 [{"role": "user", "content": "Review and revise now."}],
@@ -2971,6 +3165,148 @@ Return ONLY JSON:
                 "updated_plan_steps": fallback_steps,
                 "source": "fallback",
             }
+
+    def _should_trigger_early_midcourse_review(steps_so_far: list, used_steps: int) -> bool:
+        """Trigger a review early when the agent appears to drift."""
+        if used_steps < 2:
+            return False
+        recent_queries = [s for s in steps_so_far if s.get("type") == "query"][-3:]
+        if len(recent_queries) < 2:
+            return False
+        failed_recent = sum(1 for s in recent_queries if not s.get("ok"))
+        weak_recent = 0
+        for step in recent_queries:
+            eval_obj = step.get("self_evaluation") or {}
+            score = int(eval_obj.get("score", 0)) if isinstance(eval_obj, dict) else 0
+            if score < 60:
+                weak_recent += 1
+        zero_rows_streak = (
+            len(recent_queries) >= 2
+            and all(int(s.get("row_count", 0) or 0) == 0 for s in recent_queries[-2:])
+        )
+        duplicate_recent = any(
+            str(s.get("error_class", "")).strip().lower() == "duplicate_query"
+            for s in recent_queries[-2:]
+        )
+        return failed_recent >= 2 or weak_recent >= 2 or zero_rows_streak or duplicate_recent
+
+    def _last_query_score(steps_so_far: list) -> int:
+        for step in reversed(steps_so_far):
+            if step.get("type") != "query":
+                continue
+            eval_obj = step.get("self_evaluation") or {}
+            if isinstance(eval_obj, dict):
+                try:
+                    return int(eval_obj.get("score", 60))
+                except Exception:
+                    return 60
+        return 60
+
+    def _compute_confidence_delta(steps_so_far: list, current_score: int) -> int:
+        return int(current_score) - int(_last_query_score(steps_so_far))
+
+    def _build_synthesis_evidence_lines(
+        steps_so_far: list,
+        *,
+        max_steps: int,
+        max_result_chars: int,
+    ) -> list[str]:
+        lines = []
+        for s in steps_so_far[-max_steps:]:
+            eval_note = ""
+            if isinstance(s.get("self_evaluation"), dict):
+                eval_note = (
+                    f" | SelfEval(status={s['self_evaluation'].get('status')}, "
+                    f"score={s['self_evaluation'].get('score')}, "
+                    f"delta={s.get('confidence_delta', 0)})"
+                )
+            if s.get("type") == "search_knowledge":
+                result_preview = str(s.get("result_summary", "")).replace("\n", " ")[:max_result_chars]
+                lines.append(
+                    f"Step {s.get('step')} [KB] reason={s.get('reasoning', '')[:140]} "
+                    f"search={str(s.get('search_query', ''))[:120]} result={result_preview}{eval_note}"
+                )
+            elif s.get("type") == "export_csv":
+                lines.append(
+                    f"Step {s.get('step')} [EXPORT] sql={str(s.get('sql', ''))[:180]} "
+                    f"path={str(s.get('suggested_path', ''))[:120]}{eval_note}"
+                )
+            else:
+                result_preview = str(s.get("result_summary", "")).replace("\n", " ")[:max_result_chars]
+                lines.append(
+                    f"Step {s.get('step')} [SQL {'OK' if s.get('ok') else 'FAIL'}] "
+                    f"hyp={str(s.get('hypothesis', ''))[:120]} reason={str(s.get('reasoning', ''))[:140]} "
+                    f"sql={str(s.get('sql', ''))[:220]} result={result_preview}{eval_note}"
+                )
+        return lines
+
+    def _synthesize_final_answer_from_steps(steps_so_far: list) -> str:
+        """Build final answer with token-budgeted fallbacks."""
+        detailed_lines = _build_synthesis_evidence_lines(
+            steps_so_far,
+            max_steps=12,
+            max_result_chars=240,
+        )
+        synth_prompt = f"""Based on the following evidence, write a final answer.
+
+USER QUESTION: {user_question}
+
+STEPS AND RESULTS:
+{chr(10).join(detailed_lines)}
+
+Requirements:
+- Be explicit about confidence level and evidence quality.
+- If data is missing or inconclusive, say it clearly.
+- Provide concise next best actions."""
+        context_limit = _get_effective_context_limit()
+        if _estimate_tokens(synth_prompt) > context_limit:
+            compact_lines = _build_synthesis_evidence_lines(
+                steps_so_far,
+                max_steps=8,
+                max_result_chars=120,
+            )
+            synth_prompt = f"""Write a concise final answer from this compact evidence.
+
+USER QUESTION: {user_question}
+EVIDENCE:
+{chr(10).join(compact_lines)}
+
+Requirements:
+- Mention confidence level.
+- Mention gaps/limitations.
+- Give next best actions."""
+
+        try:
+            return _call_llm(
+                synth_prompt,
+                [{"role": "user", "content": "Synthesise the final answer."}],
+                temperature=0.3,
+            )
+        except Exception as exc:
+            if not _is_context_overflow_error(str(exc)):
+                raise
+            compact_lines = _build_synthesis_evidence_lines(
+                steps_so_far,
+                max_steps=6,
+                max_result_chars=80,
+            )
+            emergency_prompt = (
+                "Write final answer in 5 short bullets from minimal evidence only.\n\n"
+                f"USER QUESTION: {user_question}\n"
+                "EVIDENCE:\n"
+                + "\n".join(compact_lines)
+            )
+            try:
+                return _call_llm(
+                    emergency_prompt,
+                    [{"role": "user", "content": "Final answer now."}],
+                    temperature=0.2,
+                )
+            except Exception:
+                return (
+                    "Synthèse partielle: la génération finale a été limitée par la fenêtre contextuelle du modèle. "
+                    "Réduisez le périmètre (tables/période) pour une conclusion plus fiable."
+                )
 
     initial_plan = _build_initial_agent_plan()
     current_plan_steps = list(initial_plan.get("plan_steps", []))
@@ -3142,6 +3478,8 @@ For a SQL query:
 {{
   "action": "query",
   "reasoning": "Why this specific query is needed and what new insight it will provide",
+  "hypothesis": "What you expect to confirm or refute",
+  "expected_signal": "What pattern in the result would validate the hypothesis",
   "sql": "SELECT ..."
 }}
 {kb_json_schema}
@@ -3360,6 +3698,10 @@ Respond ONLY with valid JSON (no markdown):
   "reasoning": "What was fixed and why this should work better",
   "sql": "SELECT ..."
 }}"""
+        retry_prompt = _truncate_text_to_budget(
+            retry_prompt,
+            int(_get_effective_context_limit() * 0.62),
+        )
 
         content = _call_llm(
             retry_prompt,
@@ -3390,7 +3732,7 @@ Respond ONLY with valid JSON (no markdown):
         used_steps = 0        # steps counting against the credit budget
         technical_retries_used = 0  # retries not counting against credits
         query_attempts_used = 0
-        retry_pending = None  # {"failed_sql": "...", "error": "...", "error_class": "..."}
+        retry_pending = None  # {"failed_sql": "...", "error": "...", "error_class": "...", "playbook_attempted": bool}
         safety_limit = MAX_AGENT_STEPS * 4  # absolute ceiling to prevent infinite loops
         safety_counter = 0
 
@@ -3399,12 +3741,15 @@ Respond ONLY with valid JSON (no markdown):
                 break
             safety_counter += 1
 
-            # ── Mid-course review (exactly once around half of the credit) ─────
+            # ── Mid-course review (halfway OR early stagnation trigger) ─────────
             if (
                 not midcourse_review_done
-                and used_steps >= halfway_step
                 and steps
                 and not retry_pending
+                and (
+                    used_steps >= halfway_step
+                    or _should_trigger_early_midcourse_review(steps, used_steps)
+                )
             ):
                 midcourse_review = _run_midcourse_review(
                     steps,
@@ -3428,17 +3773,35 @@ Respond ONLY with valid JSON (no markdown):
                         )
                     retry_pending = None
                 else:
-                    alt_decision = _run_agent_retry(steps, retry_pending)
-                    technical_retries_used += 1
                     retry_mode = "technical"
-                    retry_pending = None
+                    alt_sql = ""
+                    playbook_attempted = bool(retry_pending.get("playbook_attempted", False))
+                    if not playbook_attempted:
+                        alt_sql = _apply_sql_retry_playbook(
+                            retry_pending.get("failed_sql", ""),
+                            error_class=str(retry_pending.get("error_class", "")),
+                            error_text=str(retry_pending.get("error", "")),
+                        )
+                        if alt_sql:
+                            retry_mode = "playbook"
+                        retry_pending["playbook_attempted"] = True
 
-                    alt_sql = (alt_decision.get("sql") or "").strip()
+                    if not alt_sql:
+                        alt_decision = _run_agent_retry(steps, retry_pending)
+                        alt_sql = (alt_decision.get("sql") or "").strip()
+                        retry_mode = "technical"
+                        retry_pending = None
+                    else:
+                        retry_pending = None
+
+                    technical_retries_used += 1
+
                     if alt_sql and steps:
                         query_attempts_used += 1
                         alt_result = _execute_and_summarise(alt_sql)
                         alt_norm = (alt_result.get("normalized_sql") or alt_sql).strip()
-                        is_dup = alt_norm.lower() in seen_query_fingerprints
+                        alt_fp = _normalize_sql_fingerprint(alt_norm)
+                        is_dup = bool(alt_fp and alt_fp in seen_query_fingerprints)
                         if is_dup:
                             alt_result = {
                                 "ok": False,
@@ -3448,7 +3811,8 @@ Respond ONLY with valid JSON (no markdown):
                                 "error_class": "duplicate_query",
                             }
                         if alt_result["ok"]:
-                            seen_query_fingerprints.add(alt_norm.lower())
+                            if alt_fp:
+                                seen_query_fingerprints.add(alt_fp)
                             steps[-1].update({
                                 "sql": alt_norm,
                                 "result_summary": alt_result["summary"],
@@ -3463,12 +3827,26 @@ Respond ONLY with valid JSON (no markdown):
                                 steps[-1],
                                 used_steps,
                             )
+                            if isinstance(steps[-1].get("self_evaluation"), dict):
+                                score = int(steps[-1]["self_evaluation"].get("score", 0))
+                                steps[-1]["confidence_delta"] = _compute_confidence_delta(
+                                    steps[:-1],
+                                    score,
+                                )
                         else:
                             steps[-1]["result_summary"] += (
                                 f" | Corrective retry failed ({retry_mode}): {alt_result['summary']}"
                             )
                             steps[-1]["error_class"] = alt_result.get("error_class", "")
                             steps[-1]["technical_retry_used"] = True
+                            # Keep room for another alternative path until global +3 retry cap is hit.
+                            if technical_retries_used < MAX_TECHNICAL_RETRIES:
+                                retry_pending = {
+                                    "failed_sql": alt_norm or alt_sql,
+                                    "error": alt_result.get("summary", ""),
+                                    "error_class": alt_result.get("error_class", ""),
+                                    "playbook_attempted": retry_mode == "playbook",
+                                }
                     continue
 
             if used_steps >= MAX_AGENT_STEPS:
@@ -3487,12 +3865,15 @@ Respond ONLY with valid JSON (no markdown):
             if action == "query":
                 used_steps += 1
                 sql = decision.get("sql", "").strip()
+                hypothesis = str(decision.get("hypothesis", "")).strip()[:220]
+                expected_signal = str(decision.get("expected_signal", "")).strip()[:220]
                 query_attempts_used += 1
                 exec_result = _execute_and_summarise(sql)
                 normalized_sql = (exec_result.get("normalized_sql") or sql).strip()
+                normalized_fp = _normalize_sql_fingerprint(normalized_sql)
 
                 # Prevent pointless loops on repeated queries.
-                if normalized_sql and normalized_sql.lower() in seen_query_fingerprints:
+                if normalized_fp and normalized_fp in seen_query_fingerprints:
                     exec_result = {
                         "ok": False,
                         "normalized_sql": normalized_sql,
@@ -3500,13 +3881,15 @@ Respond ONLY with valid JSON (no markdown):
                         "summary": "Query failed: duplicate query pattern detected.",
                         "error_class": "duplicate_query",
                     }
-                elif exec_result["ok"] and normalized_sql:
-                    seen_query_fingerprints.add(normalized_sql.lower())
+                elif exec_result["ok"] and normalized_fp:
+                    seen_query_fingerprints.add(normalized_fp)
 
                 step_entry = {
                     "step": used_steps,
                     "type": "query",
                     "reasoning": reasoning,
+                    "hypothesis": hypothesis,
+                    "expected_signal": expected_signal,
                     "sql": normalized_sql,
                     "result_summary": exec_result["summary"],
                     "row_count": exec_result.get("total_rows", 0),
@@ -3515,6 +3898,11 @@ Respond ONLY with valid JSON (no markdown):
                     "technical_retry_used": False,
                 }
                 step_entry["self_evaluation"] = _agent_self_evaluate(step_entry, used_steps)
+                if isinstance(step_entry.get("self_evaluation"), dict):
+                    step_entry["confidence_delta"] = _compute_confidence_delta(
+                        steps,
+                        int(step_entry["self_evaluation"].get("score", 0)),
+                    )
                 if step_entry["self_evaluation"]["reason"]:
                     step_entry["result_summary"] += (
                         f"\nSelf-evaluation: {step_entry['self_evaluation']['reason']}"
@@ -3526,6 +3914,7 @@ Respond ONLY with valid JSON (no markdown):
                         "failed_sql": normalized_sql or sql,
                         "error": exec_result["summary"],
                         "error_class": exec_result.get("error_class", ""),
+                        "playbook_attempted": False,
                     }
 
             elif action == "search_knowledge":
@@ -3549,6 +3938,7 @@ Respond ONLY with valid JSON (no markdown):
                         "should_retry": False,
                         "should_finish": False,
                     },
+                    "confidence_delta": 0,
                 })
 
             elif action == "export_csv":
@@ -3571,6 +3961,7 @@ Respond ONLY with valid JSON (no markdown):
                         "should_retry": False,
                         "should_finish": False,
                     },
+                    "confidence_delta": 0,
                 })
             else:
                 # action == "finish"
@@ -3579,43 +3970,7 @@ Respond ONLY with valid JSON (no markdown):
 
         # If the loop exhausted all steps without finish, synthesize from evidence.
         if final_answer is None:
-            step_lines = []
-            for s in steps[-12:]:
-                eval_note = ""
-                if isinstance(s.get("self_evaluation"), dict):
-                    eval_note = (
-                        f"\nSelf-eval: status={s['self_evaluation'].get('status')} "
-                        f"score={s['self_evaluation'].get('score')} "
-                        f"reason={s['self_evaluation'].get('reason')}"
-                    )
-                if s.get("type") == "search_knowledge":
-                    step_lines.append(
-                        f"Step {s['step']} (knowledge search): {s['reasoning']}\n"
-                        f"Search: {s.get('search_query', '')}\n"
-                        f"Result: {s['result_summary']}{eval_note}"
-                    )
-                else:
-                    step_lines.append(
-                        f"Step {s['step']}: {s['reasoning']}\n"
-                        f"SQL: {s.get('sql', '')}\n"
-                        f"Result: {s['result_summary']}{eval_note}"
-                    )
-            synth_prompt = f"""Based on the following evidence, write a final answer.
-
-USER QUESTION: {user_question}
-
-STEPS AND RESULTS:
-""" + "\n\n".join(step_lines) + """
-
-Requirements:
-- Be explicit about confidence level and evidence quality.
-- If data is missing or inconclusive, say it clearly.
-- Provide concise next best actions."""
-            final_answer = _call_llm(
-                synth_prompt,
-                [{"role": "user", "content": "Synthesise the final answer."}],
-                temperature=0.3,
-            )
+            final_answer = _synthesize_final_answer_from_steps(steps)
 
         return jsonify({
             "steps": steps,
@@ -3629,6 +3984,7 @@ Requirements:
             "initial_plan": initial_plan.get("plan_steps", []),
             "current_plan": current_plan_steps,
             "midcourse_review": midcourse_review or {},
+            "no_prompt_context_injection": bool(no_prompt_context_injection),
         })
 
     except Exception as exc:
@@ -4446,6 +4802,7 @@ def import_config():
                 clickhouse_config["database"] = dbs[0]
     if "llmConfig" in data:
         llm_config.update(data["llmConfig"])
+        _model_context_cache.clear()
     if "ragConfig" in data:
         rag_config.update(data["ragConfig"])
 

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, type ChangeEvent } from 'react';
 import { Save, Database, Cpu, CheckCircle2, RefreshCw, Search, AlertCircle, Layers, Download, Upload, Brain, Plus, X } from 'lucide-react';
 import { useAppStore } from '../store';
 
@@ -7,7 +7,14 @@ export function SettingsPane() {
 
   const [config, setConfig] = useState({
     clickhouse: { host: '', username: '', password: '', databases: ['default'] as string[] },
-    llm: { provider: 'ollama', model: '', baseUrl: '', apiKey: '' }
+    llm: {
+      provider: 'ollama',
+      model: '',
+      baseUrl: '',
+      apiKey: '',
+      contextWindow: '',
+      maxOutputTokens: ''
+    }
   });
   const [newDbInput, setNewDbInput] = useState('');
   const [isSaving, setIsSaving] = useState(false);
@@ -39,9 +46,17 @@ export function SettingsPane() {
         const databases: string[] = Array.isArray(ch.databases) && ch.databases.length > 0
           ? ch.databases
           : ch.database ? [ch.database] : ['default'];
+        const llm = data.llmConfig || {};
         setConfig({
           clickhouse: { ...ch, databases },
-          llm: data.llmConfig
+          llm: {
+            provider: llm.provider || 'ollama',
+            model: llm.model || '',
+            baseUrl: llm.baseUrl || '',
+            apiKey: llm.apiKey || '',
+            contextWindow: llm.contextWindow ?? '',
+            maxOutputTokens: llm.maxOutputTokens ?? llm.maxTokens ?? '',
+          }
         });
       });
     fetch('/api/rag/config')
@@ -231,7 +246,7 @@ export function SettingsPane() {
     }
   };
 
-  const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleImport = async (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     try {
@@ -411,6 +426,48 @@ export function SettingsPane() {
               <button onClick={fetchModels} disabled={isLoadingModels} className="shrink-0 flex items-center gap-2 bg-slate-100 hover:bg-slate-200 text-slate-700 px-4 py-2.5 rounded-lg text-sm font-medium transition-colors border border-slate-200">
                 <RefreshCw size={16} className={isLoadingModels ? "animate-spin" : ""} /> Refresh
               </button>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <div className="space-y-2">
+              <label className={labelClass}>Context Window (tokens)</label>
+              <input
+                type="number"
+                min={256}
+                value={config.llm.contextWindow || ''}
+                onChange={e => setConfig({
+                  ...config,
+                  llm: {
+                    ...config.llm,
+                    contextWindow: e.target.value ? Number(e.target.value) : '',
+                  }
+                })}
+                className={inputClass}
+                placeholder="ex: 4096"
+              />
+              <p className="text-xs text-slate-400">
+                Optional explicit runtime context limit (recommended for local HTTP providers).
+              </p>
+            </div>
+            <div className="space-y-2">
+              <label className={labelClass}>Max Output Tokens</label>
+              <input
+                type="number"
+                min={64}
+                value={config.llm.maxOutputTokens || ''}
+                onChange={e => setConfig({
+                  ...config,
+                  llm: {
+                    ...config.llm,
+                    maxOutputTokens: e.target.value ? Number(e.target.value) : '',
+                  }
+                })}
+                className={inputClass}
+                placeholder="ex: 512"
+              />
+              <p className="text-xs text-slate-400">
+                Optional completion cap for API calls (helps avoid overflows and verbose outputs).
+              </p>
             </div>
           </div>
         </div>
