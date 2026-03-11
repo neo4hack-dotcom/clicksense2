@@ -8,6 +8,7 @@ import { DashboardPane } from './components/DashboardPane';
 import { RagPane } from './components/RagPane';
 import { DataQualityPane } from './components/DataQualityPane';
 import { AgentsPane } from './components/AgentsPane';
+import { AgentManagerPane } from './components/AgentManagerPane';
 import { useAppStore } from './store';
 import { MessageSquare } from 'lucide-react';
 
@@ -96,6 +97,11 @@ export default function App() {
         {activeTab === 'agents' && (
           <div className="flex-1 h-full overflow-hidden">
             <AgentsPane />
+          </div>
+        )}
+        {activeTab === 'agent-manager' && (
+          <div className="flex-1 h-full overflow-hidden">
+            <AgentManagerPane />
           </div>
         )}
       </div>

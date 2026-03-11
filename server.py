@@ -3,13 +3,20 @@ import json
 import uuid
 import re
 import math
+import time
 import requests as http_requests
 import urllib3
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, send_from_directory
+from copy import deepcopy
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover - fallback for very old Python runtimes
+    ZoneInfo = None
 
 # Suppress InsecureRequestWarning for plain-HTTP endpoints
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -95,6 +102,8 @@ DEFAULT_DB = {
     "knowledge_folders": [],
     "table_mappings": [],
     "fk_relations": [],
+    "agent_manager_workflows": [],
+    "agent_manager_runs": [],
 }
 
 
@@ -8351,6 +8360,1205 @@ AGENTS_CATALOG = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Agent Manager — workflow orchestration + scheduling
+# ---------------------------------------------------------------------------
+_AGENT_MANAGER_WORKFLOWS_KEY = "agent_manager_workflows"
+_AGENT_MANAGER_RUNS_KEY = "agent_manager_runs"
+_AGENT_MANAGER_RUNTIME_AGENT_IDS = {"ai-data-analyst", "data-wrangling"}
+_AGENT_MANAGER_INTERACTIVE_STATUSES = {
+    "awaiting_user",
+    "plan_ready",
+    "awaiting_request",
+    "awaiting_files",
+}
+_AGENT_MANAGER_ACTIVE_RUN_STATUSES = {"queued", "running", "stopping", "pausing"}
+_AGENT_MANAGER_MAX_RUNS = 250
+_AGENT_MANAGER_MAX_LOGS = 420
+_AGENT_MANAGER_MAX_STEP_RESULTS = 120
+_AGENT_MANAGER_SCHEDULER_INTERVAL_SECONDS = 20.0
+
+_agent_manager_lock = _threading.Lock()
+_agent_manager_runtime_lock = _threading.Lock()
+_agent_manager_runtime: dict = {}
+_agent_manager_scheduler_lock = _threading.Lock()
+_agent_manager_scheduler_thread = None
+_agent_manager_scheduler_started = False
+_agent_manager_scheduler_stop = _threading.Event()
+
+
+def _am_now_dt() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _am_now_iso() -> str:
+    return _am_now_dt().isoformat()
+
+
+def _am_parse_iso(value: str | None):
+    txt = str(value or "").strip()
+    if not txt:
+        return None
+    try:
+        if txt.endswith("Z"):
+            txt = txt[:-1] + "+00:00"
+        dt = datetime.fromisoformat(txt)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _am_is_truthy(value, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        txt = value.strip().lower()
+        if txt in {"1", "true", "yes", "y", "on", "oui"}:
+            return True
+        if txt in {"0", "false", "no", "n", "off", "non"}:
+            return False
+    return default
+
+
+def _am_clamp_int(value, default: int, minimum: int, maximum: int) -> int:
+    try:
+        out = int(value)
+    except Exception:
+        out = int(default)
+    if out < minimum:
+        return minimum
+    if out > maximum:
+        return maximum
+    return out
+
+
+def _am_safe_tz_name(tz_name: str | None) -> str:
+    raw = str(tz_name or "").strip() or "UTC"
+    if ZoneInfo is None:
+        return "UTC"
+    try:
+        ZoneInfo(raw)
+        return raw
+    except Exception:
+        return "UTC"
+
+
+def _am_sanitize_schedule(raw_schedule) -> dict:
+    sched = raw_schedule if isinstance(raw_schedule, dict) else {}
+    mode_raw = str(sched.get("mode", "disabled")).strip().lower()
+    mode = mode_raw if mode_raw in {"disabled", "interval", "daily"} else "disabled"
+    interval_minutes = _am_clamp_int(sched.get("interval_minutes", 60), 60, 5, 10080)
+
+    raw_time = str(sched.get("daily_time", "09:00")).strip()
+    m = re.match(r"^(\d{1,2}):(\d{2})$", raw_time)
+    if m:
+        hour = min(23, max(0, int(m.group(1))))
+        minute = min(59, max(0, int(m.group(2))))
+    else:
+        hour, minute = 9, 0
+    daily_time = f"{hour:02d}:{minute:02d}"
+
+    timezone_name = _am_safe_tz_name(sched.get("timezone", "UTC"))
+
+    return {
+        "mode": mode,
+        "interval_minutes": interval_minutes,
+        "daily_time": daily_time,
+        "timezone": timezone_name,
+    }
+
+
+def _am_compute_next_run(schedule: dict, now_utc: datetime | None = None):
+    sched = _am_sanitize_schedule(schedule)
+    mode = sched.get("mode", "disabled")
+    now = (now_utc or _am_now_dt()).astimezone(timezone.utc)
+    if mode == "disabled":
+        return None
+    if mode == "interval":
+        minutes = _am_clamp_int(sched.get("interval_minutes", 60), 60, 5, 10080)
+        return now + timedelta(minutes=minutes)
+
+    tz_name = _am_safe_tz_name(sched.get("timezone", "UTC"))
+    try:
+        tzinfo = ZoneInfo(tz_name) if ZoneInfo else timezone.utc
+    except Exception:
+        tzinfo = timezone.utc
+    local_now = now.astimezone(tzinfo)
+
+    hh, mm = 9, 0
+    try:
+        ttxt = str(sched.get("daily_time", "09:00"))
+        hh = min(23, max(0, int(ttxt.split(":")[0])))
+        mm = min(59, max(0, int(ttxt.split(":")[1])))
+    except Exception:
+        hh, mm = 9, 0
+    candidate = local_now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if candidate <= local_now:
+        candidate += timedelta(days=1)
+    return candidate.astimezone(timezone.utc)
+
+
+def _am_truncate(text: str, max_chars: int) -> str:
+    raw = str(text or "")
+    if len(raw) <= max_chars:
+        return raw
+    return raw[:max_chars] + " …[truncated]"
+
+
+def _am_load_state_unlocked():
+    db = read_db()
+    if not isinstance(db, dict):
+        db = {}
+    workflows = db.get(_AGENT_MANAGER_WORKFLOWS_KEY, [])
+    if not isinstance(workflows, list):
+        workflows = []
+    runs = db.get(_AGENT_MANAGER_RUNS_KEY, [])
+    if not isinstance(runs, list):
+        runs = []
+    db[_AGENT_MANAGER_WORKFLOWS_KEY] = workflows
+    db[_AGENT_MANAGER_RUNS_KEY] = runs
+    return db, workflows, runs
+
+
+def _am_find_workflow_index(workflows: list, workflow_id: str) -> int:
+    for i, wf in enumerate(workflows):
+        if str(wf.get("id", "")).strip() == str(workflow_id).strip():
+            return i
+    return -1
+
+
+def _am_find_run_index(runs: list, run_id: str) -> int:
+    for i, run in enumerate(runs):
+        if str(run.get("id", "")).strip() == str(run_id).strip():
+            return i
+    return -1
+
+
+def _am_trim_runs(runs: list) -> list:
+    if len(runs) <= _AGENT_MANAGER_MAX_RUNS:
+        return runs
+
+    active = [r for r in runs if str(r.get("status", "")).lower() in _AGENT_MANAGER_ACTIVE_RUN_STATUSES]
+    archived = [r for r in runs if r not in active]
+    archived.sort(key=lambda r: _am_parse_iso(r.get("created_at")) or _am_now_dt(), reverse=True)
+
+    keep_slots = max(0, _AGENT_MANAGER_MAX_RUNS - len(active))
+    kept = active + archived[:keep_slots]
+    kept.sort(key=lambda r: _am_parse_iso(r.get("created_at")) or _am_now_dt())
+    return kept
+
+
+def _am_append_run_log_inplace(run: dict, level: str, kind: str, message: str, data=None) -> None:
+    seq = int(run.get("log_seq", 0)) + 1
+    entry = {
+        "seq": seq,
+        "ts": _am_now_iso(),
+        "level": str(level or "info"),
+        "kind": str(kind or "run"),
+        "message": _am_truncate(str(message or ""), 800),
+    }
+    if data is not None:
+        entry["data"] = data
+    run["log_seq"] = seq
+    run.setdefault("logs", []).append(entry)
+    if len(run["logs"]) > _AGENT_MANAGER_MAX_LOGS:
+        run["logs"] = run["logs"][-_AGENT_MANAGER_MAX_LOGS:]
+    run["updated_at"] = entry["ts"]
+
+
+def _am_get_agent_ids() -> set:
+    return {str(a.get("id", "")).strip() for a in AGENTS_CATALOG}
+
+
+def _am_parse_step_params(raw_params):
+    if isinstance(raw_params, dict):
+        return raw_params
+    if isinstance(raw_params, str):
+        txt = raw_params.strip()
+        if txt:
+            try:
+                parsed = json.loads(txt)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                return {}
+    return {}
+
+
+def _am_sanitize_step(raw_step: dict, index: int) -> dict:
+    if not isinstance(raw_step, dict):
+        raise ValueError(f"Step #{index + 1} must be an object.")
+    agent_id = str(raw_step.get("agent_id", "")).strip()
+    if not agent_id:
+        raise ValueError(f"Step #{index + 1}: agent_id is required.")
+    if agent_id not in _am_get_agent_ids():
+        raise ValueError(f"Step #{index + 1}: unknown agent_id '{agent_id}'.")
+
+    title = str(raw_step.get("title", "")).strip() or f"Step {index + 1}"
+    prompt = str(
+        raw_step.get("prompt")
+        or raw_step.get("objective")
+        or raw_step.get("prompt_template")
+        or ""
+    ).strip()
+    if not prompt:
+        prompt = "Execute this step and provide clear findings."
+
+    timeout_seconds = _am_clamp_int(raw_step.get("timeout_seconds", 420), 420, 30, 3600)
+    halt_on_error = _am_is_truthy(raw_step.get("halt_on_error"), True)
+    auto_approve_questions = _am_is_truthy(raw_step.get("auto_approve_questions"), False)
+    auto_reply_text = str(raw_step.get("auto_reply_text", "oui")).strip() or "oui"
+    max_followups = _am_clamp_int(raw_step.get("max_followups", 2), 2, 0, 5)
+
+    return {
+        "id": str(raw_step.get("id", "")).strip() or str(uuid.uuid4()),
+        "order": index + 1,
+        "agent_id": agent_id,
+        "title": _am_truncate(title, 160),
+        "prompt": _am_truncate(prompt, 8000),
+        "params": _am_parse_step_params(raw_step.get("params", {})),
+        "halt_on_error": halt_on_error,
+        "timeout_seconds": timeout_seconds,
+        "auto_approve_questions": auto_approve_questions,
+        "auto_reply_text": _am_truncate(auto_reply_text, 300),
+        "max_followups": max_followups,
+    }
+
+
+def _am_sanitize_workflow_payload(raw_payload, existing: dict | None = None) -> dict:
+    payload = raw_payload if isinstance(raw_payload, dict) else {}
+    now_iso = _am_now_iso()
+    current = existing or {}
+
+    name = str(payload.get("name", current.get("name", ""))).strip()
+    if not name:
+        raise ValueError("Workflow name is required.")
+
+    description = str(payload.get("description", current.get("description", ""))).strip()
+    objective = str(payload.get("objective", current.get("objective", ""))).strip()
+    default_input = str(payload.get("default_input", current.get("default_input", ""))).strip()
+
+    if "enabled" in payload:
+        enabled = _am_is_truthy(payload.get("enabled"), False)
+    else:
+        enabled = _am_is_truthy(current.get("enabled"), False)
+
+    if "schedule" in payload:
+        schedule = _am_sanitize_schedule(payload.get("schedule"))
+    else:
+        schedule = _am_sanitize_schedule(current.get("schedule", {}))
+
+    raw_steps = payload.get("steps", current.get("steps", []))
+    if not isinstance(raw_steps, list):
+        raise ValueError("steps must be a list.")
+    steps = [_am_sanitize_step(step, i) for i, step in enumerate(raw_steps)]
+    if not steps:
+        raise ValueError("Workflow must contain at least one step.")
+
+    next_run_at = None
+    if enabled and schedule.get("mode") != "disabled":
+        next_dt = _am_compute_next_run(schedule, _am_now_dt())
+        next_run_at = next_dt.isoformat() if next_dt else None
+
+    return {
+        "id": str(current.get("id", "")).strip() or str(uuid.uuid4()),
+        "name": _am_truncate(name, 140),
+        "description": _am_truncate(description, 1200),
+        "objective": _am_truncate(objective, 4000),
+        "default_input": _am_truncate(default_input, 4000),
+        "enabled": enabled,
+        "schedule": schedule,
+        "steps": steps,
+        "created_at": current.get("created_at") or now_iso,
+        "updated_at": now_iso,
+        "last_run_at": current.get("last_run_at"),
+        "next_run_at": next_run_at,
+    }
+
+
+def _am_run_summary(run: dict) -> dict:
+    return {
+        "id": run.get("id"),
+        "workflow_id": run.get("workflow_id"),
+        "workflow_name": run.get("workflow_name"),
+        "trigger": run.get("trigger"),
+        "status": run.get("status"),
+        "summary": run.get("summary", ""),
+        "error": run.get("error", ""),
+        "stop_requested": bool(run.get("stop_requested", False)),
+        "created_at": run.get("created_at"),
+        "started_at": run.get("started_at"),
+        "completed_at": run.get("completed_at"),
+        "updated_at": run.get("updated_at"),
+        "step_results_count": len(run.get("step_results", [])),
+    }
+
+
+def _am_mutate_run(run_id: str, mutator):
+    with _agent_manager_lock:
+        db, workflows, runs = _am_load_state_unlocked()
+        idx = _am_find_run_index(runs, run_id)
+        if idx < 0:
+            return None
+        run = deepcopy(runs[idx])
+        mutator(run)
+        run["updated_at"] = _am_now_iso()
+        runs[idx] = run
+        db[_AGENT_MANAGER_WORKFLOWS_KEY] = workflows
+        db[_AGENT_MANAGER_RUNS_KEY] = _am_trim_runs(runs)
+        write_db(db)
+        return deepcopy(run)
+
+
+def _am_get_run(run_id: str):
+    with _agent_manager_lock:
+        _, _, runs = _am_load_state_unlocked()
+        idx = _am_find_run_index(runs, run_id)
+        if idx < 0:
+            return None
+        return deepcopy(runs[idx])
+
+
+def _am_get_workflow(workflow_id: str):
+    with _agent_manager_lock:
+        _, workflows, _ = _am_load_state_unlocked()
+        idx = _am_find_workflow_index(workflows, workflow_id)
+        if idx < 0:
+            return None
+        return deepcopy(workflows[idx])
+
+
+def _am_register_runtime_context(run_id: str, agent_id: str = "", session_id: str = "") -> None:
+    with _agent_manager_runtime_lock:
+        ctx = _agent_manager_runtime.get(run_id, {})
+        if agent_id:
+            ctx["agent_id"] = agent_id
+        if session_id:
+            ctx["session_id"] = session_id
+        _agent_manager_runtime[run_id] = ctx
+
+
+def _am_clear_runtime_context(run_id: str) -> None:
+    with _agent_manager_runtime_lock:
+        if run_id in _agent_manager_runtime:
+            del _agent_manager_runtime[run_id]
+
+
+def _am_get_runtime_context(run_id: str) -> dict:
+    with _agent_manager_runtime_lock:
+        ctx = _agent_manager_runtime.get(run_id, {})
+        return {
+            "agent_id": str(ctx.get("agent_id", "")).strip(),
+            "session_id": str(ctx.get("session_id", "")).strip(),
+        }
+
+
+def _am_dispatch_agent_call(agent_id: str, body: dict) -> tuple[dict, int]:
+    try:
+        with app.test_request_context(
+            f"/api/agents/{agent_id}/chat",
+            method="POST",
+            json=body,
+        ):
+            raw_response = agent_chat(agent_id)
+    except Exception as exc:
+        return {"error": f"Internal dispatch failed: {exc}"}, 500
+
+    status_code = 200
+    response_obj = raw_response
+    if isinstance(raw_response, tuple):
+        if len(raw_response) >= 1:
+            response_obj = raw_response[0]
+        if len(raw_response) >= 2:
+            try:
+                status_code = int(raw_response[1])
+            except Exception:
+                status_code = 500
+
+    if hasattr(response_obj, "status_code"):
+        try:
+            status_code = int(response_obj.status_code)
+        except Exception:
+            pass
+
+    if hasattr(response_obj, "get_json"):
+        payload = response_obj.get_json(silent=True) or {}
+    elif isinstance(response_obj, dict):
+        payload = response_obj
+    else:
+        payload = {"content": str(response_obj)}
+
+    if not isinstance(payload, dict):
+        payload = {"content": str(payload)}
+    return payload, status_code
+
+
+def _am_is_interactive_payload(payload: dict) -> bool:
+    status = str(payload.get("status", "")).strip().lower()
+    if status in _AGENT_MANAGER_INTERACTIVE_STATUSES:
+        return True
+    return bool(payload.get("question"))
+
+
+def _am_extract_step_text(payload: dict) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    latest = payload.get("latest_assistant")
+    if isinstance(latest, dict):
+        txt = str(latest.get("content", "")).strip()
+        if txt:
+            return txt
+    content = str(payload.get("content", "")).strip()
+    if content:
+        return content
+    msg = str(payload.get("message", "")).strip()
+    if msg:
+        return msg
+    analyst_result = payload.get("analyst_result")
+    if isinstance(analyst_result, dict):
+        txt = str(analyst_result.get("final_answer", "")).strip()
+        if txt:
+            return txt
+    synthesis = payload.get("synthesis")
+    if isinstance(synthesis, dict):
+        txt = str(synthesis.get("conclusion", "")).strip()
+        if txt:
+            return txt
+    return ""
+
+
+def _am_is_stop_requested(run_id: str) -> bool:
+    run = _am_get_run(run_id)
+    return bool(run and run.get("stop_requested"))
+
+
+def _am_poll_runtime_agent(
+    run_id: str,
+    agent_id: str,
+    initial_payload: dict,
+    step_params: dict,
+    timeout_seconds: int,
+) -> tuple[dict, str, str]:
+    payload = initial_payload if isinstance(initial_payload, dict) else {}
+    session_id = str(payload.get("session_id", "")).strip()
+    if session_id:
+        _am_register_runtime_context(run_id, agent_id=agent_id, session_id=session_id)
+
+    deadline = time.time() + float(timeout_seconds)
+    stop_sent = False
+
+    while True:
+        if _am_is_stop_requested(run_id):
+            if session_id and not stop_sent:
+                _am_dispatch_agent_call(
+                    agent_id,
+                    {"control": "stop", "session_id": session_id, "params": step_params},
+                )
+                stop_sent = True
+            return payload, "stopped", "Run stopped by user request."
+
+        status_txt = str(payload.get("status", "")).strip().lower()
+        running = bool(payload.get("running")) or status_txt in {"running", "pausing", "stopping"}
+        if not running:
+            return payload, "ok", ""
+
+        if time.time() > deadline:
+            return payload, "timeout", f"Runtime step timed out after {timeout_seconds}s."
+
+        time.sleep(1.0)
+        poll_payload, poll_status = _am_dispatch_agent_call(
+            agent_id,
+            {"control": "status", "session_id": session_id, "params": step_params},
+        )
+        payload = poll_payload if isinstance(poll_payload, dict) else {}
+        if poll_status >= 400:
+            err = payload.get("error") or f"Status polling failed ({poll_status})."
+            return payload, "error", str(err)
+        session_id = str(payload.get("session_id", "")).strip() or session_id
+        if session_id:
+            _am_register_runtime_context(run_id, agent_id=agent_id, session_id=session_id)
+
+
+def _am_auto_followup(
+    agent_id: str,
+    base_payload: dict,
+    step: dict,
+) -> tuple[dict, str, str]:
+    payload = base_payload if isinstance(base_payload, dict) else {}
+    if not _am_is_interactive_payload(payload):
+        return payload, "ok", ""
+
+    if not _am_is_truthy(step.get("auto_approve_questions"), False):
+        status_txt = str(payload.get("status", "")).strip().lower() or "awaiting_user"
+        return payload, "needs_input", f"Agent requires user input (status={status_txt})."
+
+    max_followups = _am_clamp_int(step.get("max_followups", 2), 2, 0, 5)
+    auto_reply = str(step.get("auto_reply_text", "oui")).strip() or "oui"
+    session_id = str(payload.get("session_id", "")).strip()
+    step_params = step.get("params", {}) if isinstance(step.get("params"), dict) else {}
+
+    for _ in range(max_followups):
+        if not _am_is_interactive_payload(payload):
+            return payload, "ok", ""
+        body = {
+            "messages": [{"role": "user", "content": auto_reply}],
+            "params": step_params,
+        }
+        if session_id:
+            body["session_id"] = session_id
+        payload, status_code = _am_dispatch_agent_call(agent_id, body)
+        if status_code >= 400:
+            err = payload.get("error") or f"Agent follow-up failed ({status_code})."
+            return payload, "error", str(err)
+        session_id = str(payload.get("session_id", "")).strip() or session_id
+
+    if _am_is_interactive_payload(payload):
+        return payload, "needs_input", "Agent still requires input after auto follow-ups."
+    return payload, "ok", ""
+
+
+def _am_build_step_prompt(
+    workflow: dict,
+    step: dict,
+    run_input: str,
+    prior_outputs: list[str],
+    step_idx: int,
+    total_steps: int,
+) -> str:
+    objective = str(workflow.get("objective", "")).strip()
+    context_snippets = [s for s in prior_outputs[-3:] if str(s or "").strip()]
+    context_block = "\n\n".join(f"- { _am_truncate(s, 900) }" for s in context_snippets) if context_snippets else "- none"
+    step_prompt = str(step.get("prompt", "")).strip()
+    run_goal = str(run_input or workflow.get("default_input", "")).strip()
+    return (
+        f"You are executed by Agent Manager in workflow '{workflow.get('name','')}'.\n"
+        f"Workflow objective: {objective or 'n/a'}\n"
+        f"Global user need: {run_goal or 'n/a'}\n"
+        f"Current step: {step_idx}/{total_steps} — {step.get('title','')}\n\n"
+        f"Step instruction:\n{step_prompt}\n\n"
+        "Prior step outputs (condensed):\n"
+        f"{context_block}\n\n"
+        "Return a concise, decision-useful answer. If data is missing, explain what is blocked."
+    )
+
+
+def _am_execute_step(
+    run_id: str,
+    workflow: dict,
+    step: dict,
+    step_idx: int,
+    total_steps: int,
+    run_input: str,
+    prior_outputs: list[str],
+) -> dict:
+    started_at = _am_now_iso()
+    agent_id = str(step.get("agent_id", "")).strip()
+    step_params = step.get("params", {}) if isinstance(step.get("params"), dict) else {}
+    timeout_seconds = _am_clamp_int(step.get("timeout_seconds", 420), 420, 30, 3600)
+
+    prompt = _am_build_step_prompt(workflow, step, run_input, prior_outputs, step_idx, total_steps)
+    payload, status_code = _am_dispatch_agent_call(
+        agent_id,
+        {
+            "messages": [{"role": "user", "content": prompt}],
+            "params": step_params,
+        },
+    )
+
+    if status_code >= 400:
+        err = payload.get("error") or f"Agent call failed ({status_code})."
+        return {
+            "step_id": step.get("id"),
+            "step_index": step_idx,
+            "title": step.get("title"),
+            "agent_id": agent_id,
+            "status": "failed",
+            "started_at": started_at,
+            "ended_at": _am_now_iso(),
+            "error": str(err),
+            "output_preview": "",
+            "raw_payload": _am_truncate(json.dumps(payload, ensure_ascii=False), 10000),
+        }
+
+    session_id = str(payload.get("session_id", "")).strip()
+    if session_id:
+        _am_register_runtime_context(run_id, agent_id=agent_id, session_id=session_id)
+
+    if agent_id in _AGENT_MANAGER_RUNTIME_AGENT_IDS:
+        payload, state, state_msg = _am_poll_runtime_agent(
+            run_id=run_id,
+            agent_id=agent_id,
+            initial_payload=payload,
+            step_params=step_params,
+            timeout_seconds=timeout_seconds,
+        )
+        if state == "stopped":
+            return {
+                "step_id": step.get("id"),
+                "step_index": step_idx,
+                "title": step.get("title"),
+                "agent_id": agent_id,
+                "status": "stopped",
+                "started_at": started_at,
+                "ended_at": _am_now_iso(),
+                "error": state_msg,
+                "output_preview": _am_truncate(_am_extract_step_text(payload), 3000),
+                "raw_payload": _am_truncate(json.dumps(payload, ensure_ascii=False), 10000),
+            }
+        if state in {"error", "timeout"}:
+            return {
+                "step_id": step.get("id"),
+                "step_index": step_idx,
+                "title": step.get("title"),
+                "agent_id": agent_id,
+                "status": "failed",
+                "started_at": started_at,
+                "ended_at": _am_now_iso(),
+                "error": state_msg,
+                "output_preview": _am_truncate(_am_extract_step_text(payload), 3000),
+                "raw_payload": _am_truncate(json.dumps(payload, ensure_ascii=False), 10000),
+            }
+    else:
+        payload, state, state_msg = _am_auto_followup(agent_id, payload, step)
+        if state == "needs_input":
+            return {
+                "step_id": step.get("id"),
+                "step_index": step_idx,
+                "title": step.get("title"),
+                "agent_id": agent_id,
+                "status": "failed",
+                "started_at": started_at,
+                "ended_at": _am_now_iso(),
+                "error": state_msg,
+                "output_preview": _am_truncate(_am_extract_step_text(payload), 3000),
+                "raw_payload": _am_truncate(json.dumps(payload, ensure_ascii=False), 10000),
+            }
+        if state == "error":
+            return {
+                "step_id": step.get("id"),
+                "step_index": step_idx,
+                "title": step.get("title"),
+                "agent_id": agent_id,
+                "status": "failed",
+                "started_at": started_at,
+                "ended_at": _am_now_iso(),
+                "error": state_msg,
+                "output_preview": _am_truncate(_am_extract_step_text(payload), 3000),
+                "raw_payload": _am_truncate(json.dumps(payload, ensure_ascii=False), 10000),
+            }
+
+    output_preview = _am_truncate(_am_extract_step_text(payload), 3000)
+    if not output_preview:
+        output_preview = _am_truncate(json.dumps(payload, ensure_ascii=False), 1200)
+    return {
+        "step_id": step.get("id"),
+        "step_index": step_idx,
+        "title": step.get("title"),
+        "agent_id": agent_id,
+        "status": "completed",
+        "started_at": started_at,
+        "ended_at": _am_now_iso(),
+        "error": "",
+        "output_preview": output_preview,
+        "raw_payload": _am_truncate(json.dumps(payload, ensure_ascii=False), 10000),
+    }
+
+
+def _am_run_worker(run_id: str) -> None:
+    try:
+        def _mark_running(run: dict):
+            if run.get("stop_requested"):
+                run["status"] = "stopped"
+                run["completed_at"] = run.get("completed_at") or _am_now_iso()
+                run["summary"] = run.get("summary") or "Run cancelled before start."
+                _am_append_run_log_inplace(run, "warn", "control", "Run cancelled before start.")
+                return
+            run["status"] = "running"
+            run["started_at"] = run.get("started_at") or _am_now_iso()
+            _am_append_run_log_inplace(run, "info", "run", "Run started.")
+
+        run = _am_mutate_run(run_id, _mark_running)
+        if not run:
+            return
+        if str(run.get("status", "")).lower() == "stopped":
+            return
+
+        workflow = _am_get_workflow(str(run.get("workflow_id", "")))
+        if not workflow:
+            def _mark_missing_wf(r: dict):
+                r["status"] = "failed"
+                r["completed_at"] = _am_now_iso()
+                r["error"] = "Workflow introuvable."
+                r["summary"] = "Run failed: workflow not found."
+                _am_append_run_log_inplace(r, "error", "run", "Workflow not found.")
+
+            _am_mutate_run(run_id, _mark_missing_wf)
+            return
+
+        steps = workflow.get("steps", []) if isinstance(workflow.get("steps"), list) else []
+        total_steps = len(steps)
+        run_input = str(run.get("input", "")).strip()
+        prior_outputs: list[str] = []
+
+        for idx, step in enumerate(steps, start=1):
+            if _am_is_stop_requested(run_id):
+                def _mark_stopped(r: dict):
+                    r["status"] = "stopped"
+                    r["completed_at"] = _am_now_iso()
+                    r["summary"] = "Run stopped by user."
+                    _am_append_run_log_inplace(r, "warn", "control", "Run stopped by user.")
+
+                _am_mutate_run(run_id, _mark_stopped)
+                return
+
+            def _log_step_start(r: dict):
+                _am_append_run_log_inplace(
+                    r,
+                    "info",
+                    "step",
+                    f"Step {idx}/{total_steps} started: {step.get('title','')} ({step.get('agent_id','')})",
+                )
+
+            _am_mutate_run(run_id, _log_step_start)
+
+            step_result = _am_execute_step(
+                run_id=run_id,
+                workflow=workflow,
+                step=step,
+                step_idx=idx,
+                total_steps=total_steps,
+                run_input=run_input,
+                prior_outputs=prior_outputs,
+            )
+
+            status_txt = str(step_result.get("status", "")).lower()
+            if status_txt == "completed":
+                prior_outputs.append(str(step_result.get("output_preview", "")))
+
+            def _store_step_result(r: dict):
+                r.setdefault("step_results", []).append(step_result)
+                if len(r["step_results"]) > _AGENT_MANAGER_MAX_STEP_RESULTS:
+                    r["step_results"] = r["step_results"][-_AGENT_MANAGER_MAX_STEP_RESULTS:]
+                if status_txt == "completed":
+                    _am_append_run_log_inplace(
+                        r,
+                        "info",
+                        "step",
+                        f"Step {idx}/{total_steps} completed.",
+                        {"agent_id": step_result.get("agent_id")},
+                    )
+                elif status_txt == "stopped":
+                    _am_append_run_log_inplace(
+                        r,
+                        "warn",
+                        "step",
+                        f"Step {idx}/{total_steps} stopped: {step_result.get('error','')}",
+                    )
+                else:
+                    _am_append_run_log_inplace(
+                        r,
+                        "error",
+                        "step",
+                        f"Step {idx}/{total_steps} failed: {step_result.get('error','')}",
+                    )
+
+            _am_mutate_run(run_id, _store_step_result)
+
+            if status_txt == "stopped":
+                def _mark_stopped_after_step(r: dict):
+                    r["status"] = "stopped"
+                    r["completed_at"] = _am_now_iso()
+                    r["summary"] = "Run stopped."
+
+                _am_mutate_run(run_id, _mark_stopped_after_step)
+                return
+
+            if status_txt == "failed" and _am_is_truthy(step.get("halt_on_error"), True):
+                def _mark_failed(r: dict):
+                    r["status"] = "failed"
+                    r["completed_at"] = _am_now_iso()
+                    r["error"] = str(step_result.get("error", "Step failed"))
+                    r["summary"] = (
+                        f"Run failed at step {idx}/{total_steps}: {step_result.get('title','')}"
+                    )
+                    _am_append_run_log_inplace(
+                        r,
+                        "error",
+                        "run",
+                        f"Run halted on error at step {idx}.",
+                    )
+
+                _am_mutate_run(run_id, _mark_failed)
+                return
+
+        def _mark_completed(r: dict):
+            r["status"] = "completed"
+            r["completed_at"] = _am_now_iso()
+            completed_steps = sum(
+                1
+                for s in r.get("step_results", [])
+                if str(s.get("status", "")).lower() == "completed"
+            )
+            r["summary"] = f"Workflow completed. {completed_steps}/{total_steps} steps succeeded."
+            _am_append_run_log_inplace(r, "info", "run", r["summary"])
+
+        _am_mutate_run(run_id, _mark_completed)
+
+    except Exception as exc:
+        def _mark_crash(r: dict):
+            r["status"] = "failed"
+            r["completed_at"] = _am_now_iso()
+            r["error"] = str(exc)
+            r["summary"] = "Run failed due to internal manager error."
+            _am_append_run_log_inplace(r, "error", "run", f"Unhandled manager error: {exc}")
+
+        _am_mutate_run(run_id, _mark_crash)
+    finally:
+        _am_clear_runtime_context(run_id)
+
+
+def _am_start_run_thread(run_id: str) -> bool:
+    with _agent_manager_runtime_lock:
+        existing = _agent_manager_runtime.get(run_id, {})
+        t = existing.get("thread")
+        if t and getattr(t, "is_alive", lambda: False)():
+            return False
+        worker = _threading.Thread(
+            target=_am_run_worker,
+            args=(run_id,),
+            daemon=True,
+            name=f"agent-manager-{run_id[:8]}",
+        )
+        _agent_manager_runtime[run_id] = {
+            "thread": worker,
+            "agent_id": "",
+            "session_id": "",
+        }
+    worker.start()
+    return True
+
+
+def _am_enqueue_run(workflow_id: str, trigger: str, input_text: str = "") -> tuple[dict | None, str, int]:
+    now_iso = _am_now_iso()
+    with _agent_manager_lock:
+        db, workflows, runs = _am_load_state_unlocked()
+        wf_idx = _am_find_workflow_index(workflows, workflow_id)
+        if wf_idx < 0:
+            return None, "Workflow not found.", 404
+
+        active_exists = any(
+            str(r.get("workflow_id", "")) == str(workflow_id)
+            and str(r.get("status", "")).lower() in _AGENT_MANAGER_ACTIVE_RUN_STATUSES
+            for r in runs
+        )
+        if active_exists:
+            return None, "A run is already active for this workflow.", 409
+
+        workflow = workflows[wf_idx]
+        run_input = str(input_text or workflow.get("default_input", "")).strip()
+        run = {
+            "id": str(uuid.uuid4()),
+            "workflow_id": workflow.get("id"),
+            "workflow_name": workflow.get("name"),
+            "trigger": str(trigger or "manual"),
+            "status": "queued",
+            "summary": "Run queued.",
+            "error": "",
+            "input": _am_truncate(run_input, 4000),
+            "stop_requested": False,
+            "created_at": now_iso,
+            "updated_at": now_iso,
+            "started_at": None,
+            "completed_at": None,
+            "step_results": [],
+            "logs": [],
+            "log_seq": 0,
+        }
+        _am_append_run_log_inplace(run, "info", "run", f"Run queued (trigger={trigger}).")
+        runs.append(run)
+        db[_AGENT_MANAGER_RUNS_KEY] = _am_trim_runs(runs)
+
+        workflows[wf_idx]["last_run_at"] = now_iso
+        sched = workflows[wf_idx].get("schedule", {})
+        if workflows[wf_idx].get("enabled") and _am_sanitize_schedule(sched).get("mode") != "disabled":
+            next_dt = _am_compute_next_run(sched, _am_now_dt())
+            workflows[wf_idx]["next_run_at"] = next_dt.isoformat() if next_dt else None
+        else:
+            workflows[wf_idx]["next_run_at"] = None
+        workflows[wf_idx]["updated_at"] = now_iso
+
+        db[_AGENT_MANAGER_WORKFLOWS_KEY] = workflows
+        write_db(db)
+        run_copy = deepcopy(run)
+
+    _am_start_run_thread(run_copy["id"])
+    return run_copy, "", 200
+
+
+def _am_stop_run(run_id: str):
+    def _mark_stop_requested(run: dict):
+        run["stop_requested"] = True
+        status = str(run.get("status", "")).lower()
+        if status in {"queued"}:
+            run["status"] = "stopped"
+            run["completed_at"] = _am_now_iso()
+            run["summary"] = "Run stopped before execution."
+        elif status in {"running", "pausing"}:
+            run["status"] = "stopping"
+            run["summary"] = "Stop requested."
+        _am_append_run_log_inplace(run, "warn", "control", "Stop requested by user.")
+
+    run = _am_mutate_run(run_id, _mark_stop_requested)
+    if not run:
+        return None
+
+    ctx = _am_get_runtime_context(run_id)
+    agent_id = str(ctx.get("agent_id", "")).strip()
+    session_id = str(ctx.get("session_id", "")).strip()
+    if agent_id and session_id:
+        _am_dispatch_agent_call(
+            agent_id,
+            {"control": "stop", "session_id": session_id, "params": {}},
+        )
+    return run
+
+
+def _am_scheduler_tick() -> None:
+    due_workflow_ids = []
+    now = _am_now_dt()
+    with _agent_manager_lock:
+        db, workflows, runs = _am_load_state_unlocked()
+        active_by_workflow = {
+            str(r.get("workflow_id", ""))
+            for r in runs
+            if str(r.get("status", "")).lower() in _AGENT_MANAGER_ACTIVE_RUN_STATUSES
+        }
+        changed = False
+
+        for wf in workflows:
+            wf_id = str(wf.get("id", "")).strip()
+            if not wf_id:
+                continue
+            enabled = _am_is_truthy(wf.get("enabled"), False)
+            sched = _am_sanitize_schedule(wf.get("schedule", {}))
+            wf["schedule"] = sched
+
+            if not enabled or sched.get("mode") == "disabled":
+                if wf.get("next_run_at"):
+                    wf["next_run_at"] = None
+                    changed = True
+                continue
+
+            next_dt = _am_parse_iso(wf.get("next_run_at"))
+            if next_dt is None:
+                computed = _am_compute_next_run(sched, now)
+                wf["next_run_at"] = computed.isoformat() if computed else None
+                changed = True
+                next_dt = computed
+
+            if next_dt and next_dt <= now:
+                if wf_id in active_by_workflow:
+                    wf["next_run_at"] = (now + timedelta(minutes=1)).isoformat()
+                    changed = True
+                    continue
+                due_workflow_ids.append(wf_id)
+
+        if changed:
+            db[_AGENT_MANAGER_WORKFLOWS_KEY] = workflows
+            db[_AGENT_MANAGER_RUNS_KEY] = _am_trim_runs(runs)
+            write_db(db)
+
+    for wf_id in due_workflow_ids:
+        run, err, status = _am_enqueue_run(wf_id, "scheduled", "")
+        if run:
+            _log(
+                f"Scheduled workflow '{run.get('workflow_name','')}' started (run {run.get('id','')[:8]}).",
+                source="agent-manager",
+            )
+        elif status != 409:
+            _log(f"Scheduler failed to enqueue workflow {wf_id}: {err}", "warn", "agent-manager")
+
+
+def _am_scheduler_loop() -> None:
+    _log("Agent Manager scheduler started.", source="agent-manager")
+    while not _agent_manager_scheduler_stop.is_set():
+        try:
+            _am_scheduler_tick()
+        except Exception as exc:
+            _log(f"Scheduler tick error: {exc}", "error", "agent-manager")
+        _agent_manager_scheduler_stop.wait(_AGENT_MANAGER_SCHEDULER_INTERVAL_SECONDS)
+
+
+def _am_start_scheduler_if_needed() -> None:
+    global _agent_manager_scheduler_started, _agent_manager_scheduler_thread
+    if _agent_manager_scheduler_started:
+        return
+    if app.testing:
+        return
+    if _am_is_truthy(os.environ.get("CLICKSENSE_DISABLE_AGENT_MANAGER_SCHEDULER"), False):
+        return
+    with _agent_manager_scheduler_lock:
+        if _agent_manager_scheduler_started:
+            return
+        _agent_manager_scheduler_stop.clear()
+        _agent_manager_scheduler_thread = _threading.Thread(
+            target=_am_scheduler_loop,
+            daemon=True,
+            name="agent-manager-scheduler",
+        )
+        _agent_manager_scheduler_thread.start()
+        _agent_manager_scheduler_started = True
+
+
+@app.before_request
+def _ensure_agent_manager_scheduler():
+    if request.path.startswith("/api/"):
+        _am_start_scheduler_if_needed()
+
+
+@app.route("/api/agent-manager/agents", methods=["GET"])
+def agent_manager_agents():
+    catalog = []
+    for agent in AGENTS_CATALOG:
+        aid = str(agent.get("id", "")).strip()
+        catalog.append({
+            "id": aid,
+            "name": agent.get("name", aid),
+            "description": agent.get("description", ""),
+            "parameters": agent.get("parameters", []),
+            "runtime": aid in _AGENT_MANAGER_RUNTIME_AGENT_IDS,
+            "interactive_possible": aid in {"clickhouse-writer", "etl-agent"},
+        })
+    return jsonify({"agents": catalog})
+
+
+@app.route("/api/agent-manager/workflows", methods=["GET"])
+def agent_manager_list_workflows():
+    with _agent_manager_lock:
+        _, workflows, _ = _am_load_state_unlocked()
+        result = sorted(
+            [deepcopy(wf) for wf in workflows if isinstance(wf, dict)],
+            key=lambda wf: _am_parse_iso(wf.get("updated_at")) or _am_now_dt(),
+            reverse=True,
+        )
+    return jsonify({"workflows": result})
+
+
+@app.route("/api/agent-manager/workflows", methods=["POST"])
+def agent_manager_create_workflow():
+    payload = request.get_json(silent=True) or {}
+    try:
+        workflow = _am_sanitize_workflow_payload(payload, existing=None)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    with _agent_manager_lock:
+        db, workflows, runs = _am_load_state_unlocked()
+        workflows.append(workflow)
+        db[_AGENT_MANAGER_WORKFLOWS_KEY] = workflows
+        db[_AGENT_MANAGER_RUNS_KEY] = _am_trim_runs(runs)
+        write_db(db)
+    return jsonify({"workflow": workflow}), 201
+
+
+@app.route("/api/agent-manager/workflows/<workflow_id>", methods=["PUT"])
+def agent_manager_update_workflow(workflow_id):
+    payload = request.get_json(silent=True) or {}
+    with _agent_manager_lock:
+        db, workflows, runs = _am_load_state_unlocked()
+        idx = _am_find_workflow_index(workflows, workflow_id)
+        if idx < 0:
+            return jsonify({"error": "Workflow not found."}), 404
+        existing = workflows[idx]
+        try:
+            workflow = _am_sanitize_workflow_payload(payload, existing=existing)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        workflows[idx] = workflow
+        db[_AGENT_MANAGER_WORKFLOWS_KEY] = workflows
+        db[_AGENT_MANAGER_RUNS_KEY] = _am_trim_runs(runs)
+        write_db(db)
+    return jsonify({"workflow": workflow})
+
+
+@app.route("/api/agent-manager/workflows/<workflow_id>", methods=["DELETE"])
+def agent_manager_delete_workflow(workflow_id):
+    with _agent_manager_lock:
+        db, workflows, runs = _am_load_state_unlocked()
+        idx = _am_find_workflow_index(workflows, workflow_id)
+        if idx < 0:
+            return jsonify({"error": "Workflow not found."}), 404
+        active = any(
+            str(r.get("workflow_id", "")) == str(workflow_id)
+            and str(r.get("status", "")).lower() in _AGENT_MANAGER_ACTIVE_RUN_STATUSES
+            for r in runs
+        )
+        if active:
+            return jsonify({"error": "Cannot delete while a run is active."}), 409
+        deleted = workflows.pop(idx)
+        db[_AGENT_MANAGER_WORKFLOWS_KEY] = workflows
+        db[_AGENT_MANAGER_RUNS_KEY] = _am_trim_runs(runs)
+        write_db(db)
+    return jsonify({"success": True, "deleted_id": deleted.get("id")})
+
+
+@app.route("/api/agent-manager/workflows/<workflow_id>/run", methods=["POST"])
+def agent_manager_run_workflow(workflow_id):
+    data = request.get_json(silent=True) or {}
+    run_input = str(data.get("input", "")).strip()
+    trigger = str(data.get("trigger", "manual")).strip() or "manual"
+    run, err, status = _am_enqueue_run(workflow_id, trigger, run_input)
+    if not run:
+        return jsonify({"error": err}), status
+    return jsonify({"run": _am_run_summary(run), "run_id": run.get("id")})
+
+
+@app.route("/api/agent-manager/runs", methods=["GET"])
+def agent_manager_list_runs():
+    workflow_id = str(request.args.get("workflow_id", "")).strip()
+    limit = _am_clamp_int(request.args.get("limit", 50), 50, 1, 200)
+    with _agent_manager_lock:
+        _, _, runs = _am_load_state_unlocked()
+        items = [deepcopy(r) for r in runs if isinstance(r, dict)]
+    if workflow_id:
+        items = [r for r in items if str(r.get("workflow_id", "")) == workflow_id]
+    items.sort(key=lambda r: _am_parse_iso(r.get("created_at")) or _am_now_dt(), reverse=True)
+    summaries = [_am_run_summary(r) for r in items[:limit]]
+    return jsonify({"runs": summaries})
+
+
+@app.route("/api/agent-manager/runs/<run_id>", methods=["GET"])
+def agent_manager_get_run(run_id):
+    run = _am_get_run(run_id)
+    if not run:
+        return jsonify({"error": "Run not found."}), 404
+    return jsonify({"run": run})
+
+
+@app.route("/api/agent-manager/runs/<run_id>/stop", methods=["POST"])
+def agent_manager_stop_run(run_id):
+    run = _am_stop_run(run_id)
+    if not run:
+        return jsonify({"error": "Run not found."}), 404
+    return jsonify({"run": _am_run_summary(run), "success": True})
+
+
+@app.route("/api/agent-manager/scheduler", methods=["GET"])
+def agent_manager_scheduler_status():
+    with _agent_manager_scheduler_lock:
+        started = bool(_agent_manager_scheduler_started)
+        alive = bool(_agent_manager_scheduler_thread and _agent_manager_scheduler_thread.is_alive())
+    return jsonify({
+        "started": started,
+        "alive": alive,
+        "interval_seconds": _AGENT_MANAGER_SCHEDULER_INTERVAL_SECONDS,
+    })
+
+
 @app.route("/api/console-logs", methods=["GET"])
 def get_console_logs():
     """Return buffered console logs for the frontend Console panel."""
@@ -8432,33 +9640,54 @@ def etl_browse_files():
 
 @app.route("/api/agents/clickhouse-writer/cleanup", methods=["POST"])
 def clickhouse_writer_cleanup():
-    """Drop all BOT_ tables for a given session."""
+    """Drop BOT_* tables for a given writer session (including pre-existing BOT_*)."""
     data = request.get_json(silent=True) or {}
     session_id = data.get("session_id", "")
     session = _writer_sessions.get(session_id, {})
     created_tables = session.get("created_tables", [])
-    database = session.get("database", clickhouse_config.get("database", "default"))
+    database = (
+        (data.get("database") or "").strip()
+        or session.get("database", clickhouse_config.get("database", "default"))
+    )
+
+    raw_requested = data.get("tables")
+    requested_tables = []
+    if isinstance(raw_requested, list):
+        requested_tables = [str(x) for x in raw_requested if str(x).strip()]
+    elif isinstance(raw_requested, str):
+        if "," in raw_requested:
+            requested_tables = [s.strip() for s in raw_requested.split(",") if s.strip()]
+        else:
+            requested_tables = _cw_extract_bot_table_mentions(raw_requested) or [raw_requested.strip()]
+
     try:
         client = get_clickhouse_client()
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
-    dropped, errors = [], []
-    allowed_tables, skipped_non_bot = _cw_filter_bot_tables(created_tables)
-    for table in allowed_tables:
-        try:
-            client.command(f"DROP TABLE IF EXISTS `{database}`.`{table}`")
-            dropped.append(table)
-        except Exception as exc:
-            errors.append(f"{table}: {str(exc)}")
+
+    existing_bot_tables = _cw_list_existing_bot_tables(client, database)
+    resolved = _cw_resolve_cleanup_targets(
+        existing_bot_tables=existing_bot_tables,
+        session_tables=created_tables,
+        requested_tables=requested_tables,
+    )
+    targets = resolved["targets"]
+    dropped, errors = _cw_drop_tables(client, database, targets)
+
     if session_id in _writer_sessions:
+        dropped_upper = {str(t).upper() for t in dropped}
         _writer_sessions[session_id]["created_tables"] = [
-            t for t in created_tables
-            if _cw_is_bot_table_name(t) and _cw_normalize_table_name(t) not in dropped
+            t
+            for t in resolved["session_allowed"]
+            if _cw_normalize_table_name(t).upper() not in dropped_upper
         ]
+
     return jsonify({
         "dropped": dropped,
         "errors": errors,
-        "skipped_non_bot": skipped_non_bot,
+        "skipped_non_bot": resolved["skipped_non_bot"],
+        "not_found": resolved["not_found"],
+        "available_bot_tables": resolved["available"],
     })
 
 
@@ -8531,6 +9760,82 @@ def _cw_filter_bot_tables(table_names: list[str]) -> tuple[list[str], list[str]]
                 seen_skipped.add(clean)
                 skipped.append(clean)
     return allowed, skipped
+
+
+def _cw_list_existing_bot_tables(client, database: str) -> list[str]:
+    """List current BOT_* tables in the target database."""
+    try:
+        res = client.query(f"SHOW TABLES FROM `{database}`")
+        raw_tables = [str(row[0]) for row in res.result_rows]
+    except Exception:
+        raw_tables = []
+    allowed, _ = _cw_filter_bot_tables(raw_tables)
+    return allowed
+
+
+def _cw_extract_bot_table_mentions(text: str) -> list[str]:
+    """Extract BOT_* table names mentioned in free text."""
+    raw = str(text or "")
+    mentions = re.findall(r"\bBOT_[A-Za-z0-9_]+\b", raw, flags=re.IGNORECASE)
+    allowed, _ = _cw_filter_bot_tables(mentions)
+    return allowed
+
+
+def _cw_resolve_cleanup_targets(
+    existing_bot_tables: list[str],
+    session_tables: list[str],
+    requested_tables: list[str],
+) -> dict:
+    """
+    Resolve which BOT_* tables can be dropped.
+
+    - available BOT tables = existing BOT tables in DB + session BOT tables
+    - if requested_tables provided, only those are targeted (case-insensitive match)
+    - otherwise all available BOT tables are targeted
+    """
+    existing_allowed, _ = _cw_filter_bot_tables(existing_bot_tables)
+    session_allowed, session_skipped_non_bot = _cw_filter_bot_tables(session_tables)
+    requested_allowed, requested_skipped_non_bot = _cw_filter_bot_tables(requested_tables)
+    available, _ = _cw_filter_bot_tables(existing_allowed + session_allowed)
+
+    if requested_allowed:
+        upper_map = {}
+        for name in available:
+            upper_map[str(name).upper()] = name
+        targets = []
+        not_found = []
+        seen_targets = set()
+        for req in requested_allowed:
+            match = upper_map.get(str(req).upper())
+            if match:
+                match_norm = _cw_normalize_table_name(match)
+                if match_norm not in seen_targets:
+                    seen_targets.add(match_norm)
+                    targets.append(match_norm)
+            else:
+                not_found.append(_cw_normalize_table_name(req))
+    else:
+        targets = available
+        not_found = []
+
+    return {
+        "targets": targets,
+        "not_found": not_found,
+        "available": available,
+        "session_allowed": session_allowed,
+        "skipped_non_bot": sorted(set(session_skipped_non_bot + requested_skipped_non_bot)),
+    }
+
+
+def _cw_drop_tables(client, database: str, table_names: list[str]) -> tuple[list[str], list[str]]:
+    dropped, errors = [], []
+    for table in table_names:
+        try:
+            client.command(f"DROP TABLE IF EXISTS `{database}`.`{table}`")
+            dropped.append(table)
+        except Exception as exc:
+            errors.append(f"{table}: {str(exc)}")
+    return dropped, errors
 
 
 def _cw_compact_action_log_for_prompt(
@@ -9502,18 +10807,27 @@ def _cw_execute_steps(session: dict, client, database: str, preview_rows: int = 
 
     # ── All steps done (or max reached): synthesize ───────────────────────
     allowed_created_tables, skipped_non_bot = _cw_filter_bot_tables(session.get("created_tables", []))
+    existing_bot_tables = _cw_list_existing_bot_tables(client, database)
+    cleanup_candidates, _ = _cw_filter_bot_tables(existing_bot_tables + allowed_created_tables)
     session["created_tables"] = allowed_created_tables
+    session["cleanup_candidates"] = cleanup_candidates
     synthesis = _cw_synthesize(session)
     session["synthesis"] = synthesis
     session["status"] = "awaiting_cleanup"
 
     cleanup_question = None
-    if allowed_created_tables:
+    if cleanup_candidates:
+        preview_tables = cleanup_candidates[:12]
+        table_preview_txt = ", ".join(preview_tables)
+        remaining = max(0, len(cleanup_candidates) - len(preview_tables))
+        if remaining > 0:
+            table_preview_txt += f", ... (+{remaining})"
         cleanup_question = {
             "text": (
-                f"L'agent a créé {len(allowed_created_tables)} table(s) temporaire(s): "
-                f"{', '.join(allowed_created_tables)}. "
-                "Souhaitez-vous les supprimer maintenant?"
+                f"{len(cleanup_candidates)} table(s) BOT_* détectée(s): "
+                f"{table_preview_txt}. "
+                "Souhaitez-vous les supprimer maintenant ? "
+                "Vous pouvez aussi écrire des noms précis (ex: BOT_tmp_a, BOT_tmp_b)."
             ),
             "choices": [
                 {"label": "Oui — supprimer toutes les tables BOT_", "value": "delete"},
@@ -9527,7 +10841,7 @@ def _cw_execute_steps(session: dict, client, database: str, preview_rows: int = 
             f"({'/' + str(max_actions) + ' max'}). "
             "Voici la synthèse complète ci-dessous."
         ),
-        "status": "awaiting_cleanup" if allowed_created_tables else "done",
+        "status": "awaiting_cleanup" if cleanup_candidates else "done",
         "plan": plan,
         "action_log": session["action_log"],
         "action_count": session["action_count"],
@@ -9536,6 +10850,7 @@ def _cw_execute_steps(session: dict, client, database: str, preview_rows: int = 
         "max_technical_retries": max_technical_retries,
         "synthesis": synthesis,
         "created_tables": allowed_created_tables,
+        "cleanup_candidates": cleanup_candidates,
         "skipped_non_bot_tables": skipped_non_bot,
         "replan_log": session["replan_log"],
         "question": cleanup_question,
@@ -9672,37 +10987,57 @@ def _run_clickhouse_writer_agent():
             result = _cw_execute_steps(session, client, db, preview_rows)
 
         elif status == "awaiting_cleanup":
-            affirmative = any(w in user_message.lower()
-                              for w in ["oui", "yes", "delete", "supprimer", "ok", "confirme", "1"])
+            requested_bot_tables = _cw_extract_bot_table_mentions(user_message)
+            affirmative = bool(requested_bot_tables) or any(
+                w in user_message.lower()
+                for w in ["oui", "yes", "delete", "drop", "supprimer", "cleanup", "clean", "purge", "ok", "confirme", "1"]
+            )
             if affirmative:
-                dropped, errors = [], []
-                allowed_tables, skipped_non_bot = _cw_filter_bot_tables(session.get("created_tables", []))
-                for table in allowed_tables:
-                    try:
-                        client.command(f"DROP TABLE IF EXISTS `{db}`.`{table}`")
-                        dropped.append(table)
-                    except Exception as exc:
-                        errors.append(f"{table}: {str(exc)}")
+                existing_bot_tables = _cw_list_existing_bot_tables(client, db)
+                resolved = _cw_resolve_cleanup_targets(
+                    existing_bot_tables=existing_bot_tables,
+                    session_tables=session.get("created_tables", []),
+                    requested_tables=requested_bot_tables,
+                )
+                dropped, errors = _cw_drop_tables(client, db, resolved["targets"])
                 session["status"] = "done"
+                dropped_upper = {str(t).upper() for t in dropped}
                 session["created_tables"] = [
-                    t for t in allowed_tables
-                    if _cw_normalize_table_name(t) not in dropped
+                    t
+                    for t in resolved["session_allowed"]
+                    if _cw_normalize_table_name(t).upper() not in dropped_upper
                 ]
+                remaining_bot_tables = _cw_list_existing_bot_tables(client, db)
+                session["cleanup_candidates"] = remaining_bot_tables
+
                 dropped_txt = ", ".join(dropped) if dropped else "aucune"
                 error_txt = f" (erreurs: {'; '.join(errors)})" if errors else ""
                 skipped_txt = (
-                    f" Tables ignorées (hors BOT_*): {', '.join(skipped_non_bot)}."
-                    if skipped_non_bot else ""
+                    f" Tables ignorées (hors BOT_*): {', '.join(resolved['skipped_non_bot'])}."
+                    if resolved["skipped_non_bot"] else ""
                 )
-                result = {
-                    "content": (
-                        f"🗑️ Tables supprimées: {dropped_txt}{error_txt}.{skipped_txt} "
+                missing_txt = (
+                    f" Tables BOT_* introuvables: {', '.join(resolved['not_found'])}."
+                    if resolved["not_found"] else ""
+                )
+                if not resolved["targets"]:
+                    content = (
+                        "Aucune table BOT_* correspondante à supprimer."
+                        f"{missing_txt}{skipped_txt}"
+                    )
+                else:
+                    content = (
+                        f"🗑️ Tables supprimées: {dropped_txt}{error_txt}.{missing_txt}{skipped_txt} "
                         "La session est terminée."
-                    ),
+                    )
+                result = {
+                    "content": content,
                     "status": "done",
-                    "cleanup_done": True,
+                    "cleanup_done": bool(resolved["targets"]),
                     "tables_dropped": dropped,
-                    "skipped_non_bot_tables": skipped_non_bot,
+                    "skipped_non_bot_tables": resolved["skipped_non_bot"],
+                    "not_found_tables": resolved["not_found"],
+                    "remaining_bot_tables": remaining_bot_tables,
                     "technical_retries_used": int(session.get("technical_retries", 0) or 0),
                     "max_technical_retries": int(session.get("max_technical_retries", 3) or 3),
                     "synthesis": session.get("synthesis"),
@@ -9726,6 +11061,56 @@ def _run_clickhouse_writer_agent():
                     "synthesis": session.get("synthesis"),
                     "plan": session.get("plan"),
                     "action_log": session["action_log"],
+                }
+
+        elif status == "done":
+            requested_bot_tables = _cw_extract_bot_table_mentions(user_message)
+            cleanup_intent = bool(requested_bot_tables) or any(
+                w in user_message.lower()
+                for w in ["delete", "drop", "supprimer", "cleanup", "clean", "purge"]
+            )
+            if cleanup_intent:
+                existing_bot_tables = _cw_list_existing_bot_tables(client, db)
+                resolved = _cw_resolve_cleanup_targets(
+                    existing_bot_tables=existing_bot_tables,
+                    session_tables=session.get("created_tables", []),
+                    requested_tables=requested_bot_tables,
+                )
+                dropped, errors = _cw_drop_tables(client, db, resolved["targets"])
+                dropped_upper = {str(t).upper() for t in dropped}
+                session["created_tables"] = [
+                    t
+                    for t in resolved["session_allowed"]
+                    if _cw_normalize_table_name(t).upper() not in dropped_upper
+                ]
+                session["cleanup_candidates"] = _cw_list_existing_bot_tables(client, db)
+                dropped_txt = ", ".join(dropped) if dropped else "aucune"
+                error_txt = f" (erreurs: {'; '.join(errors)})" if errors else ""
+                missing_txt = (
+                    f" Tables BOT_* introuvables: {', '.join(resolved['not_found'])}."
+                    if resolved["not_found"] else ""
+                )
+                result = {
+                    "content": (
+                        f"🧹 Cleanup BOT_* exécuté. Tables supprimées: {dropped_txt}{error_txt}.{missing_txt}"
+                        if resolved["targets"]
+                        else f"Aucune table BOT_* correspondante à supprimer.{missing_txt}"
+                    ),
+                    "status": "done",
+                    "cleanup_done": bool(resolved["targets"]),
+                    "tables_dropped": dropped,
+                    "not_found_tables": resolved["not_found"],
+                    "remaining_bot_tables": session.get("cleanup_candidates", []),
+                    "technical_retries_used": int(session.get("technical_retries", 0) or 0),
+                    "max_technical_retries": int(session.get("max_technical_retries", 3) or 3),
+                    "synthesis": session.get("synthesis"),
+                    "plan": session.get("plan"),
+                    "action_log": session.get("action_log", []),
+                }
+            else:
+                result = {
+                    "content": "Session terminée. Démarrez une nouvelle conversation.",
+                    "status": "done",
                 }
 
         else:

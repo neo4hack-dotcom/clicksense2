@@ -6,7 +6,7 @@ import {
   RotateCcw, Trash2, BookOpen, TrendingUp, Star, Code2, Download,
   GitFork, ArrowRight, ArrowLeftRight, ThumbsUp, ThumbsDown,
   FolderOpen, Upload, Layers, Calculator, ShieldCheck, PauseCircle,
-  Square, Activity, Sparkles,
+  Square, Activity, Sparkles, ShieldAlert,
 } from 'lucide-react';
 import clsx from 'clsx';
 import { useAppStore } from '../store';

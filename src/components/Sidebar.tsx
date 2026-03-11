@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { MessageSquare, LayoutDashboard, Settings, BookOpen, Database, Grid, Layers, ShieldCheck, Bot, BarChart2, Wrench, Cpu, Terminal, X, ChevronDown } from 'lucide-react';
+import { MessageSquare, LayoutDashboard, Settings, BookOpen, Database, Grid, Layers, Bot, BarChart2, Wrench, Cpu, Terminal, ChevronDown, GitFork } from 'lucide-react';
 import { useAppStore } from '../store';
 import clsx from 'clsx';
 
@@ -10,6 +10,7 @@ const navGroups = [
     items: [
       { id: 'chat', icon: MessageSquare, label: 'AI Assistant' },
       { id: 'agents', icon: Cpu, label: 'Agents' },
+      { id: 'agent-manager', icon: GitFork, label: 'Agent Manager' },
       { id: 'rag', icon: Layers, label: 'RAG' },
     ],
   },
