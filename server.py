@@ -575,6 +575,11 @@ _SYSTEM_PROMPT_BUDGET_FRACTION = 0.45
 _CONTEXT_SAFETY_RATIO = 0.72
 _CONTEXT_OUTPUT_RESERVE = 256
 
+# For generic HTTP LLM providers, avoid optimistic context assumptions unless
+# the user explicitly sets a context window.
+_HTTP_CONTEXT_FALLBACK = 4096
+_HTTP_CONTEXT_AUTO_CAP = 8192
+
 
 def _estimate_tokens(text: str) -> int:
     """Conservative token estimate (biased high to avoid overflow)."""
@@ -686,9 +691,10 @@ def _get_model_context_limit() -> int:
 
     Order of precedence:
     1. In-memory cache (from a previous call).
-    2. Known limits dict (matched by substring of model name).
-    3. Ask the LLM itself, cache the result.
-    4. Conservative default (4 096 tokens).
+    2. Provider-specific runtime detection (Ollama) or conservative known cap (HTTP).
+    3. Known limits dict (non-HTTP providers).
+    4. Ask the LLM itself, cache the result (last resort).
+    5. Conservative default (4 096 tokens).
     """
     provider = (llm_config.get("provider") or "ollama").lower()
     model = (llm_config.get("model") or "unknown").lower()
@@ -708,6 +714,26 @@ def _get_model_context_limit() -> int:
         _model_context_cache[cache_key] = explicit
         print(f"[Token budget] Using explicit contextWindow={explicit} for '{cache_key}'")
         return explicit
+
+    # For generic HTTP providers, keep context assumptions conservative.
+    # Many OpenAI-compatible servers expose architecture model names but run with
+    # smaller runtime context windows.
+    if provider in ("local_http", "n8n"):
+        for known_name, limit in _KNOWN_CONTEXT_LIMITS.items():
+            if known_name in model:
+                capped = max(512, min(limit, _HTTP_CONTEXT_AUTO_CAP))
+                _model_context_cache[cache_key] = capped
+                print(
+                    f"[Token budget] Conservative HTTP context for '{cache_key}': "
+                    f"{capped} tokens (from known={limit})"
+                )
+                return capped
+        _model_context_cache[cache_key] = _HTTP_CONTEXT_FALLBACK
+        print(
+            f"[Token budget] Unknown HTTP model '{cache_key}', using fallback: "
+            f"{_HTTP_CONTEXT_FALLBACK} tokens"
+        )
+        return _HTTP_CONTEXT_FALLBACK
 
     # For Ollama, prefer runtime context from /api/show over theoretical model limits.
     if provider == "ollama":
@@ -871,6 +897,56 @@ def _truncate_text_to_budget(text: str, token_budget: int) -> str:
     # Convert budget back to chars with conservative multiplier.
     max_chars = max(80, int(token_budget * 3))
     return text[:max_chars]
+
+
+def _compact_llm_inputs(
+    system_prompt: str,
+    messages: list,
+    *,
+    system_token_budget: int = 220,
+    message_token_budget: int = 520,
+    keep_last: int = 5,
+) -> tuple[str, list]:
+    """Build a compact prompt/messages pair for transport-level retries."""
+    compact_system = _truncate_text_to_budget(system_prompt or "", system_token_budget)
+    safe_messages = [
+        {"role": m.get("role", "user"), "content": m.get("content", "")}
+        for m in (messages or [])
+    ]
+    compact_messages = _trim_messages_to_budget(
+        safe_messages,
+        token_budget=message_token_budget,
+        keep_last=keep_last,
+    )
+    if not compact_messages and safe_messages:
+        compact_messages = [safe_messages[-1]]
+    return compact_system, compact_messages
+
+
+def _get_http_completion_budget() -> int:
+    """Return a conservative completion budget for HTTP LLM transports."""
+    explicit = _parse_int_like(
+        llm_config.get("maxOutputTokens") or llm_config.get("maxTokens"),
+        0,
+    )
+    if explicit > 0:
+        return max(64, min(4096, explicit))
+
+    provider = (llm_config.get("provider") or "ollama").lower()
+    model = (llm_config.get("model") or "unknown").lower()
+    cache_key = f"{provider}::{model}"
+
+    context_hint = _parse_int_like(
+        llm_config.get("contextWindow")
+        or llm_config.get("maxContextTokens")
+        or llm_config.get("numCtx"),
+        0,
+    )
+    if context_hint <= 0:
+        context_hint = int(_model_context_cache.get(cache_key, _HTTP_CONTEXT_FALLBACK))
+
+    budget = int(context_hint * 0.22)
+    return max(128, min(2048, budget))
 
 
 def _summarize_agent_steps_for_prompt(
@@ -1135,20 +1211,56 @@ def _call_llm(system_prompt: str, messages: list, temperature: float = 0.7,
         headers = {"Content-Type": "application/json"}
         if llm_config.get("apiKey"):
             headers["Authorization"] = f"Bearer {llm_config['apiKey']}"
-        resp = _http_post(
-            endpoint,
-            json={
-                "model": llm_config.get("model") or "local-model",
-                "messages": [{"role": "system", "content": system_prompt}] + messages,
-                "temperature": temperature,
-                "stream": False,
-            },
-            headers=headers,
-            timeout=120,
-        )
+
+        def _post_local_http(sys_prompt: str, msg_list: list, max_tokens: int):
+            return _http_post(
+                endpoint,
+                json={
+                    "model": llm_config.get("model") or "local-model",
+                    "messages": [{"role": "system", "content": sys_prompt}] + msg_list,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "stream": False,
+                },
+                headers=headers,
+                timeout=120,
+            )
+
+        completion_budget = _get_http_completion_budget()
+        resp = _post_local_http(system_prompt, messages, completion_budget)
         if not resp.ok:
-            raise Exception(f"local_http LLM Error: {resp.status_code} - {resp.text}")
-        resp_data = _parse_response_json(resp, "local_http LLM")
+            if _is_context_overflow_error(resp.text):
+                compact_system, compact_messages = _compact_llm_inputs(
+                    system_prompt,
+                    messages,
+                    system_token_budget=200,
+                    message_token_budget=420,
+                    keep_last=4,
+                )
+                compact_budget = max(96, min(512, completion_budget // 2))
+                resp = _post_local_http(compact_system, compact_messages, compact_budget)
+            if not resp.ok:
+                raise Exception(f"local_http LLM Error: {resp.status_code} - {resp.text}")
+
+        try:
+            resp_data = _parse_response_json(resp, "local_http LLM")
+        except Exception as exc:
+            if _is_context_overflow_error(str(exc)):
+                compact_system, compact_messages = _compact_llm_inputs(
+                    system_prompt,
+                    messages,
+                    system_token_budget=180,
+                    message_token_budget=360,
+                    keep_last=3,
+                )
+                compact_budget = max(96, min(384, completion_budget // 2))
+                retry_resp = _post_local_http(compact_system, compact_messages, compact_budget)
+                if not retry_resp.ok:
+                    raise Exception(f"local_http LLM Error: {retry_resp.status_code} - {retry_resp.text}")
+                resp_data = _parse_response_json(retry_resp, "local_http LLM")
+            else:
+                raise
+
         content = (
             resp_data.get("choices", [{}])[0].get("message", {}).get("content")
             or resp_data.get("content")
@@ -1182,20 +1294,56 @@ def _call_llm(system_prompt: str, messages: list, temperature: float = 0.7,
         headers = {"Content-Type": "application/json"}
         if llm_config.get("apiKey"):
             headers["Authorization"] = llm_config["apiKey"]  # raw value, no Bearer
-        prompt = _messages_to_prompt(system_prompt, messages)
-        resp = _http_post(
-            endpoint,
-            json={
-                "prompt": prompt,
-                "model": llm_config.get("model", ""),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            },
-            headers=headers,
-            timeout=120,
-        )
+
+        def _post_n8n(sys_prompt: str, msg_list: list, max_tokens: int):
+            prompt = _messages_to_prompt(sys_prompt, msg_list)
+            return _http_post(
+                endpoint,
+                json={
+                    "prompt": prompt,
+                    "model": llm_config.get("model", ""),
+                    "max_tokens": max_tokens,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+                headers=headers,
+                timeout=120,
+            )
+
+        completion_budget = _get_http_completion_budget()
+        resp = _post_n8n(system_prompt, messages, completion_budget)
         if not resp.ok:
-            raise Exception(f"n8n LLM Error: {resp.status_code} - {resp.text}")
-        resp_data = _parse_response_json(resp, "n8n LLM")
+            if _is_context_overflow_error(resp.text):
+                compact_system, compact_messages = _compact_llm_inputs(
+                    system_prompt,
+                    messages,
+                    system_token_budget=180,
+                    message_token_budget=380,
+                    keep_last=4,
+                )
+                compact_budget = max(96, min(512, completion_budget // 2))
+                resp = _post_n8n(compact_system, compact_messages, compact_budget)
+            if not resp.ok:
+                raise Exception(f"n8n LLM Error: {resp.status_code} - {resp.text}")
+
+        try:
+            resp_data = _parse_response_json(resp, "n8n LLM")
+        except Exception as exc:
+            if _is_context_overflow_error(str(exc)):
+                compact_system, compact_messages = _compact_llm_inputs(
+                    system_prompt,
+                    messages,
+                    system_token_budget=160,
+                    message_token_budget=320,
+                    keep_last=3,
+                )
+                compact_budget = max(96, min(384, completion_budget // 2))
+                retry_resp = _post_n8n(compact_system, compact_messages, compact_budget)
+                if not retry_resp.ok:
+                    raise Exception(f"n8n LLM Error: {retry_resp.status_code} - {retry_resp.text}")
+                resp_data = _parse_response_json(retry_resp, "n8n LLM")
+            else:
+                raise
+
         content = (
             resp_data.get("output")
             or resp_data.get("text")
