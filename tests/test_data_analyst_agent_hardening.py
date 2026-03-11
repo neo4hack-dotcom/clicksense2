@@ -55,10 +55,14 @@ def _reset_model_cache():
     server._model_context_cache.clear()
     with server._data_analyst_sessions_lock:
         server._data_analyst_sessions.clear()
+    with server._data_wrangling_sessions_lock:
+        server._data_wrangling_sessions.clear()
     yield
     server._model_context_cache.clear()
     with server._data_analyst_sessions_lock:
         server._data_analyst_sessions.clear()
+    with server._data_wrangling_sessions_lock:
+        server._data_wrangling_sessions.clear()
 
 
 @pytest.fixture()
@@ -442,3 +446,44 @@ def test_resolve_sql_memory_placeholders_supports_last_alias_and_unknown_refs():
             "SELECT * FROM sales WHERE client_id IN ({{step99.client_id}})",
             memory,
         )
+
+
+def test_wrangling_finalize_plan_filters_unknown_columns():
+    columns = [
+        {"name": "id", "type": "Int64"},
+        {"name": "email", "type": "String"},
+        {"name": "amount", "type": "Float64"},
+    ]
+    raw_plan = {
+        "plan_steps": ["check nulls", "check nulls", "inspect outliers"],
+        "focus_columns": ["email", "unknown_col", "amount"],
+        "sql_checks": [
+            {"name": "Null check", "sql": "SELECT count() FROM t LIMIT 100"},
+            {"name": "Bad row", "sql": ""},
+        ],
+    }
+    final = server._dw_finalize_plan(raw_plan, columns, max_steps=12)
+    assert final["plan_steps"] == ["check nulls", "inspect outliers"]
+    assert final["focus_columns"] == ["email", "amount"]
+    assert len(final["sql_checks"]) == 1
+
+
+def test_wrangling_detect_batch_anomalies_flags_duplicate_id_and_bad_email():
+    rows = [
+        {"id": 1, "email": "ok@example.com", "amount": 10},
+        {"id": 1, "email": "bad@@example", "amount": 11},
+    ]
+    anomalies = server._dw_detect_batch_anomalies(
+        rows,
+        table_name="customers",
+        line_offset=100,
+        column_types={"id": "Int64", "email": "String", "amount": "Float64"},
+        focus_columns={"email", "amount"},
+        column_state={},
+        primary_id_column="id",
+        primary_id_seen=set(),
+        date_pairs=[],
+    )
+    issue_types = {a["issue_type"] for a in anomalies}
+    assert "duplicate_primary_id" in issue_types
+    assert "invalid_email_format" in issue_types
