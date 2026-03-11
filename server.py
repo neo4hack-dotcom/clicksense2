@@ -2273,6 +2273,25 @@ def agent_analysis():
     table_mapping_filter = data.get("tableMappingFilter", [])
     # Tables explicitly confirmed by the user via the selection UI (skips auto-identification)
     confirmed_tables = data.get("confirmedTables", [])
+    # Chat UI flags (robust parsing for bool/string/int payloads)
+    def _as_bool(value, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    use_knowledge_base = _as_bool(data.get("use_knowledge_base", True), True)
+    # "knowledge agent" mode: do not inject static context in prompts.
+    use_knowledge_agent = _as_bool(
+        data.get("use_knowledge_agent", data.get("useKnowledgeAgent", False)),
+        False,
+    )
+    no_prompt_context_injection = use_knowledge_agent
 
     if not user_question.strip():
         return jsonify({"error": "No question provided"}), 400
@@ -2285,17 +2304,21 @@ def agent_analysis():
     # Knowledge base context (prefer semantic retrieval, keep fallback compact)
     db = read_db()
     folders = db.get("knowledge_folders", [])
-    knowledge_context = None
-    if user_question.strip() and folders:
-        knowledge_context = _get_knowledge_context_by_similarity(
-            user_question.strip(),
-            top_k=int(rag_config.get("topK", 5)),
-        )
-    if not knowledge_context:
-        knowledge_context = "\n\n".join(
-            f"[{f['title']}]\n{f['content']}" for f in folders if f.get("content")
-        ) or knowledge_base
-    knowledge_context = (knowledge_context or "")[:25000]
+    knowledge_context = ""
+    if use_knowledge_base:
+        kb_hit = None
+        if user_question.strip() and folders:
+            kb_hit = _get_knowledge_context_by_similarity(
+                user_question.strip(),
+                top_k=int(rag_config.get("topK", 5)),
+            )
+        if kb_hit:
+            knowledge_context = kb_hit
+        else:
+            knowledge_context = "\n\n".join(
+                f"[{f['title']}]\n{f['content']}" for f in folders if f.get("content")
+            ) or knowledge_base
+        knowledge_context = (knowledge_context or "")[:25000]
 
     # Build full mapping dict (used by table identification and mapping note)
     all_mappings = {m["table_name"]: m["mapping_name"] for m in db.get("table_mappings", [])}
@@ -2332,16 +2355,6 @@ def agent_analysis():
         schema = {t: cols for t, cols in schema.items() if t in relevant_tables}
         table_metadata = {t: v for t, v in table_metadata.items() if t in relevant_tables}
 
-    # Recompute mapping note after filtering
-    mapping_lines = [
-        f"  - {tbl}  →  \"{all_mappings[tbl]}\""
-        for tbl in schema if tbl in all_mappings
-    ]
-    mapping_note = (
-        "Friendly business names for tables (use technical name in SQL, friendly name when talking to the user):\n"
-        + "\n".join(mapping_lines)
-    ) if mapping_lines else ""
-
     try:
         agent_client = get_clickhouse_client()
     except Exception as exc:
@@ -2350,12 +2363,15 @@ def agent_analysis():
     # Accumulate steps
     steps: list = []
     seen_query_fingerprints: set[str] = set()
+    context_injected_once = False
 
     def _search_knowledge_for_agent(query: str) -> str:
         """Search the knowledge base (ES RAG) for context relevant to the query.
 
         Falls back to static knowledge text when semantic retrieval is unavailable.
         """
+        if not use_knowledge_base:
+            return "Knowledge base search is disabled for this run."
         try:
             if query.strip():
                 hit_context = _get_knowledge_context_by_similarity(
@@ -2422,6 +2438,7 @@ def agent_analysis():
 
     def _run_agent_step(steps_so_far: list, used_steps: int = None) -> dict:
         """Ask the LLM for its next action given accumulated context."""
+        nonlocal context_injected_once
         steps_context = _summarize_agent_steps_for_prompt(
             steps_so_far,
             max_steps=8,
@@ -2430,13 +2447,33 @@ def agent_analysis():
 
         effective_used = used_steps if used_steps is not None else len(steps_so_far)
 
+        if use_knowledge_base:
+            actions_block = """You have FOUR possible actions:
+1. Run a ClickHouse SQL query to fetch data -> action "query"
+2. Search the knowledge base for business rules, definitions or context -> action "search_knowledge"
+3. Export data to a CSV file (pipe-separated) - ONLY if the user explicitly asks to export or save results -> action "export_csv"
+4. Produce the final answer when you have enough information -> action "finish"""
+            kb_json_schema = """
+For a knowledge base search:
+{
+  "action": "search_knowledge",
+  "reasoning": "Why you need to search the knowledge base and what concept you're looking for",
+  "search_query": "the search terms or question to look up"
+}
+"""
+        else:
+            actions_block = """You have THREE possible actions:
+1. Run a ClickHouse SQL query to fetch data -> action "query"
+2. Export data to a CSV file (pipe-separated) - ONLY if the user explicitly asks to export or save results -> action "export_csv"
+3. Produce the final answer when you have enough information -> action "finish"
+Knowledge base search is DISABLED for this run."""
+            kb_json_schema = ""
+
         # ── Static parts of the prompt (no schema/metadata/knowledge yet) ────
         static_header = f"""You are an autonomous ClickHouse data analyst agent.
 Your goal is to answer the user's question by executing a sequence of targeted actions.
 You may run up to {MAX_AGENT_STEPS} distinct actions in total. Each action must bring NEW information.
 After gathering enough evidence you MUST produce a final answer.
-
-DATABASE SCHEMA:
 """
         static_footer = f"""
 
@@ -2461,11 +2498,7 @@ USER QUESTION:
 {user_question}
 
 INSTRUCTIONS:
-You have FOUR possible actions:
-1. Run a ClickHouse SQL query to fetch data → action "query"
-2. Search the knowledge base for business rules, definitions or context → action "search_knowledge"
-3. Export data to a CSV file (pipe-separated) — ONLY if the user explicitly asks to export or save results → action "export_csv"
-4. Produce the final answer when you have enough information → action "finish"
+{actions_block}
 
 {"IMPORTANT: You have used all available steps — you MUST respond with action 'finish'." if effective_used >= MAX_AGENT_STEPS else ""}
 
@@ -2477,13 +2510,7 @@ For a SQL query:
   "reasoning": "Why this specific query is needed and what new insight it will provide",
   "sql": "SELECT ..."
 }}
-
-For a knowledge base search:
-{{
-  "action": "search_knowledge",
-  "reasoning": "Why you need to search the knowledge base and what concept you're looking for",
-  "search_query": "the search terms or question to look up"
-}}
+{kb_json_schema}
 
 For an export request (only when the user asks to save/export data):
 {{
@@ -2502,30 +2529,43 @@ For the final answer:
 
 No markdown fences. Only raw JSON."""
 
-        # ── Token budget: fit schema/metadata/knowledge to what remains ───────
-        base_tokens = _estimate_tokens(static_header + static_footer + "Proceed with the next step.")
-        pruned_schema, pruned_metadata, pruned_knowledge = _truncate_prompt_context(
-            schema, table_metadata, knowledge_context, base_tokens
-        )
-
-        pruned_schema_str = json.dumps(pruned_schema, indent=2)
-        pruned_metadata_str = json.dumps(pruned_metadata, indent=2)
-        pruned_mapping_note = (
-            "Friendly business names for tables (use technical name in SQL, friendly name when talking to the user):\n"
-            + "\n".join(
-                f"  - {tbl}  →  \"{all_mappings[tbl]}\""
-                for tbl in pruned_schema if tbl in all_mappings
+        inject_context_now = (not no_prompt_context_injection) and (not context_injected_once)
+        if inject_context_now:
+            # Inject heavy static context only once per run to avoid prompt bloat.
+            base_tokens = _estimate_tokens(static_header + static_footer + "Proceed with the next step.")
+            pruned_schema, pruned_metadata, pruned_knowledge = _truncate_prompt_context(
+                schema, table_metadata, knowledge_context, base_tokens
             )
-        ) if any(tbl in all_mappings for tbl in pruned_schema) else ""
 
-        system_prompt = (
-            static_header
-            + pruned_schema_str
-            + f"\n\nTABLE METADATA (functional descriptions):\n{pruned_metadata_str}"
-            + (f"\n\n{pruned_mapping_note}" if pruned_mapping_note else "")
-            + (f"\n\nSTATIC KNOWLEDGE BASE (always available):\n{pruned_knowledge}" if pruned_knowledge else "")
-            + static_footer
-        )
+            pruned_schema_str = json.dumps(pruned_schema, indent=2)
+            pruned_metadata_str = json.dumps(pruned_metadata, indent=2)
+            pruned_mapping_note = (
+                "Friendly business names for tables (use technical name in SQL, friendly name when talking to the user):\n"
+                + "\n".join(
+                    f"  - {tbl}  ->  \"{all_mappings[tbl]}\""
+                    for tbl in pruned_schema if tbl in all_mappings
+                )
+            ) if any(tbl in all_mappings for tbl in pruned_schema) else ""
+
+            context_section = (
+                "DATABASE SCHEMA:\n"
+                + pruned_schema_str
+                + f"\n\nTABLE METADATA (functional descriptions):\n{pruned_metadata_str}"
+                + (f"\n\n{pruned_mapping_note}" if pruned_mapping_note else "")
+                + (f"\n\nSTATIC KNOWLEDGE BASE (available context):\n{pruned_knowledge}" if pruned_knowledge else "")
+            )
+            context_injected_once = True
+        else:
+            if no_prompt_context_injection:
+                context_section = """CONTEXT MODE:
+- Static schema/metadata/knowledge injection is disabled for this run.
+- Rely on the user question plus previous step evidence only."""
+            else:
+                context_section = """CONTEXT MODE:
+- Static schema/metadata/knowledge were already injected earlier in this run.
+- Do not request reinjection; rely on previous step evidence."""
+
+        system_prompt = static_header + "\n\n" + context_section + static_footer
 
         # ── Final safety check: abort if prompt still exceeds context window ──
         context_limit = _get_model_context_limit()
@@ -2568,12 +2608,16 @@ No markdown fences. Only raw JSON."""
             max_steps=8,
             max_result_chars=220,
         )
-
-        retry_schema_compact = {
-            tbl: [c["name"] if isinstance(c, dict) else str(c) for c in cols]
-            for tbl, cols in schema.items()
-        }
-        retry_schema_str = json.dumps(retry_schema_compact, indent=2)
+        if no_prompt_context_injection:
+            retry_context_note = (
+                "No static schema/metadata/knowledge context is available in this run. "
+                "Reuse only what can be inferred from previous steps."
+            )
+        else:
+            retry_context_note = (
+                "Static context is injected only once per run. Do not request reinjection; "
+                "reuse table/column hints from previous steps."
+            )
 
         if retry_mode == "quality":
             issue_block = (
@@ -2592,8 +2636,8 @@ No markdown fences. Only raw JSON."""
 RETRY MODE: {retry_mode}
 ERROR CLASS: {error_class or "n/a"}
 
-DATABASE SCHEMA (relevant tables only):
-{retry_schema_str}
+CONTEXT POLICY:
+{retry_context_note}
 
 PREVIOUS SQL:
 {failed_sql}
