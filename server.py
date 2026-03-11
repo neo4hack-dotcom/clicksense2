@@ -575,6 +575,11 @@ _SYSTEM_PROMPT_BUDGET_FRACTION = 0.45
 _CONTEXT_SAFETY_RATIO = 0.72
 _CONTEXT_OUTPUT_RESERVE = 256
 
+# For generic HTTP LLM providers, avoid optimistic context assumptions unless
+# the user explicitly sets a context window.
+_HTTP_CONTEXT_FALLBACK = 4096
+_HTTP_CONTEXT_AUTO_CAP = 8192
+
 
 def _estimate_tokens(text: str) -> int:
     """Conservative token estimate (biased high to avoid overflow)."""
@@ -686,9 +691,10 @@ def _get_model_context_limit() -> int:
 
     Order of precedence:
     1. In-memory cache (from a previous call).
-    2. Known limits dict (matched by substring of model name).
-    3. Ask the LLM itself, cache the result.
-    4. Conservative default (4 096 tokens).
+    2. Provider-specific runtime detection (Ollama) or conservative known cap (HTTP).
+    3. Known limits dict (non-HTTP providers).
+    4. Ask the LLM itself, cache the result (last resort).
+    5. Conservative default (4 096 tokens).
     """
     provider = (llm_config.get("provider") or "ollama").lower()
     model = (llm_config.get("model") or "unknown").lower()
@@ -708,6 +714,26 @@ def _get_model_context_limit() -> int:
         _model_context_cache[cache_key] = explicit
         print(f"[Token budget] Using explicit contextWindow={explicit} for '{cache_key}'")
         return explicit
+
+    # For generic HTTP providers, keep context assumptions conservative.
+    # Many OpenAI-compatible servers expose architecture model names but run with
+    # smaller runtime context windows.
+    if provider in ("local_http", "n8n"):
+        for known_name, limit in _KNOWN_CONTEXT_LIMITS.items():
+            if known_name in model:
+                capped = max(512, min(limit, _HTTP_CONTEXT_AUTO_CAP))
+                _model_context_cache[cache_key] = capped
+                print(
+                    f"[Token budget] Conservative HTTP context for '{cache_key}': "
+                    f"{capped} tokens (from known={limit})"
+                )
+                return capped
+        _model_context_cache[cache_key] = _HTTP_CONTEXT_FALLBACK
+        print(
+            f"[Token budget] Unknown HTTP model '{cache_key}', using fallback: "
+            f"{_HTTP_CONTEXT_FALLBACK} tokens"
+        )
+        return _HTTP_CONTEXT_FALLBACK
 
     # For Ollama, prefer runtime context from /api/show over theoretical model limits.
     if provider == "ollama":
@@ -873,6 +899,56 @@ def _truncate_text_to_budget(text: str, token_budget: int) -> str:
     return text[:max_chars]
 
 
+def _compact_llm_inputs(
+    system_prompt: str,
+    messages: list,
+    *,
+    system_token_budget: int = 220,
+    message_token_budget: int = 520,
+    keep_last: int = 5,
+) -> tuple[str, list]:
+    """Build a compact prompt/messages pair for transport-level retries."""
+    compact_system = _truncate_text_to_budget(system_prompt or "", system_token_budget)
+    safe_messages = [
+        {"role": m.get("role", "user"), "content": m.get("content", "")}
+        for m in (messages or [])
+    ]
+    compact_messages = _trim_messages_to_budget(
+        safe_messages,
+        token_budget=message_token_budget,
+        keep_last=keep_last,
+    )
+    if not compact_messages and safe_messages:
+        compact_messages = [safe_messages[-1]]
+    return compact_system, compact_messages
+
+
+def _get_http_completion_budget() -> int:
+    """Return a conservative completion budget for HTTP LLM transports."""
+    explicit = _parse_int_like(
+        llm_config.get("maxOutputTokens") or llm_config.get("maxTokens"),
+        0,
+    )
+    if explicit > 0:
+        return max(64, min(4096, explicit))
+
+    provider = (llm_config.get("provider") or "ollama").lower()
+    model = (llm_config.get("model") or "unknown").lower()
+    cache_key = f"{provider}::{model}"
+
+    context_hint = _parse_int_like(
+        llm_config.get("contextWindow")
+        or llm_config.get("maxContextTokens")
+        or llm_config.get("numCtx"),
+        0,
+    )
+    if context_hint <= 0:
+        context_hint = int(_model_context_cache.get(cache_key, _HTTP_CONTEXT_FALLBACK))
+
+    budget = int(context_hint * 0.22)
+    return max(128, min(2048, budget))
+
+
 def _summarize_agent_steps_for_prompt(
     steps: list,
     max_steps: int = 8,
@@ -905,6 +981,37 @@ _READONLY_FORBIDDEN_KEYWORDS = (
     "RENAME", "ATTACH", "DETACH", "OPTIMIZE", "SYSTEM", "GRANT", "REVOKE",
     "KILL", "SET ROLE", "USE",
 )
+_SIMPLE_COMPAT_FORBIDDEN_FUNCTION_PATTERNS = (
+    r"\bwindowfunnel\s*\(",
+    r"\bretention\s*\(",
+    r"\bsequencematch\s*\(",
+    r"\bsequencecount\s*\(",
+    r"\bsequencenextnode\s*\(",
+    r"\bargmax\s*\(",
+    r"\bargmin\s*\(",
+    r"\btopk\s*\(",
+    r"\buniqhll12\s*\(",
+    r"\buniqtheta\s*\(",
+    r"\bquantiles?[a-z0-9_]*\s*\(",
+    r"\bjsonextract[a-z0-9_]*\s*\(",
+    r"\bsumif\s*\(",
+    r"\bcountif\s*\(",
+)
+_SIMPLE_COMPAT_FORBIDDEN_DATE_FUNCTION_PATTERNS = (
+    r"\btoyear\s*\(",
+    r"\btomonth\s*\(",
+    r"\btoquarter\s*\(",
+    r"\byear\s*\(",
+    r"\bmonth\s*\(",
+    r"\bdate_trunc\s*\(",
+    r"\btostartof[a-z0-9_]*\s*\(",
+    r"\bextract\s*\(",
+)
+_DATE_LITERAL_PATTERN = (
+    r"(?:'\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}:\d{2})?'"
+    r"|toDate\s*\(\s*'\d{4}-\d{2}-\d{2}'\s*\)"
+    r"|toDateTime\s*\(\s*'\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}'\s*\))"
+)
 
 
 def _classify_clickhouse_error(error_text: str) -> str:
@@ -930,7 +1037,61 @@ def _classify_clickhouse_error(error_text: str) -> str:
         return "aggregation_error"
     if "join" in text and ("not found" in text or "cannot" in text):
         return "join_error"
+    if "simple compatibility" in text or "between" in text or "date filter" in text:
+        return "simple_compat"
     return "execution_error"
+
+
+def _validate_simple_clickhouse_sql(statement: str) -> None:
+    """Validate SQL against simple compatibility + strict date filtering rules."""
+    sql = (statement or "").strip()
+    low = sql.lower()
+
+    for pattern in _SIMPLE_COMPAT_FORBIDDEN_FUNCTION_PATTERNS:
+        if re.search(pattern, low, flags=re.IGNORECASE):
+            raise ValueError(
+                "Simple compatibility mode: advanced ClickHouse functions are not allowed. "
+                "Use COUNT, SUM, AVG, MIN, MAX, COUNT DISTINCT, ROUND, COALESCE."
+            )
+
+    for pattern in _SIMPLE_COMPAT_FORBIDDEN_DATE_FUNCTION_PATTERNS:
+        if re.search(pattern, low, flags=re.IGNORECASE):
+            raise ValueError(
+                "Simple compatibility mode: date extraction functions are not allowed "
+                "(year/month/toYear/toMonth/date_trunc/toStartOf*)."
+            )
+
+    # Date filtering policy:
+    # - If a date literal is used, filter must use BETWEEN ... AND ... or '='
+    # - Comparators >, <, >=, <= with date literals are forbidden.
+    has_date_literal = bool(re.search(_DATE_LITERAL_PATTERN, sql, flags=re.IGNORECASE))
+    if not has_date_literal:
+        return
+
+    left_cmp = rf"\b[\w`.]+\b\s*(?:>=|<=|>|<)\s*{_DATE_LITERAL_PATTERN}"
+    right_cmp = rf"{_DATE_LITERAL_PATTERN}\s*(?:>=|<=|>|<)\s*\b[\w`.]+\b"
+    if re.search(left_cmp, sql, flags=re.IGNORECASE) or re.search(right_cmp, sql, flags=re.IGNORECASE):
+        raise ValueError(
+            "Simple compatibility mode: date filters must use BETWEEN ... AND ... or '=' "
+            "(no >, <, >=, <= with date values)."
+        )
+
+    has_between = bool(
+        re.search(
+            rf"\bbetween\s+{_DATE_LITERAL_PATTERN}\s+and\s+{_DATE_LITERAL_PATTERN}",
+            sql,
+            flags=re.IGNORECASE,
+        )
+    )
+    has_equal_date = bool(
+        re.search(rf"\b[\w`.]+\b\s*=\s*{_DATE_LITERAL_PATTERN}", sql, flags=re.IGNORECASE)
+        or re.search(rf"{_DATE_LITERAL_PATTERN}\s*=\s*\b[\w`.]+\b", sql, flags=re.IGNORECASE)
+    )
+    if not (has_between or has_equal_date):
+        raise ValueError(
+            "Simple compatibility mode: when filtering by date, use either "
+            "`column BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'` or `column = 'YYYY-MM-DD'`."
+        )
 
 
 def _normalize_sql_for_execution(
@@ -982,6 +1143,7 @@ def _execute_sql_guarded(
     sql: str,
     *,
     read_only: bool,
+    enforce_simple_compat: bool = False,
     max_preview_rows: int = 20,
     max_execution_time: int = 15,
     default_limit: int = 1000,
@@ -996,6 +1158,8 @@ def _execute_sql_guarded(
             default_limit=default_limit,
             hard_limit_cap=hard_limit_cap,
         )
+        if enforce_simple_compat:
+            _validate_simple_clickhouse_sql(normalized_sql)
     except Exception as exc:
         err = str(exc)
         return {
@@ -1135,20 +1299,56 @@ def _call_llm(system_prompt: str, messages: list, temperature: float = 0.7,
         headers = {"Content-Type": "application/json"}
         if llm_config.get("apiKey"):
             headers["Authorization"] = f"Bearer {llm_config['apiKey']}"
-        resp = _http_post(
-            endpoint,
-            json={
-                "model": llm_config.get("model") or "local-model",
-                "messages": [{"role": "system", "content": system_prompt}] + messages,
-                "temperature": temperature,
-                "stream": False,
-            },
-            headers=headers,
-            timeout=120,
-        )
+
+        def _post_local_http(sys_prompt: str, msg_list: list, max_tokens: int):
+            return _http_post(
+                endpoint,
+                json={
+                    "model": llm_config.get("model") or "local-model",
+                    "messages": [{"role": "system", "content": sys_prompt}] + msg_list,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "stream": False,
+                },
+                headers=headers,
+                timeout=120,
+            )
+
+        completion_budget = _get_http_completion_budget()
+        resp = _post_local_http(system_prompt, messages, completion_budget)
         if not resp.ok:
-            raise Exception(f"local_http LLM Error: {resp.status_code} - {resp.text}")
-        resp_data = _parse_response_json(resp, "local_http LLM")
+            if _is_context_overflow_error(resp.text):
+                compact_system, compact_messages = _compact_llm_inputs(
+                    system_prompt,
+                    messages,
+                    system_token_budget=200,
+                    message_token_budget=420,
+                    keep_last=4,
+                )
+                compact_budget = max(96, min(512, completion_budget // 2))
+                resp = _post_local_http(compact_system, compact_messages, compact_budget)
+            if not resp.ok:
+                raise Exception(f"local_http LLM Error: {resp.status_code} - {resp.text}")
+
+        try:
+            resp_data = _parse_response_json(resp, "local_http LLM")
+        except Exception as exc:
+            if _is_context_overflow_error(str(exc)):
+                compact_system, compact_messages = _compact_llm_inputs(
+                    system_prompt,
+                    messages,
+                    system_token_budget=180,
+                    message_token_budget=360,
+                    keep_last=3,
+                )
+                compact_budget = max(96, min(384, completion_budget // 2))
+                retry_resp = _post_local_http(compact_system, compact_messages, compact_budget)
+                if not retry_resp.ok:
+                    raise Exception(f"local_http LLM Error: {retry_resp.status_code} - {retry_resp.text}")
+                resp_data = _parse_response_json(retry_resp, "local_http LLM")
+            else:
+                raise
+
         content = (
             resp_data.get("choices", [{}])[0].get("message", {}).get("content")
             or resp_data.get("content")
@@ -1182,20 +1382,56 @@ def _call_llm(system_prompt: str, messages: list, temperature: float = 0.7,
         headers = {"Content-Type": "application/json"}
         if llm_config.get("apiKey"):
             headers["Authorization"] = llm_config["apiKey"]  # raw value, no Bearer
-        prompt = _messages_to_prompt(system_prompt, messages)
-        resp = _http_post(
-            endpoint,
-            json={
-                "prompt": prompt,
-                "model": llm_config.get("model", ""),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            },
-            headers=headers,
-            timeout=120,
-        )
+
+        def _post_n8n(sys_prompt: str, msg_list: list, max_tokens: int):
+            prompt = _messages_to_prompt(sys_prompt, msg_list)
+            return _http_post(
+                endpoint,
+                json={
+                    "prompt": prompt,
+                    "model": llm_config.get("model", ""),
+                    "max_tokens": max_tokens,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+                headers=headers,
+                timeout=120,
+            )
+
+        completion_budget = _get_http_completion_budget()
+        resp = _post_n8n(system_prompt, messages, completion_budget)
         if not resp.ok:
-            raise Exception(f"n8n LLM Error: {resp.status_code} - {resp.text}")
-        resp_data = _parse_response_json(resp, "n8n LLM")
+            if _is_context_overflow_error(resp.text):
+                compact_system, compact_messages = _compact_llm_inputs(
+                    system_prompt,
+                    messages,
+                    system_token_budget=180,
+                    message_token_budget=380,
+                    keep_last=4,
+                )
+                compact_budget = max(96, min(512, completion_budget // 2))
+                resp = _post_n8n(compact_system, compact_messages, compact_budget)
+            if not resp.ok:
+                raise Exception(f"n8n LLM Error: {resp.status_code} - {resp.text}")
+
+        try:
+            resp_data = _parse_response_json(resp, "n8n LLM")
+        except Exception as exc:
+            if _is_context_overflow_error(str(exc)):
+                compact_system, compact_messages = _compact_llm_inputs(
+                    system_prompt,
+                    messages,
+                    system_token_budget=160,
+                    message_token_budget=320,
+                    keep_last=3,
+                )
+                compact_budget = max(96, min(384, completion_budget // 2))
+                retry_resp = _post_n8n(compact_system, compact_messages, compact_budget)
+                if not retry_resp.ok:
+                    raise Exception(f"n8n LLM Error: {retry_resp.status_code} - {retry_resp.text}")
+                resp_data = _parse_response_json(retry_resp, "n8n LLM")
+            else:
+                raise
+
         content = (
             resp_data.get("output")
             or resp_data.get("text")
@@ -2062,17 +2298,18 @@ You must ask for clarification in ALL of these situations. Prefer asking over gu
     "context": {"table": "exact_table_name"}}
 
 CLICKHOUSE INSTRUCTIONS:
-- Use advanced ClickHouse functions when appropriate.
-- For funnels: windowFunnel(). For retention: retention(). For patterns: sequenceMatch().
-- For latest status: argMax(). For top-K: topK(). For unique counts: uniqHLL12().
-- For response times: quantilesTiming(). For JSON: JSONExtract(). For conditionals: sumIf(), countIf().
-- Always write highly optimized SQL.
+- Use SIMPLE and highly compatible ClickHouse SQL only.
+- Prefer: COUNT, SUM, AVG, MIN, MAX, COUNT DISTINCT, ROUND, COALESCE, IF, simple GROUP BY.
+- Avoid advanced/specialized functions: windowFunnel, retention, sequenceMatch, argMax, topK, uniqHLL12, quantiles*, JSONExtract*, sumIf, countIf.
+- Keep SQL straightforward and robust.
 
 DATE HANDLING — CRITICAL:
-- Prefer explicit date ranges with literals and BETWEEN when possible.
-- Avoid expensive transformations on date columns inside WHERE.
-- If a relative period is requested (last 7 days, this month), translate it into a clear and correct SQL date filter.
-- Do not hardcode fixed years unless the user explicitly asked for that period.
+- When filtering by date, ALWAYS use either:
+  1) `date_col BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'`
+  2) `date_col = 'YYYY-MM-DD'`
+- NEVER use date extraction/transformation functions for filtering: no year(), month(), toYear(), toMonth(), date_trunc(), toStartOf*().
+- NEVER use >, <, >=, <= with date literals.
+- If the user asks a relative period, translate it to explicit literal dates and use BETWEEN.
 
 When NOT ambiguous, return ONLY this JSON:
 {
@@ -2155,17 +2392,18 @@ You must ask for clarification in ALL of these situations. Prefer asking over gu
     "context": {{"table": "exact_table_name"}}}}
 
 CLICKHOUSE INSTRUCTIONS:
-- Use advanced ClickHouse functions when appropriate.
-- For funnels: windowFunnel(). For retention: retention(). For patterns: sequenceMatch().
-- For latest status: argMax(). For top-K: topK(). For unique counts: uniqHLL12().
-- For response times: quantilesTiming(). For JSON: JSONExtract(). For conditionals: sumIf(), countIf().
-- Always write highly optimized SQL.
+- Use SIMPLE and highly compatible ClickHouse SQL only.
+- Prefer: COUNT, SUM, AVG, MIN, MAX, COUNT DISTINCT, ROUND, COALESCE, IF, simple GROUP BY.
+- Avoid advanced/specialized functions: windowFunnel, retention, sequenceMatch, argMax, topK, uniqHLL12, quantiles*, JSONExtract*, sumIf, countIf.
+- Keep SQL straightforward and robust.
 
 DATE HANDLING — CRITICAL:
-- Prefer explicit date ranges with literals and BETWEEN when possible.
-- Avoid expensive transformations on date columns inside WHERE.
-- If a relative period is requested (last 7 days, this month), translate it into a clear and correct SQL date filter.
-- Do not hardcode fixed years unless the user explicitly asked for that period.
+- When filtering by date, ALWAYS use either:
+  1) `date_col BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'`
+  2) `date_col = 'YYYY-MM-DD'`
+- NEVER use date extraction/transformation functions for filtering: no year(), month(), toYear(), toMonth(), date_trunc(), toStartOf*().
+- NEVER use >, <, >=, <= with date literals.
+- If the user asks a relative period, translate it to explicit literal dates and use BETWEEN.
 
 SQL QUERY — PRIORITY RULE:
 The SQL query is ALWAYS the primary deliverable. Even for descriptive or analytical questions,
@@ -2686,7 +2924,9 @@ After gathering enough evidence you MUST produce a final answer.
         static_footer = f"""
 
 CLICKHOUSE INSTRUCTIONS:
-- Use advanced ClickHouse functions when appropriate (windowFunnel, retention, argMax, topK, uniqHLL12, quantilesTiming, JSONExtract, sumIf, countIf …).
+- Use SIMPLE and highly compatible ClickHouse SQL only.
+- Prefer: COUNT, SUM, AVG, MIN, MAX, COUNT DISTINCT, ROUND, COALESCE, IF, simple GROUP BY.
+- Avoid advanced/specialized functions: windowFunnel, retention, sequenceMatch, argMax, topK, uniqHLL12, quantiles*, JSONExtract*, sumIf, countIf.
 - SQL MUST remain read-only in this agent: SELECT/SHOW/DESCRIBE/EXPLAIN/WITH only.
 - Always write highly optimised SQL with LIMIT <= 5000.
 - Each query must explore a genuinely distinct angle (different aggregation, filter, dimension, or sub-question).
@@ -2694,10 +2934,12 @@ CLICKHOUSE INSTRUCTIONS:
 - Emit exactly one SQL statement (no semicolon-separated batch).
 
 DATE HANDLING — CRITICAL:
-- Prefer explicit date ranges with literals and BETWEEN when possible.
-- Avoid expensive transformations on date columns inside WHERE.
-- If a relative period is requested (last 7 days, this month), translate it into a clear and correct SQL date filter.
-- Never hardcode fixed years unless the user explicitly asked for that period.
+- When filtering by date, ALWAYS use either:
+  1) `date_col BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'`
+  2) `date_col = 'YYYY-MM-DD'`
+- NEVER use date extraction/transformation functions for filtering: no year(), month(), toYear(), toMonth(), date_trunc(), toStartOf*().
+- NEVER use >, <, >=, <= with date literals.
+- If the user asks a relative period, translate it to explicit literal dates and use BETWEEN.
 
 CURRENT ANALYSIS PROGRESS ({effective_used}/{MAX_AGENT_STEPS} steps used):
 {steps_context if steps_context else "None yet — this is the first step."}
@@ -2919,8 +3161,12 @@ PREVIOUS STEPS FOR CONTEXT:
 RULES:
 - Read-only SQL only: SELECT/SHOW/DESCRIBE/EXPLAIN/WITH.
 - Use FEWER and SIMPLER functions when fixing technical errors.
+- Use only simple compatible functions: COUNT, SUM, AVG, MIN, MAX, COUNT DISTINCT, ROUND, COALESCE, IF.
+- Do NOT use: windowFunnel, retention, sequenceMatch, argMax, topK, uniqHLL12, quantiles*, JSONExtract*, sumIf, countIf.
 - Avoid nested complexity unless strictly required.
-- Prefer clear date ranges and avoid expensive date transforms in WHERE.
+- For date filters use only: BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD' or = 'YYYY-MM-DD'.
+- No year()/month()/toYear()/toMonth()/date_trunc()/toStartOf*() in filters.
+- No >, <, >=, <= with date literals.
 - Add LIMIT 200 if not present; never exceed LIMIT 5000.
 - Return exactly one SQL statement.
 
@@ -2946,6 +3192,7 @@ Respond ONLY with valid JSON (no markdown):
         return _execute_sql_guarded(
             sql,
             read_only=True,
+            enforce_simple_compat=True,
             max_preview_rows=max_rows,
             max_execution_time=15,
             default_limit=1000,
