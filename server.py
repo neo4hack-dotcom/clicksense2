@@ -4905,147 +4905,7 @@ def _dq_column_stats(
     return stats
 
 
-@app.route("/api/data-quality/analyze", methods=["POST"])
-def analyze_data_quality():
-    """Run AI-powered data quality analysis on selected table columns."""
-    import re as _re
-    data = request.get_json()
-    table = (data.get("table") or "").strip()
-    columns = data.get("columns", [])
-    _sample_raw = data.get("sample_size")
-    sample_size = min(int(_sample_raw), 500000) if _sample_raw is not None else None
-    # Optional row filter
-    filter_col = (data.get("filter_column") or "").strip() or None
-    filter_op = (data.get("filter_operator") or "=").strip()
-    filter_val = data.get("filter_value")
-    if filter_val is not None:
-        filter_val = str(filter_val)
-    # Second value for BETWEEN operator
-    filter_val2 = data.get("filter_value2")
-    if filter_val2 is not None:
-        filter_val2 = str(filter_val2)
-    # Optional time series column for temporal/volume analysis
-    time_col = (data.get("time_column") or "").strip() or None
-
-    if not table:
-        return jsonify({"error": "Table name is required"}), 400
-    if not columns:
-        return jsonify({"error": "At least one column is required"}), 400
-    # Basic name validation to prevent SQL injection
-    if not _re.match(r"^[\w.]+$", table):
-        return jsonify({"error": "Invalid table name"}), 400
-    for col in columns:
-        if not _re.match(r"^\w+$", col):
-            return jsonify({"error": f"Invalid column name: {col}"}), 400
-    if filter_col and not _re.match(r"^\w+$", filter_col):
-        return jsonify({"error": "Invalid filter column name"}), 400
-    allowed_ops = {"=", "!=", "<", ">", "<=", ">=", "LIKE", "BETWEEN"}
-    if filter_op not in allowed_ops:
-        filter_op = "="
-
-    safe_table = _re.sub(r"[^\w.]", "", table)
-
-    # Build filter WHERE clause used both for per-column stats and volume analysis
-    where_clause = ""
-    if filter_col and filter_op and filter_val is not None:
-        safe_fcol = _re.sub(r"[^\w]", "", filter_col)
-        escaped_val = str(filter_val).replace("'", "''")
-        if filter_op == "BETWEEN" and filter_val2 is not None:
-            escaped_val2 = str(filter_val2).replace("'", "''")
-            where_clause = f" WHERE `{safe_fcol}` BETWEEN '{escaped_val}' AND '{escaped_val2}'"
-        else:
-            op_map = {"=": "=", "!=": "!=", "<": "<", ">": ">", "<=": "<=", ">=": ">=", "LIKE": "LIKE"}
-            op = op_map.get(filter_op, "=")
-            where_clause = f" WHERE `{safe_fcol}` {op} '{escaped_val}'"
-
-    try:
-        client = get_clickhouse_client()
-
-        # Get column types from DESCRIBE TABLE
-        desc = client.query(f"DESCRIBE TABLE {table}")
-        col_types = {row[0]: row[1] for row in desc.result_rows}
-
-        # Collect per-column stats
-        column_stats = []
-        for col in columns:
-            col_type = col_types.get(col, "String")
-            cs = _dq_column_stats(
-                client, table, col, col_type, sample_size,
-                filter_col=filter_col, filter_op=filter_op, filter_val=filter_val,
-                filter_val2=filter_val2,
-            )
-            column_stats.append(cs)
-
-        # ── Volume Consistency Analysis (Temporal) ────────────────────────────
-        volume_analysis = None
-        if time_col and _re.match(r"^\w+$", time_col):
-            safe_time_col = _re.sub(r"[^\w]", "", time_col)
-            try:
-                # Auto-detect granularity: use hourly if range < 7 days, else daily
-                range_r = client.query(
-                    f"SELECT min(`{safe_time_col}`), max(`{safe_time_col}`) FROM {safe_table}"
-                )
-                rr = range_r.result_rows[0]
-                min_ts, max_ts = rr[0], rr[1]
-                try:
-                    from datetime import timezone as _tz
-                    delta_days = (max_ts - min_ts).days if hasattr(max_ts, 'days') else 999
-                except Exception:
-                    delta_days = 999
-                granularity = "hour" if delta_days <= 7 else "day"
-                trunc_fn = "toStartOfHour" if granularity == "hour" else "toStartOfDay"
-
-                if where_clause:
-                    where_vol = where_clause + f" AND `{safe_time_col}` IS NOT NULL"
-                else:
-                    where_vol = f" WHERE `{safe_time_col}` IS NOT NULL"
-                vol_r = client.query(
-                    f"SELECT {trunc_fn}(`{safe_time_col}`) AS period, count() AS cnt"
-                    f" FROM {safe_table}{where_vol}"
-                    f" GROUP BY period ORDER BY period"
-                )
-                vol_rows = [{"period": str(row[0]), "count": int(row[1])} for row in vol_r.result_rows]
-
-                if vol_rows:
-                    counts = [r["count"] for r in vol_rows]
-                    vol_avg = sum(counts) / len(counts)
-                    vol_stddev = (sum((c - vol_avg) ** 2 for c in counts) / max(len(counts), 1)) ** 0.5
-                    vol_p25 = sorted(counts)[len(counts) // 4]
-                    vol_p75 = sorted(counts)[3 * len(counts) // 4]
-                    iqr_vol = vol_p75 - vol_p25
-                    low_threshold = max(1, vol_p25 - 1.5 * iqr_vol)
-                    anomaly_periods = [r for r in vol_rows if r["count"] < low_threshold]
-                    volume_analysis = {
-                        "time_column": time_col,
-                        "granularity": granularity,
-                        "periods": len(vol_rows),
-                        "avg_volume": round(vol_avg, 1),
-                        "stddev_volume": round(vol_stddev, 1),
-                        "min_volume": min(counts),
-                        "max_volume": max(counts),
-                        "p25_volume": vol_p25,
-                        "p75_volume": vol_p75,
-                        "low_volume_threshold": round(low_threshold, 1),
-                        "anomaly_count": len(anomaly_periods),
-                        "anomaly_periods": anomaly_periods[:20],
-                        "recent_periods": vol_rows[-10:],
-                    }
-            except Exception as ve:
-                volume_analysis = {"error": str(ve), "time_column": time_col}
-
-        # ── LLM analysis (batched when many columns) ─────────────────────────
-        filter_note = ""
-        if filter_col and filter_val is not None:
-            if filter_op == "BETWEEN" and filter_val2 is not None:
-                filter_note = f" (filtered to rows where `{filter_col}` BETWEEN '{filter_val}' AND '{filter_val2}')"
-            else:
-                filter_note = f" (filtered to rows where `{filter_col}` {filter_op} '{filter_val}')"
-
-        volume_note = ""
-        if volume_analysis and "error" not in volume_analysis:
-            volume_note = f"\n\nVOLUME CONSISTENCY (by {volume_analysis['granularity']}):\n{json.dumps(volume_analysis, indent=2, default=str)}"
-
-        _dq_system_prompt = """You are an expert data quality analyst specializing in database analytics and anomaly detection.
+_DQ_SYSTEM_PROMPT = """You are an expert data quality analyst specializing in database analytics and anomaly detection.
 Analyze the statistical profiles of the provided columns and identify all data quality issues.
 
 Evaluate each column for:
@@ -5088,79 +4948,663 @@ Return ONLY valid JSON with this exact structure:
   "recommendations": ["<global recommendation 1>", "<global recommendation 2>"]
 }"""
 
-        scan_desc = "full scan" if sample_size is None else f"sample of {sample_size:,} rows"
+_dq_prepared_runs_lock = _threading.Lock()
+_dq_prepared_runs: dict[str, dict] = {}
+_DQ_PREPARED_TTL_SECONDS = 30 * 60
+_DQ_PREPARED_MAX_ITEMS = 64
 
-        # Batch columns into at most 5 LLM calls to avoid token overflow
-        MAX_DQ_BATCHES = 5
-        BATCH_THRESHOLD = 8  # no batching below this count
 
-        def _dq_call_batch(batch_stats, batch_idx, total_batches, include_volume=False):
-            """Call LLM for a batch of column stats. Returns parsed analysis dict."""
-            batch_json = json.dumps(batch_stats, indent=2, default=str)
-            vol_section = volume_note if (include_volume and volume_note) else ""
-            batch_note = f" [batch {batch_idx}/{total_batches}]" if total_batches > 1 else ""
-            user_msg = (
-                f"Analyze data quality for table `{table}` ({scan_desc}{filter_note}){batch_note}.\n\n"
-                f"Column Statistics:\n{batch_json}{vol_section}\n\n"
-                "Provide a thorough analysis identifying all data quality issues with specific numbers."
-            )
-            raw = _call_llm(_dq_system_prompt, [{"role": "user", "content": user_msg}], temperature=0.1)
-            result = _parse_llm_json(raw)
-            if not result:
-                return {
-                    "summary": raw,
-                    "quality_score": None,
-                    "columns": [{"column": s["column"], "quality_score": None, "issues": [], "insights": ""}
-                                for s in batch_stats],
-                    "recommendations": [],
-                }
-            return result
+def _dq_prune_prepared_runs() -> None:
+    import time as _time
 
-        if len(column_stats) <= BATCH_THRESHOLD:
-            # Single LLM call
-            analysis = _dq_call_batch(column_stats, 1, 1, include_volume=True)
-        else:
-            # Split into batches (max MAX_DQ_BATCHES)
-            import math as _math
-            n_batches = min(MAX_DQ_BATCHES, len(column_stats))
-            batch_size = _math.ceil(len(column_stats) / n_batches)
-            batches = [column_stats[i:i + batch_size] for i in range(0, len(column_stats), batch_size)]
+    now = _time.time()
+    with _dq_prepared_runs_lock:
+        stale_ids = [
+            run_id
+            for run_id, payload in _dq_prepared_runs.items()
+            if now - float(payload.get("created_at", 0)) > _DQ_PREPARED_TTL_SECONDS
+        ]
+        for run_id in stale_ids:
+            _dq_prepared_runs.pop(run_id, None)
+        while len(_dq_prepared_runs) > _DQ_PREPARED_MAX_ITEMS:
+            oldest = min(
+                _dq_prepared_runs.items(),
+                key=lambda item: float(item[1].get("created_at", 0)),
+            )[0]
+            _dq_prepared_runs.pop(oldest, None)
 
-            batch_results = []
-            for idx, batch in enumerate(batches):
-                # Only include volume analysis in the first batch
-                br = _dq_call_batch(batch, idx + 1, len(batches), include_volume=(idx == 0))
-                batch_results.append(br)
 
-            # Merge batch results
-            all_columns = []
-            all_recs = []
-            scores = []
-            for br in batch_results:
-                all_columns.extend(br.get("columns") or [])
-                all_recs.extend(br.get("recommendations") or [])
-                if br.get("quality_score") is not None:
-                    scores.append(br["quality_score"])
+def _dq_store_prepared_run(payload: dict) -> str:
+    import time as _time
 
-            merged_score = round(sum(scores) / len(scores)) if scores else None
-            # Build merged summary
-            merged_summary = f"Analysis of {len(column_stats)} columns in {len(batches)} batches. " + \
-                             " ".join(br.get("summary", "") for br in batch_results[:2])
-            analysis = {
-                "summary": merged_summary[:500],
-                "quality_score": merged_score,
-                "columns": all_columns,
-                "recommendations": list(dict.fromkeys(all_recs))[:10],  # deduplicate, keep 10
+    _dq_prune_prepared_runs()
+    run_id = f"dq_{uuid.uuid4().hex}"
+    body = dict(payload or {})
+    body["created_at"] = _time.time()
+    with _dq_prepared_runs_lock:
+        _dq_prepared_runs[run_id] = body
+    return run_id
+
+
+def _dq_pop_prepared_run(run_id: str) -> dict | None:
+    _dq_prune_prepared_runs()
+    with _dq_prepared_runs_lock:
+        return _dq_prepared_runs.pop(run_id, None)
+
+
+def _dq_filter_note(filter_col, filter_op, filter_val, filter_val2) -> str:
+    if not filter_col or filter_val is None:
+        return ""
+    if filter_op == "BETWEEN" and filter_val2 is not None:
+        return (
+            f" (filtered to rows where `{filter_col}` BETWEEN '{filter_val}' "
+            f"AND '{filter_val2}')"
+        )
+    return f" (filtered to rows where `{filter_col}` {filter_op} '{filter_val}')"
+
+
+def _dq_compact_column_stat_for_llm(stat: dict, aggressive: bool = False) -> dict:
+    keep = (
+        "column", "type", "total", "null_count", "null_pct", "distinct_count", "distinct_pct",
+        "empty_count", "empty_pct", "min", "max", "avg", "stddev", "p25", "p50", "p75",
+        "outlier_count", "outlier_pct", "zscore_outlier_count", "zscore_outlier_pct",
+        "negative_count", "zero_count", "coeff_variation", "skewness_approx", "min_length",
+        "max_length", "avg_length", "sentinel_count", "whitespace_padded_count",
+        "all_caps_count", "numeric_string_count", "email_like_count", "min_date",
+        "max_date", "future_count", "epoch_sentinel_count", "weekend_count", "pre_1900_count",
+        "filter_applied", "query_error",
+    )
+    compact = {}
+    for key in keep:
+        if key in stat and stat.get(key) is not None:
+            compact[key] = stat.get(key)
+
+    top_values = stat.get("top_values") or []
+    if isinstance(top_values, list) and top_values:
+        max_values = 3 if aggressive else 6
+        max_len = 42 if aggressive else 80
+        compact["top_values"] = [
+            {
+                "value": str(v.get("value", ""))[:max_len],
+                "count": int(v.get("count", 0)),
             }
+            for v in top_values[:max_values]
+            if isinstance(v, dict)
+        ]
+    if compact.get("query_error"):
+        compact["query_error"] = str(compact["query_error"])[:200]
+    return compact
 
+
+def _dq_compact_volume_for_llm(volume_analysis: dict | None) -> dict | None:
+    if not isinstance(volume_analysis, dict):
+        return None
+    if volume_analysis.get("error"):
+        return {
+            "time_column": volume_analysis.get("time_column"),
+            "error": str(volume_analysis.get("error"))[:200],
+        }
+    return {
+        "time_column": volume_analysis.get("time_column"),
+        "granularity": volume_analysis.get("granularity"),
+        "periods": volume_analysis.get("periods"),
+        "avg_volume": volume_analysis.get("avg_volume"),
+        "stddev_volume": volume_analysis.get("stddev_volume"),
+        "min_volume": volume_analysis.get("min_volume"),
+        "max_volume": volume_analysis.get("max_volume"),
+        "p25_volume": volume_analysis.get("p25_volume"),
+        "p75_volume": volume_analysis.get("p75_volume"),
+        "low_volume_threshold": volume_analysis.get("low_volume_threshold"),
+        "anomaly_count": volume_analysis.get("anomaly_count"),
+        "anomaly_periods": (volume_analysis.get("anomaly_periods") or [])[:8],
+        "recent_periods": (volume_analysis.get("recent_periods") or [])[:6],
+    }
+
+
+def _dq_build_llm_plan(
+    table: str,
+    scan_desc: str,
+    filter_note: str,
+    column_stats: list[dict],
+    volume_analysis: dict | None,
+) -> dict:
+    compact_stats = [_dq_compact_column_stat_for_llm(s) for s in column_stats]
+    compact_volume = _dq_compact_volume_for_llm(volume_analysis)
+
+    raw_context_window = _get_model_context_limit()
+    effective_context = _get_effective_context_limit()
+
+    prompt_scaffold = (
+        f"Analyze data quality for table `{table}` ({scan_desc}{filter_note}).\n\n"
+        "Column Statistics:\n[]\n\n"
+        "Provide a thorough analysis identifying all data quality issues with specific numbers."
+    )
+    scaffold_tokens = _estimate_tokens(prompt_scaffold)
+    system_tokens = _estimate_tokens(_DQ_SYSTEM_PROMPT)
+    output_reserve = max(180, min(900, int(effective_context * 0.20)))
+    token_budget_per_call = max(
+        120,
+        effective_context - system_tokens - scaffold_tokens - output_reserve,
+    )
+
+    volume_tokens = 0
+    if compact_volume:
+        volume_tokens = _estimate_tokens(
+            "VOLUME CONSISTENCY:\n"
+            + json.dumps(compact_volume, separators=(",", ":"), ensure_ascii=False, default=str)
+        )
+
+    serialized_stats = [
+        json.dumps(s, separators=(",", ":"), ensure_ascii=False, default=str)
+        for s in compact_stats
+    ]
+    stat_tokens = [max(8, _estimate_tokens(s)) for s in serialized_stats]
+
+    batches = []
+    i = 0
+    while i < len(compact_stats):
+        batch_budget = token_budget_per_call - (volume_tokens if len(batches) == 0 else 0)
+        batch_budget = max(80, batch_budget)
+        current = []
+        used = 0
+        while i < len(compact_stats):
+            entry = compact_stats[i]
+            entry_tokens = stat_tokens[i]
+            if entry_tokens > batch_budget:
+                compact_entry = _dq_compact_column_stat_for_llm(column_stats[i], aggressive=True)
+                compact_tokens = _estimate_tokens(
+                    json.dumps(compact_entry, separators=(",", ":"), ensure_ascii=False, default=str)
+                )
+                if compact_tokens < entry_tokens:
+                    compact_stats[i] = compact_entry
+                    stat_tokens[i] = compact_tokens
+                    entry = compact_entry
+                    entry_tokens = compact_tokens
+
+            if current and used + entry_tokens > batch_budget:
+                break
+
+            current.append(entry)
+            used += entry_tokens
+            i += 1
+
+            # Always advance even when a single field exceeds the budget.
+            if entry_tokens > batch_budget:
+                break
+
+        if not current:
+            current.append(compact_stats[i])
+            i += 1
+        batches.append(current)
+
+    prompt_tokens_per_call = []
+    for idx, batch in enumerate(batches):
+        batch_tokens = _estimate_tokens(
+            json.dumps(batch, separators=(",", ":"), ensure_ascii=False, default=str)
+        )
+        prompt_tokens_per_call.append(
+            scaffold_tokens + batch_tokens + (volume_tokens if idx == 0 else 0)
+        )
+
+    total_synthesis_tokens = scaffold_tokens + volume_tokens + sum(stat_tokens)
+    calls_by_ratio = max(1, math.ceil(total_synthesis_tokens / max(1, token_budget_per_call)))
+
+    return {
+        "raw_context_window_tokens": raw_context_window,
+        "effective_context_window_tokens": effective_context,
+        "token_budget_per_call": token_budget_per_call,
+        "estimated_total_synthesis_tokens": total_synthesis_tokens,
+        "estimated_total_prompt_tokens": sum(prompt_tokens_per_call),
+        "estimated_calls_ratio": calls_by_ratio,
+        "estimated_calls": len(batches),
+        "estimated_prompt_tokens_per_call": prompt_tokens_per_call,
+        "columns_per_call": [len(b) for b in batches],
+        "batches": batches,
+        "compact_volume": compact_volume,
+    }
+
+
+def _dq_public_plan(plan: dict) -> dict:
+    if not isinstance(plan, dict):
+        return {}
+    return {
+        "raw_context_window_tokens": plan.get("raw_context_window_tokens"),
+        "effective_context_window_tokens": plan.get("effective_context_window_tokens"),
+        "token_budget_per_call": plan.get("token_budget_per_call"),
+        "estimated_total_synthesis_tokens": plan.get("estimated_total_synthesis_tokens"),
+        "estimated_total_prompt_tokens": plan.get("estimated_total_prompt_tokens"),
+        "estimated_calls_ratio": plan.get("estimated_calls_ratio"),
+        "estimated_calls": plan.get("estimated_calls"),
+        "estimated_prompt_tokens_per_call": plan.get("estimated_prompt_tokens_per_call") or [],
+        "columns_per_call": plan.get("columns_per_call") or [],
+    }
+
+
+def _dq_call_batch_llm(
+    table: str,
+    scan_desc: str,
+    filter_note: str,
+    batch_stats: list[dict],
+    batch_idx: int,
+    total_batches: int,
+    compact_volume: dict | None = None,
+) -> dict:
+    batch_json = json.dumps(batch_stats, indent=2, ensure_ascii=False, default=str)
+    volume_section = ""
+    if compact_volume and batch_idx == 1:
+        volume_section = (
+            "\n\nVOLUME CONSISTENCY:\n"
+            + json.dumps(compact_volume, indent=2, ensure_ascii=False, default=str)
+        )
+    batch_note = f" [batch {batch_idx}/{total_batches}]" if total_batches > 1 else ""
+    user_msg = (
+        f"Analyze data quality for table `{table}` ({scan_desc}{filter_note}){batch_note}.\n\n"
+        f"Column Statistics:\n{batch_json}{volume_section}\n\n"
+        "Provide a thorough analysis identifying all data quality issues with specific numbers."
+    )
+    safe_user_msg = _truncate_text_to_budget(user_msg, int(_get_effective_context_limit() * 0.68))
+    raw = _call_llm(_DQ_SYSTEM_PROMPT, [{"role": "user", "content": safe_user_msg}], temperature=0.1)
+
+    try:
+        parsed = _parse_llm_json(raw)
+    except Exception:
+        parsed = None
+
+    if not isinstance(parsed, dict):
+        return {
+            "summary": str(raw)[:320],
+            "quality_score": None,
+            "columns": [
+                {"column": s.get("column"), "quality_score": None, "issues": [], "insights": ""}
+                for s in batch_stats
+            ],
+            "recommendations": [],
+        }
+    return parsed
+
+
+def _dq_merge_batch_results(column_stats: list[dict], batch_results: list[dict]) -> dict:
+    scores = []
+    summaries = []
+    recs = []
+    by_column: dict[str, dict] = {}
+
+    for br in batch_results:
+        if isinstance(br.get("quality_score"), (int, float)):
+            scores.append(int(br.get("quality_score")))
+        if br.get("summary"):
+            summaries.append(str(br.get("summary")))
+        for rec in (br.get("recommendations") or []):
+            if isinstance(rec, str) and rec.strip():
+                recs.append(rec.strip())
+        for col in (br.get("columns") or []):
+            if not isinstance(col, dict):
+                continue
+            cname = str(col.get("column") or "").strip()
+            if not cname:
+                continue
+            clean = {
+                "column": cname,
+                "quality_score": col.get("quality_score"),
+                "issues": col.get("issues") if isinstance(col.get("issues"), list) else [],
+                "insights": str(col.get("insights", ""))[:400],
+            }
+            by_column[cname] = clean
+
+    ordered_columns = []
+    for stat in column_stats:
+        cname = str(stat.get("column", "")).strip()
+        fallback = {
+            "column": cname,
+            "quality_score": None,
+            "issues": [],
+            "insights": "",
+        }
+        ordered_columns.append(by_column.get(cname, fallback))
+
+    merged_score = round(sum(scores) / len(scores)) if scores else None
+    merged_summary = (
+        f"Analysis of {len(column_stats)} columns in {len(batch_results)} LLM call(s). "
+        + " ".join(summaries[:2])
+    ).strip()
+    return {
+        "summary": merged_summary[:700],
+        "quality_score": merged_score,
+        "columns": ordered_columns,
+        "recommendations": list(dict.fromkeys(recs))[:10],
+    }
+
+
+def _dq_run_llm_analysis(
+    table: str,
+    scan_desc: str,
+    filter_note: str,
+    column_stats: list[dict],
+    volume_analysis: dict | None,
+    llm_plan: dict,
+) -> dict:
+    batches = llm_plan.get("batches") or [[_dq_compact_column_stat_for_llm(s) for s in column_stats]]
+    compact_volume = llm_plan.get("compact_volume")
+    if compact_volume is None:
+        compact_volume = _dq_compact_volume_for_llm(volume_analysis)
+
+    batch_results = []
+    for idx, batch in enumerate(batches):
+        br = _dq_call_batch_llm(
+            table=table,
+            scan_desc=scan_desc,
+            filter_note=filter_note,
+            batch_stats=batch,
+            batch_idx=idx + 1,
+            total_batches=len(batches),
+            compact_volume=compact_volume,
+        )
+        batch_results.append(br)
+
+    return _dq_merge_batch_results(column_stats, batch_results)
+
+
+def _dq_parse_request_payload(data: dict) -> dict:
+    data = data or {}
+    table = str(data.get("table") or "").strip()
+
+    columns_raw = data.get("columns", [])
+    if isinstance(columns_raw, str):
+        columns = [c.strip() for c in columns_raw.split(",") if c.strip()]
+    elif isinstance(columns_raw, list):
+        columns = [str(c).strip() for c in columns_raw if str(c).strip()]
+    else:
+        columns = []
+    columns = list(dict.fromkeys(columns))
+
+    sample_raw = data.get("sample_size")
+    sample_size = None
+    if sample_raw is not None and str(sample_raw).strip() != "":
+        try:
+            sample_size = int(sample_raw)
+        except Exception as exc:
+            raise ValueError("sample_size must be an integer") from exc
+        sample_size = min(max(sample_size, 1), 500000)
+
+    filter_col = str(data.get("filter_column") or "").strip() or None
+    filter_op = str(data.get("filter_operator") or "=").strip().upper()
+    allowed_ops = {"=", "!=", "<", ">", "<=", ">=", "LIKE", "BETWEEN"}
+    if filter_op not in allowed_ops:
+        filter_op = "="
+    filter_val = data.get("filter_value")
+    if filter_val is not None and str(filter_val) != "":
+        filter_val = str(filter_val)
+    else:
+        filter_val = None
+    filter_val2 = data.get("filter_value2")
+    if filter_val2 is not None and str(filter_val2) != "":
+        filter_val2 = str(filter_val2)
+    else:
+        filter_val2 = None
+
+    time_col = str(data.get("time_column") or "").strip() or None
+
+    if not table:
+        raise ValueError("Table name is required")
+    if not columns:
+        raise ValueError("At least one column is required")
+    if not _re.match(r"^[\w.]+$", table):
+        raise ValueError("Invalid table name")
+    for col in columns:
+        if not _re.match(r"^\w+$", col):
+            raise ValueError(f"Invalid column name: {col}")
+    if filter_col and not _re.match(r"^\w+$", filter_col):
+        raise ValueError("Invalid filter column name")
+    if time_col and not _re.match(r"^\w+$", time_col):
+        raise ValueError("Invalid time column name")
+    if filter_op == "BETWEEN" and filter_col and filter_val is not None and filter_val2 is None:
+        raise ValueError("filter_value2 is required when filter_operator is BETWEEN")
+
+    return {
+        "table": table,
+        "columns": columns,
+        "sample_size": sample_size,
+        "filter_col": filter_col,
+        "filter_op": filter_op,
+        "filter_val": filter_val,
+        "filter_val2": filter_val2,
+        "time_col": time_col,
+    }
+
+
+def _dq_collect_profiles(params: dict) -> dict:
+    table = params["table"]
+    columns = params["columns"]
+    sample_size = params.get("sample_size")
+    filter_col = params.get("filter_col")
+    filter_op = params.get("filter_op")
+    filter_val = params.get("filter_val")
+    filter_val2 = params.get("filter_val2")
+    time_col = params.get("time_col")
+
+    safe_table = _re.sub(r"[^\w.]", "", table)
+
+    where_clause = ""
+    if filter_col and filter_op and filter_val is not None:
+        safe_fcol = _re.sub(r"[^\w]", "", filter_col)
+        escaped_val = str(filter_val).replace("'", "''")
+        if filter_op == "BETWEEN" and filter_val2 is not None:
+            escaped_val2 = str(filter_val2).replace("'", "''")
+            where_clause = f" WHERE `{safe_fcol}` BETWEEN '{escaped_val}' AND '{escaped_val2}'"
+        else:
+            where_clause = f" WHERE `{safe_fcol}` {filter_op} '{escaped_val}'"
+
+    client = get_clickhouse_client()
+
+    desc = client.query(f"DESCRIBE TABLE {table}")
+    col_types = {row[0]: row[1] for row in desc.result_rows}
+
+    column_stats = []
+    for col in columns:
+        col_type = col_types.get(col, "String")
+        cs = _dq_column_stats(
+            client,
+            table,
+            col,
+            col_type,
+            sample_size,
+            filter_col=filter_col,
+            filter_op=filter_op,
+            filter_val=filter_val,
+            filter_val2=filter_val2,
+        )
+        column_stats.append(cs)
+
+    volume_analysis = None
+    if time_col:
+        safe_time_col = _re.sub(r"[^\w]", "", time_col)
+        try:
+            range_r = client.query(
+                f"SELECT min(`{safe_time_col}`), max(`{safe_time_col}`) FROM {safe_table}"
+            )
+            rr = range_r.result_rows[0]
+            min_ts, max_ts = rr[0], rr[1]
+            try:
+                delta_days = (max_ts - min_ts).days if hasattr(max_ts, "days") else 999
+            except Exception:
+                delta_days = 999
+            granularity = "hour" if delta_days <= 7 else "day"
+            trunc_fn = "toStartOfHour" if granularity == "hour" else "toStartOfDay"
+
+            if where_clause:
+                where_vol = where_clause + f" AND `{safe_time_col}` IS NOT NULL"
+            else:
+                where_vol = f" WHERE `{safe_time_col}` IS NOT NULL"
+            vol_r = client.query(
+                f"SELECT {trunc_fn}(`{safe_time_col}`) AS period, count() AS cnt"
+                f" FROM {safe_table}{where_vol}"
+                f" GROUP BY period ORDER BY period"
+            )
+            vol_rows = [{"period": str(row[0]), "count": int(row[1])} for row in vol_r.result_rows]
+            if vol_rows:
+                counts = [r["count"] for r in vol_rows]
+                vol_avg = sum(counts) / len(counts)
+                vol_stddev = (sum((c - vol_avg) ** 2 for c in counts) / max(len(counts), 1)) ** 0.5
+                sorted_counts = sorted(counts)
+                vol_p25 = sorted_counts[len(sorted_counts) // 4]
+                vol_p75 = sorted_counts[3 * len(sorted_counts) // 4]
+                iqr_vol = vol_p75 - vol_p25
+                low_threshold = max(1, vol_p25 - 1.5 * iqr_vol)
+                anomaly_periods = [r for r in vol_rows if r["count"] < low_threshold]
+                volume_analysis = {
+                    "time_column": time_col,
+                    "granularity": granularity,
+                    "periods": len(vol_rows),
+                    "avg_volume": round(vol_avg, 1),
+                    "stddev_volume": round(vol_stddev, 1),
+                    "min_volume": min(counts),
+                    "max_volume": max(counts),
+                    "p25_volume": vol_p25,
+                    "p75_volume": vol_p75,
+                    "low_volume_threshold": round(low_threshold, 1),
+                    "anomaly_count": len(anomaly_periods),
+                    "anomaly_periods": anomaly_periods[:20],
+                    "recent_periods": vol_rows[-10:],
+                }
+        except Exception as exc:
+            volume_analysis = {"error": str(exc), "time_column": time_col}
+
+    return {
+        "table": table,
+        "sample_size": sample_size,
+        "column_stats": column_stats,
+        "volume_analysis": volume_analysis,
+        "scan_desc": "full scan" if sample_size is None else f"sample of {sample_size:,} rows",
+        "filter_note": _dq_filter_note(filter_col, filter_op, filter_val, filter_val2),
+    }
+
+
+def _dq_prepare_run(params: dict) -> dict:
+    profile = _dq_collect_profiles(params)
+    llm_plan = _dq_build_llm_plan(
+        table=profile["table"],
+        scan_desc=profile["scan_desc"],
+        filter_note=profile["filter_note"],
+        column_stats=profile["column_stats"],
+        volume_analysis=profile.get("volume_analysis"),
+    )
+    prepared_run_id = _dq_store_prepared_run(
+        {
+            "table": profile["table"],
+            "sample_size": profile["sample_size"],
+            "column_stats": profile["column_stats"],
+            "volume_analysis": profile.get("volume_analysis"),
+            "scan_desc": profile["scan_desc"],
+            "filter_note": profile["filter_note"],
+            "llm_plan": llm_plan,
+        }
+    )
+    return {
+        "status": "awaiting_llm_approval",
+        "approval_required": True,
+        "prepared_run_id": prepared_run_id,
+        "table": profile["table"],
+        "sample_size": profile["sample_size"],
+        "columns_count": len(profile["column_stats"]),
+        "llm_plan": _dq_public_plan(llm_plan),
+        "message": (
+            f"{llm_plan.get('estimated_calls', 1)} appel(s) LLM local estimé(s). "
+            "Confirmez OUI pour lancer l'analyse ou NON pour annuler."
+        ),
+    }
+
+
+@app.route("/api/data-quality/plan", methods=["POST"])
+def data_quality_plan():
+    """Collect stats + estimate token-aware LLM batches, without calling the LLM."""
+    data = request.get_json(silent=True) or {}
+    try:
+        params = _dq_parse_request_payload(data)
+        return jsonify(_dq_prepare_run(params))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        print(f"Data quality plan error: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/data-quality/analyze", methods=["POST"])
+def analyze_data_quality():
+    """Run AI-powered data quality analysis on selected table columns."""
+    data = request.get_json(silent=True) or {}
+    prepared_run_id = str(data.get("prepared_run_id") or "").strip()
+
+    try:
+        if prepared_run_id:
+            approval_raw = data.get("llm_approval")
+            approval_text = str(approval_raw).strip().lower() if approval_raw is not None else ""
+            approved = approval_raw is True or approval_text in {"oui", "yes", "true", "1"}
+            if not approved:
+                return jsonify({
+                    "error": "LLM approval is required (OUI/NON).",
+                    "approval_required": True,
+                    "prepared_run_id": prepared_run_id,
+                }), 400
+
+            prepared = _dq_pop_prepared_run(prepared_run_id)
+            if not prepared:
+                return jsonify({
+                    "error": "Prepared run not found or expired. Please run planning again.",
+                    "prepared_run_id": prepared_run_id,
+                }), 404
+
+            analysis = _dq_run_llm_analysis(
+                table=prepared["table"],
+                scan_desc=prepared["scan_desc"],
+                filter_note=prepared["filter_note"],
+                column_stats=prepared["column_stats"],
+                volume_analysis=prepared.get("volume_analysis"),
+                llm_plan=prepared["llm_plan"],
+            )
+            plan_public = _dq_public_plan(prepared["llm_plan"])
+            plan_public["executed_calls"] = len(prepared["llm_plan"].get("batches") or [])
+            return jsonify({
+                "table": prepared["table"],
+                "sample_size": prepared.get("sample_size"),
+                "column_stats": prepared["column_stats"],
+                "analysis": analysis,
+                "volume_analysis": prepared.get("volume_analysis"),
+                "llm_plan": plan_public,
+            })
+
+        if bool(data.get("prepare_only")):
+            params = _dq_parse_request_payload(data)
+            return jsonify(_dq_prepare_run(params))
+
+        params = _dq_parse_request_payload(data)
+        profile = _dq_collect_profiles(params)
+        llm_plan = _dq_build_llm_plan(
+            table=profile["table"],
+            scan_desc=profile["scan_desc"],
+            filter_note=profile["filter_note"],
+            column_stats=profile["column_stats"],
+            volume_analysis=profile.get("volume_analysis"),
+        )
+        analysis = _dq_run_llm_analysis(
+            table=profile["table"],
+            scan_desc=profile["scan_desc"],
+            filter_note=profile["filter_note"],
+            column_stats=profile["column_stats"],
+            volume_analysis=profile.get("volume_analysis"),
+            llm_plan=llm_plan,
+        )
+        plan_public = _dq_public_plan(llm_plan)
+        plan_public["executed_calls"] = len(llm_plan.get("batches") or [])
         return jsonify({
-            "table": table,
-            "sample_size": sample_size,  # None when full scan (no LIMIT)
-            "column_stats": column_stats,
+            "table": profile["table"],
+            "sample_size": profile["sample_size"],
+            "column_stats": profile["column_stats"],
             "analysis": analysis,
-            "volume_analysis": volume_analysis,
+            "volume_analysis": profile.get("volume_analysis"),
+            "llm_plan": plan_public,
         })
-
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     except Exception as exc:
         print(f"Data quality error: {exc}")
         return jsonify({"error": str(exc)}), 500
@@ -7696,6 +8140,13 @@ AGENTS_CATALOG = [
                 "default": 5,
                 "description": "Nombre de lignes à afficher par résultat intermédiaire",
             },
+            {
+                "name": "max_technical_retries",
+                "label": "Retries techniques gratuits (global)",
+                "type": "number",
+                "default": 3,
+                "description": "Nombre max de tentatives SQL simplifiées gratuites (0-8) sur tout le run.",
+            },
         ],
     },
     {
@@ -7834,7 +8285,8 @@ def clickhouse_writer_cleanup():
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
     dropped, errors = [], []
-    for table in created_tables:
+    allowed_tables, skipped_non_bot = _cw_filter_bot_tables(created_tables)
+    for table in allowed_tables:
         try:
             client.command(f"DROP TABLE IF EXISTS `{database}`.`{table}`")
             dropped.append(table)
@@ -7842,9 +8294,14 @@ def clickhouse_writer_cleanup():
             errors.append(f"{table}: {str(exc)}")
     if session_id in _writer_sessions:
         _writer_sessions[session_id]["created_tables"] = [
-            t for t in created_tables if t not in dropped
+            t for t in created_tables
+            if _cw_is_bot_table_name(t) and _cw_normalize_table_name(t) not in dropped
         ]
-    return jsonify({"dropped": dropped, "errors": errors})
+    return jsonify({
+        "dropped": dropped,
+        "errors": errors,
+        "skipped_non_bot": skipped_non_bot,
+    })
 
 
 # ===========================================================================
@@ -7884,6 +8341,59 @@ def _cw_get_schema_info(client, database: str, max_tables: int = 30) -> str:
     return "\n".join(parts)
 
 
+def _cw_normalize_table_name(table_name: str) -> str:
+    """Normalize table identifier by removing db qualifier and backticks."""
+    txt = str(table_name or "").strip()
+    if not txt:
+        return ""
+    if "." in txt:
+        txt = txt.split(".")[-1]
+    return txt.strip().strip("`").strip()
+
+
+def _cw_is_bot_table_name(table_name: str) -> bool:
+    clean = _cw_normalize_table_name(table_name)
+    return bool(clean) and clean.upper().startswith("BOT_")
+
+
+def _cw_filter_bot_tables(table_names: list[str]) -> tuple[list[str], list[str]]:
+    """Split a table list into BOT_* and non-BOT tables (normalized unique names)."""
+    allowed, skipped = [], []
+    seen_allowed, seen_skipped = set(), set()
+    for raw in table_names or []:
+        clean = _cw_normalize_table_name(raw)
+        if not clean:
+            continue
+        if _cw_is_bot_table_name(clean):
+            if clean not in seen_allowed:
+                seen_allowed.add(clean)
+                allowed.append(clean)
+        else:
+            if clean not in seen_skipped:
+                seen_skipped.add(clean)
+                skipped.append(clean)
+    return allowed, skipped
+
+
+def _cw_compact_action_log_for_prompt(
+    action_log: list[dict],
+    *,
+    max_items: int = 6,
+    max_sql_chars: int = 200,
+    max_result_chars: int = 200,
+) -> str:
+    lines = []
+    for entry in action_log[-max_items:]:
+        status = "OK" if entry.get("ok") else "FAIL"
+        sql_preview = str(entry.get("sql", "")).replace("\n", " ")[:max_sql_chars]
+        result_preview = str(entry.get("result_preview", "")).replace("\n", " ")[:max_result_chars]
+        lines.append(
+            f"Step {entry.get('step_id')} [{status}] {entry.get('description', '')[:120]} | "
+            f"SQL: {sql_preview} | Result: {result_preview}"
+        )
+    return "\n".join(lines) if lines else "(first step)"
+
+
 def _cw_detect_bot_table(sql: str) -> str | None:
     """Extract the BOT_ table name from a CREATE TABLE statement."""
     m = re.search(r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:(?:`[^`]+`|\w+)\.)?`?(BOT_\w+)`?",
@@ -7897,7 +8407,7 @@ def _cw_extract_table_name(sql: str, pattern: str) -> str | None:
     if not m:
         return None
     # The table name may be backtick-quoted; strip them
-    return m.group(1).strip("`")
+    return _cw_normalize_table_name(m.group(1))
 
 
 def _cw_is_sql_safe(sql: str) -> tuple[bool, str]:
@@ -7931,26 +8441,41 @@ def _cw_is_sql_safe(sql: str) -> tuple[bool, str]:
     if re.match(r"DROP\s+(DATABASE|SCHEMA)\b", sql_stripped, re.IGNORECASE):
         return False, "DROP DATABASE/SCHEMA n'est pas autorisé par l'agent Writer."
 
+    # ── All non-table DROP statements are blocked ────────────────────────────
+    if re.match(r"DROP\s+\w+\b", sql_stripped, re.IGNORECASE) and not re.match(
+        r"DROP\s+TABLE\b", sql_stripped, re.IGNORECASE
+    ):
+        return False, "Seul DROP TABLE est autorisé, et uniquement sur des tables BOT_*."
+
     # ── RENAME TABLE – never allowed ─────────────────────────────────────────
     if re.match(r"RENAME\s+TABLE\b", sql_stripped, re.IGNORECASE):
         return False, "RENAME TABLE n'est pas autorisé par l'agent Writer."
 
     # Helper: return (False, message) if table does not start with BOT_
     def _require_bot(table_name: str, op: str) -> tuple[bool, str] | None:
-        if not table_name.upper().startswith("BOT_"):
+        clean = _cw_normalize_table_name(table_name)
+        if not _cw_is_bot_table_name(clean):
             return (
                 False,
-                f"[SÉCURITÉ] {op} refusé : la table '{table_name}' n'est pas une table "
+                f"[SÉCURITÉ] {op} refusé : la table '{clean or table_name}' n'est pas une table "
                 f"temporaire BOT_. L'agent Writer ne peut pas modifier les tables existantes.",
             )
         return None  # OK
 
     # ── DROP TABLE [IF EXISTS] [db.]table ────────────────────────────────────
-    table = _cw_extract_table_name(
+    drop_match = re.match(
+        r"DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(.+)$",
         sql_stripped,
-        r"DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:(?:`[^`]+`|\w+)\.)?(`?\w+`?)",
+        re.IGNORECASE,
     )
-    if table is not None:
+    if drop_match is not None:
+        drop_tail = drop_match.group(1).strip()
+        # Disallow multi-target drop to prevent bypasses like
+        # DROP TABLE BOT_tmp, prod_table.
+        if "," in drop_tail:
+            return False, "[SÉCURITÉ] DROP TABLE multi-cibles interdit. Supprimez une seule table BOT_* par commande."
+        table_token = re.split(r"\s+", drop_tail, maxsplit=1)[0]
+        table = _cw_normalize_table_name(table_token)
         err = _require_bot(table, "DROP TABLE")
         if err:
             return err
@@ -8011,8 +8536,12 @@ def _cw_is_sql_safe(sql: str) -> tuple[bool, str]:
             return err
         return True, ""
 
-    # All other statements (OPTIMIZE TABLE, SYSTEM ..., etc.) are allowed
-    return True, ""
+    # Block other non-read operations by default for safer writer behavior.
+    return False, (
+        "Statement non autorisé par l'agent Writer. "
+        "Utilisez uniquement SELECT/SHOW/DESCRIBE/EXPLAIN/WITH "
+        "ou des écritures strictement cadrées sur des tables BOT_*."
+    )
 
 
 def _cw_plan(user_request: str, database: str, schema_info: str) -> dict:
@@ -8060,16 +8589,47 @@ def _cw_plan(user_request: str, database: str, schema_info: str) -> dict:
         "  ]\n"
         "}"
     )
-    raw = _call_llm(system_prompt, [{"role": "user", "content": user_content}], temperature=0.1)
-    result = _parse_llm_json(raw)
+    user_content = _truncate_text_to_budget(
+        user_content,
+        int(_get_effective_context_limit() * 0.56),
+    )
+    try:
+        raw = _call_llm(system_prompt, [{"role": "user", "content": user_content}], temperature=0.1)
+        result = _parse_llm_json(raw)
+    except Exception:
+        result = None
     if not result or "steps" not in result:
         result = {
             "objective": user_request,
-            "approach": "Exécution directe de la demande utilisateur.",
-            "estimated_steps": 1,
-            "complexity": "simple",
-            "steps": [{"id": 1, "description": "Exécuter la demande", "type": "compute",
-                        "rationale": "Réponse directe", "creates_table": None}],
+            "approach": (
+                "Plan de secours déterministe: explorer les données, créer une table BOT_ si nécessaire, "
+                "puis vérifier le résultat."
+            ),
+            "estimated_steps": 3,
+            "complexity": "medium",
+            "steps": [
+                {
+                    "id": 1,
+                    "description": "Explorer rapidement les tables et colonnes utiles avec une requête simple.",
+                    "type": "explore",
+                    "rationale": "Valider le périmètre avant écriture.",
+                    "creates_table": None,
+                },
+                {
+                    "id": 2,
+                    "description": "Créer/peupler une table BOT_ ciblée pour matérialiser le résultat.",
+                    "type": "create_table",
+                    "rationale": "Isoler le résultat sans toucher aux tables métier existantes.",
+                    "creates_table": "BOT_result_tmp",
+                },
+                {
+                    "id": 3,
+                    "description": "Vérifier les données produites et préparer la conclusion.",
+                    "type": "verify",
+                    "rationale": "Confirmer la qualité et l'utilité du résultat.",
+                    "creates_table": None,
+                },
+            ],
         }
     # Enforce max 12 steps
     result["steps"] = result["steps"][:12]
@@ -8082,15 +8642,12 @@ def _cw_generate_sql(session: dict, step: dict, client, database: str) -> dict:
     action_log = session["action_log"]
     user_context = session.get("user_context", {})
 
-    prev_summaries = []
-    for entry in action_log[-4:]:
-        status_str = "✓ SUCCÈS" if entry["ok"] else "✗ ECHEC"
-        preview = str(entry.get("result_preview", ""))[:300]
-        prev_summaries.append(
-            f"Étape {entry['step_id']} ({status_str}): {entry['description']}\n"
-            f"  SQL: {str(entry.get('sql', ''))[:200]}\n"
-            f"  Résultat: {preview}"
-        )
+    prev_summaries = _cw_compact_action_log_for_prompt(
+        action_log,
+        max_items=5,
+        max_sql_chars=170,
+        max_result_chars=190,
+    )
 
     try:
         res = client.query(f"SHOW TABLES FROM `{database}`")
@@ -8107,6 +8664,10 @@ def _cw_generate_sql(session: dict, step: dict, client, database: str) -> dict:
         "Tu es précis et tiens compte des volumes de données. "
         "Tu réponds UNIQUEMENT avec du JSON valide, sans markdown ni texte supplémentaire."
     )
+    user_context_text = _truncate_text_to_budget(
+        json.dumps(user_context or {}, ensure_ascii=False),
+        280,
+    )
     user_content = (
         f"Base: {database} | Tables disponibles: {tables_text}\n\n"
         f"Objectif global: {plan.get('objective', '')}\n"
@@ -8115,9 +8676,8 @@ def _cw_generate_sql(session: dict, step: dict, client, database: str) -> dict:
         f"Type: {step.get('type', 'compute')} | "
         f"Crée une table: {step.get('creates_table', 'non')}\n"
         f"Raison: {step.get('rationale', '')}\n\n"
-        f"Résultats des étapes précédentes:\n"
-        + ("\n".join(prev_summaries) if prev_summaries else "  (première étape)\n")
-        + f"\n\nContexte fourni par l'utilisateur: {json.dumps(user_context, ensure_ascii=False)}\n\n"
+        f"Résultats des étapes précédentes:\n{prev_summaries}\n\n"
+        f"Contexte fourni par l'utilisateur: {user_context_text}\n\n"
         "Génère le SQL pour cette étape.\n"
         "Règles OBLIGATOIRES:\n"
         "- SÉCURITÉ ABSOLUE: tu n'as le droit d'écrire (CREATE, INSERT, DROP, ALTER, TRUNCATE, DELETE) "
@@ -8154,6 +8714,10 @@ def _cw_generate_sql(session: dict, step: dict, client, database: str) -> dict:
         '  "choices": [{"label": "Description option", "value": "valeur"}]\n'
         "}"
     )
+    user_content = _truncate_text_to_budget(
+        user_content,
+        int(_get_effective_context_limit() * 0.58),
+    )
     raw = _call_llm(system_prompt, [{"role": "user", "content": user_content}], temperature=0.05)
     result = _parse_llm_json(raw)
     if not result:
@@ -8175,12 +8739,12 @@ def _cw_replan(session: dict, remaining_credits: int) -> dict:
     action_log = session["action_log"]
     current_idx = session["action_index"]
 
-    results_summary = []
-    for entry in action_log:
-        results_summary.append(
-            f"Étape {entry['step_id']} ({'OK' if entry['ok'] else 'ECHEC'}): "
-            f"{entry['description']} → {str(entry.get('result_preview', ''))[:200]}"
-        )
+    results_summary = _cw_compact_action_log_for_prompt(
+        action_log,
+        max_items=8,
+        max_sql_chars=120,
+        max_result_chars=160,
+    )
 
     remaining_steps = [s for s in plan.get("steps", []) if s["id"] > current_idx]
     next_id = current_idx + 1
@@ -8194,7 +8758,7 @@ def _cw_replan(session: dict, remaining_credits: int) -> dict:
         f"Objectif: {plan.get('objective', '')}\n"
         f"Approche originale: {plan.get('approach', '')}\n\n"
         f"Crédits restants (actions max): {remaining_credits}\n\n"
-        f"Résultats obtenus jusqu'ici:\n" + "\n".join(results_summary) + "\n\n"
+        f"Résultats obtenus jusqu'ici:\n{results_summary}\n\n"
         f"Étapes restantes prévues:\n{json.dumps(remaining_steps, ensure_ascii=False, indent=2)}\n\n"
         "Réévalue: Le plan actuel est-il encore optimal compte tenu des résultats?\n"
         "Considère:\n"
@@ -8212,8 +8776,15 @@ def _cw_replan(session: dict, remaining_credits: int) -> dict:
         f"{remaining_credits} étapes avec id (commençant à {next_id}), description, type, "
         "rationale, creates_table."
     )
-    raw = _call_llm(system_prompt, [{"role": "user", "content": user_content}], temperature=0.1)
-    result = _parse_llm_json(raw)
+    user_content = _truncate_text_to_budget(
+        user_content,
+        int(_get_effective_context_limit() * 0.55),
+    )
+    try:
+        raw = _call_llm(system_prompt, [{"role": "user", "content": user_content}], temperature=0.1)
+        result = _parse_llm_json(raw)
+    except Exception:
+        result = None
     if not result:
         return {"should_replan": False, "reason": "Pas de réévaluation nécessaire."}
     return result
@@ -8223,25 +8794,20 @@ def _cw_synthesize(session: dict) -> dict:
     """LLM generates a comprehensive synthesis of the entire operation."""
     plan = session["plan"]
     action_log = session["action_log"]
-    created_tables = session.get("created_tables", [])
+    created_tables, _ = _cw_filter_bot_tables(session.get("created_tables", []))
     replan_log = session.get("replan_log", [])
-
-    log_detail = []
-    for entry in action_log:
-        log_detail.append({
-            "step_id": entry["step_id"],
-            "description": entry["description"],
-            "sql_preview": str(entry.get("sql", ""))[:400],
-            "ok": entry["ok"],
-            "result_preview": str(entry.get("result_preview", ""))[:400],
-            "rows": entry.get("rows_affected"),
-            "explanation": entry.get("explanation", ""),
-        })
-
-    replan_summary = [
-        f"Après étape {i*3+3}: {r.get('reason', '')} (replanifié: {r.get('should_replan', False)})"
-        for i, r in enumerate(replan_log)
-    ]
+    replan_summary = []
+    for i, r in enumerate(replan_log[-8:]):
+        replan_summary.append(
+            f"Après étape {i * 3 + 3}: {str(r.get('reason', ''))[:180]} "
+            f"(replanifié: {bool(r.get('should_replan', False))})"
+        )
+    action_summary = _cw_compact_action_log_for_prompt(
+        action_log,
+        max_items=12,
+        max_sql_chars=220,
+        max_result_chars=240,
+    )
 
     system_prompt = (
         "Tu es un analyste senior rédigeant un rapport de synthèse complet et perspicace. "
@@ -8252,7 +8818,7 @@ def _cw_synthesize(session: dict) -> dict:
     user_content = (
         f"Objectif: {plan.get('objective', '')}\n"
         f"Approche: {plan.get('approach', '')}\n\n"
-        f"Journal d'exécution:\n{json.dumps(log_detail, ensure_ascii=False, indent=2)}\n\n"
+        f"Journal d'exécution (compact):\n{action_summary}\n\n"
         f"Réévaluations du plan:\n" + ("\n".join(replan_summary) if replan_summary else "Aucune réévaluation.") + "\n\n"
         f"Tables temporaires créées: {', '.join(created_tables) if created_tables else 'aucune'}\n\n"
         "Génère une synthèse complète et détaillée.\n"
@@ -8275,16 +8841,50 @@ def _cw_synthesize(session: dict) -> dict:
         '  "tables_created": [{"name": "BOT_xxx", "purpose": "contenu", "useful_for": "usages futurs"}]\n'
         "}"
     )
-    raw = _call_llm(system_prompt, [{"role": "user", "content": user_content}], temperature=0.3)
-    result = _parse_llm_json(raw)
+    user_content = _truncate_text_to_budget(
+        user_content,
+        int(_get_effective_context_limit() * 0.6),
+    )
+    result = None
+    try:
+        raw = _call_llm(system_prompt, [{"role": "user", "content": user_content}], temperature=0.3)
+        result = _parse_llm_json(raw)
+    except Exception as exc:
+        if _is_context_overflow_error(str(exc)):
+            compact_prompt = _truncate_text_to_budget(
+                user_content,
+                int(_get_effective_context_limit() * 0.35),
+            )
+            try:
+                raw = _call_llm(
+                    system_prompt,
+                    [{"role": "user", "content": compact_prompt}],
+                    temperature=0.2,
+                )
+                result = _parse_llm_json(raw)
+            except Exception:
+                result = None
+        else:
+            result = None
     if not result:
+        successful = [e for e in action_log if e.get("ok")]
+        failed = [e for e in action_log if not e.get("ok")]
         return {
-            "executive_summary": f"Analyse complétée en {len(action_log)} étapes.",
-            "key_findings": [e["description"] for e in action_log if e["ok"]],
+            "executive_summary": (
+                f"Analyse complétée en {len(action_log)} étape(s), "
+                f"avec {len(successful)} succès et {len(failed)} échec(s)."
+            ),
+            "key_findings": [e["description"] for e in successful[:8]],
             "step_reflections": [],
-            "data_insights": "",
-            "recommendations": [],
-            "conclusion": "Analyse terminée.",
+            "data_insights": (
+                "Les résultats confirment une exécution structurée, avec des étapes à creuser "
+                "lorsque les résultats intermédiaires étaient vides ou en échec."
+            ),
+            "recommendations": [
+                "Conserver les tables BOT_* utiles pour accélérer les analyses suivantes.",
+                "Relancer les étapes en échec avec un périmètre plus ciblé.",
+            ],
+            "conclusion": "Analyse terminée avec synthèse de secours (mode résilient).",
             "tables_created": [{"name": t, "purpose": "Table intermédiaire", "useful_for": ""}
                                 for t in created_tables],
         }
@@ -8301,15 +8901,12 @@ def _cw_generate_simple_sql(session: dict, step: dict, client, database: str,
     plan = session["plan"]
     action_log = session["action_log"]
 
-    prev_summaries = []
-    for entry in action_log[-4:]:
-        status_str = "✓ SUCCÈS" if entry["ok"] else "✗ ECHEC"
-        preview = str(entry.get("result_preview", ""))[:200]
-        prev_summaries.append(
-            f"Étape {entry['step_id']} ({status_str}): {entry['description']}\n"
-            f"  SQL: {str(entry.get('sql', ''))[:150]}\n"
-            f"  Résultat: {preview}"
-        )
+    prev_summaries = _cw_compact_action_log_for_prompt(
+        action_log,
+        max_items=5,
+        max_sql_chars=150,
+        max_result_chars=170,
+    )
 
     try:
         res = client.query(f"SHOW TABLES FROM `{database}`")
@@ -8331,9 +8928,8 @@ def _cw_generate_simple_sql(session: dict, step: dict, client, database: str,
         f"Étape actuelle {step['id']}: {step['description']}\n\n"
         f"SQL qui a échoué:\n{failed_sql}\n\n"
         f"Erreur ClickHouse:\n{error_msg}\n\n"
-        f"Contexte des étapes précédentes:\n"
-        + ("\n".join(prev_summaries) if prev_summaries else "  (première étape)\n")
-        + "\n\nRÈGLES DE SIMPLIFICATION OBLIGATOIRES:\n"
+        f"Contexte des étapes précédentes:\n{prev_summaries}\n\n"
+        "RÈGLES DE SIMPLIFICATION OBLIGATOIRES:\n"
         "- Utilise MOINS de fonctions; remplace les fonctions complexes par COUNT, SUM, AVG, MIN, MAX simples\n"
         "- Évite les window functions, CTEs, sous-requêtes imbriquées — utilise un SELECT … GROUP BY plat\n"
         "- Évite les fonctions ClickHouse avancées (windowFunnel, retention, argMax, topK, uniqHLL12, etc.)\n"
@@ -8346,8 +8942,15 @@ def _cw_generate_simple_sql(session: dict, step: dict, client, database: str,
         '  "explanation": "ce qui a été simplifié et pourquoi"\n'
         "}"
     )
-    raw = _call_llm(system_prompt, [{"role": "user", "content": user_content}], temperature=0.05)
-    result = _parse_llm_json(raw)
+    user_content = _truncate_text_to_budget(
+        user_content,
+        int(_get_effective_context_limit() * 0.56),
+    )
+    try:
+        raw = _call_llm(system_prompt, [{"role": "user", "content": user_content}], temperature=0.05)
+        result = _parse_llm_json(raw)
+    except Exception:
+        result = None
     if not result:
         return ""
     return (result.get("sql") or "").strip()
@@ -8363,14 +8966,12 @@ def _cw_rethink_strategy(session: dict, step: dict, client, database: str,
     plan = session["plan"]
     action_log = session["action_log"]
 
-    prev_summaries = []
-    for entry in action_log[-6:]:
-        status_str = "✓ SUCCÈS" if entry["ok"] else "✗ ECHEC"
-        prev_summaries.append(
-            f"Étape {entry['step_id']} ({status_str}): {entry['description']}\n"
-            f"  SQL: {str(entry.get('sql', ''))[:200]}\n"
-            f"  Résultat: {str(entry.get('result_preview', ''))[:200]}"
-        )
+    prev_summaries = _cw_compact_action_log_for_prompt(
+        action_log,
+        max_items=7,
+        max_sql_chars=170,
+        max_result_chars=170,
+    )
 
     try:
         res = client.query(f"SHOW TABLES FROM `{database}`")
@@ -8395,9 +8996,8 @@ def _cw_rethink_strategy(session: dict, step: dict, client, database: str,
         f"Type: {step.get('type', 'compute')}\n\n"
         f"SQL original qui a échoué:\n{failed_sql}\n\n"
         f"Erreur: {error_msg}\n\n"
-        f"Contexte des étapes précédentes:\n"
-        + ("\n".join(prev_summaries) if prev_summaries else "  (première étape)\n")
-        + "\n\nNOUVELLE STRATÉGIE REQUISE — règles:\n"
+        f"Contexte des étapes précédentes:\n{prev_summaries}\n\n"
+        "NOUVELLE STRATÉGIE REQUISE — règles:\n"
         "- Utilise UNIQUEMENT SELECT, COUNT, SUM, MIN, MAX, AVG avec GROUP BY simple\n"
         "- Si CREATE TABLE nécessaire: utilise ENGINE = MergeTree() ORDER BY tuple(), "
         "puis un INSERT séparé dans un second SQL\n"
@@ -8412,8 +9012,15 @@ def _cw_rethink_strategy(session: dict, step: dict, client, database: str,
         '  "explanation": "en quoi cette nouvelle approche est différente"\n'
         "}"
     )
-    raw = _call_llm(system_prompt, [{"role": "user", "content": user_content}], temperature=0.1)
-    result = _parse_llm_json(raw)
+    user_content = _truncate_text_to_budget(
+        user_content,
+        int(_get_effective_context_limit() * 0.56),
+    )
+    try:
+        raw = _call_llm(system_prompt, [{"role": "user", "content": user_content}], temperature=0.1)
+        result = _parse_llm_json(raw)
+    except Exception:
+        result = None
     if not result:
         return ""
     return (result.get("sql") or "").strip()
@@ -8440,8 +9047,15 @@ def _cw_generate_suggestions(user_request: str, schema_info: str, plan: dict) ->
         "Réponds UNIQUEMENT avec:\n"
         '{"suggestions": [{"label": "Courte description action", "value": "Demande complète à envoyer à l\'agent"}]}'
     )
-    raw = _call_llm(system_prompt, [{"role": "user", "content": user_content}], temperature=0.3)
-    result = _parse_llm_json(raw)
+    user_content = _truncate_text_to_budget(
+        user_content,
+        int(_get_effective_context_limit() * 0.45),
+    )
+    try:
+        raw = _call_llm(system_prompt, [{"role": "user", "content": user_content}], temperature=0.3)
+        result = _parse_llm_json(raw)
+    except Exception:
+        result = None
     if not result:
         return []
     return (result.get("suggestions") or [])[:5]
@@ -8455,6 +9069,7 @@ def _cw_execute_steps(session: dict, client, database: str, preview_rows: int = 
     plan = session["plan"]
     steps = plan.get("steps", [])
     max_actions = session.get("max_actions", 12)
+    max_technical_retries = max(0, int(session.get("max_technical_retries", 3) or 0))
 
     while (session["action_index"] < len(steps)
            and session["action_count"] < max_actions):
@@ -8488,7 +9103,7 @@ def _cw_execute_steps(session: dict, client, database: str, preview_rows: int = 
                 "action_count": session["action_count"],
                 "remaining_credits": max_actions - session["action_count"],
                 "question": sql_result["question"],
-                "created_tables": session["created_tables"],
+                "created_tables": _cw_filter_bot_tables(session["created_tables"])[0],
             }
 
         # ── Execute SQL ───────────────────────────────────────────────────
@@ -8537,8 +9152,10 @@ def _cw_execute_steps(session: dict, client, database: str, preview_rows: int = 
                         entry["rows_affected"] = None
                         bot_table = (sql_result.get("creates_table")
                                      or _cw_detect_bot_table(entry["sql"]))
-                        if bot_table and bot_table not in session["created_tables"]:
-                            session["created_tables"].append(bot_table)
+                        if _cw_is_bot_table_name(bot_table):
+                            normalized_bot = _cw_normalize_table_name(bot_table)
+                            if normalized_bot and normalized_bot not in session["created_tables"]:
+                                session["created_tables"].append(normalized_bot)
                 else:
                     original_error = exec_main.get("error", exec_main.get("summary", "Unknown error"))
                     error_class = exec_main.get("error_class", _classify_clickhouse_error(original_error))
@@ -8547,15 +9164,22 @@ def _cw_execute_steps(session: dict, client, database: str, preview_rows: int = 
                     entry["result_preview"] = f"[{error_class}] {original_error}"
 
                     # ── Technical retry with simpler SQL (free — no credit consumed) ──
-                    alt_sql = _cw_generate_simple_sql(
-                        session,
-                        step,
-                        client,
-                        database,
-                        sql,
-                        f"[{error_class}] {original_error}",
-                    )
-                    session["technical_retries"] = session.get("technical_retries", 0) + 1
+                    technical_retries_used = int(session.get("technical_retries", 0) or 0)
+                    alt_sql = ""
+                    if technical_retries_used < max_technical_retries:
+                        alt_sql = _cw_generate_simple_sql(
+                            session,
+                            step,
+                            client,
+                            database,
+                            sql,
+                            f"[{error_class}] {original_error}",
+                        )
+                        session["technical_retries"] = technical_retries_used + 1
+                    else:
+                        entry["result_preview"] += (
+                            f" | Retry technique ignoré: budget atteint ({max_technical_retries})."
+                        )
                     if alt_sql:
                         alt_is_safe, alt_safety_reason = _cw_is_sql_safe(alt_sql)
                         if alt_is_safe:
@@ -8582,8 +9206,10 @@ def _cw_execute_steps(session: dict, client, database: str, preview_rows: int = 
                                     entry["result_preview"] = "Commande exécutée avec succès (alternative simplifiée)."
                                     entry["rows_affected"] = None
                                     bot_table = _cw_detect_bot_table(entry["sql"])
-                                    if bot_table and bot_table not in session["created_tables"]:
-                                        session["created_tables"].append(bot_table)
+                                    if _cw_is_bot_table_name(bot_table):
+                                        normalized_bot = _cw_normalize_table_name(bot_table)
+                                        if normalized_bot and normalized_bot not in session["created_tables"]:
+                                            session["created_tables"].append(normalized_bot)
                                 entry["explanation"] = (
                                     entry.get("explanation", "") + " [alternative simplifiée]"
                                 )
@@ -8640,8 +9266,10 @@ def _cw_execute_steps(session: dict, client, database: str, preview_rows: int = 
                                                 else:
                                                     rethink_entry["result_preview"] = "Commande exécutée (stratégie alternative)."
                                                     bot_t = _cw_detect_bot_table(rethink_entry["sql"])
-                                                    if bot_t and bot_t not in session["created_tables"]:
-                                                        session["created_tables"].append(bot_t)
+                                                    if _cw_is_bot_table_name(bot_t):
+                                                        normalized_bot = _cw_normalize_table_name(bot_t)
+                                                        if normalized_bot and normalized_bot not in session["created_tables"]:
+                                                            session["created_tables"].append(normalized_bot)
                                             else:
                                                 rt_error = rt_exec.get("error", rt_exec.get("summary", "unknown"))
                                                 rethink_entry["result_preview"] = (
@@ -8715,16 +9343,18 @@ def _cw_execute_steps(session: dict, client, database: str, preview_rows: int = 
                 steps = plan["steps"]
 
     # ── All steps done (or max reached): synthesize ───────────────────────
+    allowed_created_tables, skipped_non_bot = _cw_filter_bot_tables(session.get("created_tables", []))
+    session["created_tables"] = allowed_created_tables
     synthesis = _cw_synthesize(session)
     session["synthesis"] = synthesis
     session["status"] = "awaiting_cleanup"
 
     cleanup_question = None
-    if session["created_tables"]:
+    if allowed_created_tables:
         cleanup_question = {
             "text": (
-                f"L'agent a créé {len(session['created_tables'])} table(s) temporaire(s): "
-                f"{', '.join(session['created_tables'])}. "
+                f"L'agent a créé {len(allowed_created_tables)} table(s) temporaire(s): "
+                f"{', '.join(allowed_created_tables)}. "
                 "Souhaitez-vous les supprimer maintenant?"
             ),
             "choices": [
@@ -8739,13 +9369,16 @@ def _cw_execute_steps(session: dict, client, database: str, preview_rows: int = 
             f"({'/' + str(max_actions) + ' max'}). "
             "Voici la synthèse complète ci-dessous."
         ),
-        "status": "awaiting_cleanup" if session["created_tables"] else "done",
+        "status": "awaiting_cleanup" if allowed_created_tables else "done",
         "plan": plan,
         "action_log": session["action_log"],
         "action_count": session["action_count"],
         "remaining_credits": max_actions - session["action_count"],
+        "technical_retries_used": int(session.get("technical_retries", 0) or 0),
+        "max_technical_retries": max_technical_retries,
         "synthesis": synthesis,
-        "created_tables": session["created_tables"],
+        "created_tables": allowed_created_tables,
+        "skipped_non_bot_tables": skipped_non_bot,
         "replan_log": session["replan_log"],
         "question": cleanup_question,
     }
@@ -8800,6 +9433,10 @@ def _run_clickhouse_writer_agent():
         preview_rows = max(1, min(int(params.get("sample_preview", 5)), 20))
     except (TypeError, ValueError):
         preview_rows = 5
+    try:
+        max_technical_retries = max(0, min(int(params.get("max_technical_retries", 3)), 8))
+    except (TypeError, ValueError):
+        max_technical_retries = 3
 
     # ── Session management ────────────────────────────────────────────────
     if not session_id or session_id not in _writer_sessions:
@@ -8812,6 +9449,7 @@ def _run_clickhouse_writer_agent():
             "action_index": 0,
             "action_count": 0,
             "technical_retries": 0,
+            "max_technical_retries": max_technical_retries,
             "action_log": [],
             "created_tables": [],
             "replan_log": [],
@@ -8822,6 +9460,10 @@ def _run_clickhouse_writer_agent():
         _writer_sessions[session_id] = session
     else:
         session = _writer_sessions[session_id]
+    # Keep runtime tunable from the UI on resumed sessions.
+    session["database"] = database
+    session["max_actions"] = max_actions
+    session["max_technical_retries"] = max_technical_retries
 
     status = session["status"]
     user_message = messages[-1]["content"].strip() if messages else ""
@@ -8876,31 +9518,43 @@ def _run_clickhouse_writer_agent():
                               for w in ["oui", "yes", "delete", "supprimer", "ok", "confirme", "1"])
             if affirmative:
                 dropped, errors = [], []
-                for table in list(session["created_tables"]):
+                allowed_tables, skipped_non_bot = _cw_filter_bot_tables(session.get("created_tables", []))
+                for table in allowed_tables:
                     try:
                         client.command(f"DROP TABLE IF EXISTS `{db}`.`{table}`")
                         dropped.append(table)
                     except Exception as exc:
                         errors.append(f"{table}: {str(exc)}")
                 session["status"] = "done"
-                session["created_tables"] = [t for t in session["created_tables"]
-                                              if t not in dropped]
+                session["created_tables"] = [
+                    t for t in allowed_tables
+                    if _cw_normalize_table_name(t) not in dropped
+                ]
                 dropped_txt = ", ".join(dropped) if dropped else "aucune"
                 error_txt = f" (erreurs: {'; '.join(errors)})" if errors else ""
+                skipped_txt = (
+                    f" Tables ignorées (hors BOT_*): {', '.join(skipped_non_bot)}."
+                    if skipped_non_bot else ""
+                )
                 result = {
                     "content": (
-                        f"🗑️ Tables supprimées: {dropped_txt}{error_txt}. "
+                        f"🗑️ Tables supprimées: {dropped_txt}{error_txt}.{skipped_txt} "
                         "La session est terminée."
                     ),
                     "status": "done",
                     "cleanup_done": True,
                     "tables_dropped": dropped,
+                    "skipped_non_bot_tables": skipped_non_bot,
+                    "technical_retries_used": int(session.get("technical_retries", 0) or 0),
+                    "max_technical_retries": int(session.get("max_technical_retries", 3) or 3),
                     "synthesis": session.get("synthesis"),
                     "plan": session.get("plan"),
                     "action_log": session["action_log"],
                 }
             else:
                 session["status"] = "done"
+                kept_tables, _ = _cw_filter_bot_tables(session.get("created_tables", []))
+                session["created_tables"] = kept_tables
                 result = {
                     "content": (
                         "✅ Tables BOT_ conservées. Vous pouvez les utiliser pour des analyses futures. "
@@ -8908,7 +9562,9 @@ def _run_clickhouse_writer_agent():
                     ),
                     "status": "done",
                     "cleanup_done": False,
-                    "created_tables": session["created_tables"],
+                    "created_tables": kept_tables,
+                    "technical_retries_used": int(session.get("technical_retries", 0) or 0),
+                    "max_technical_retries": int(session.get("max_technical_retries", 3) or 3),
                     "synthesis": session.get("synthesis"),
                     "plan": session.get("plan"),
                     "action_log": session["action_log"],
