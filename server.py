@@ -337,6 +337,60 @@ def _chunk_text(text: str, chunk_size: int) -> list:
     return chunks
 
 
+def _get_knowledge_context_by_similarity(query: str, top_k: int = 5) -> str | None:
+    """Embed *query* and return the top-K most relevant knowledge chunks from ES.
+
+    Returns a formatted context string on success, or None when ES is
+    unavailable / not indexed so the caller can fall back gracefully.
+    """
+    try:
+        query_embedding = _get_embedding(query)
+    except Exception:
+        return None  # embedding not configured — skip similarity search
+
+    try:
+        host = rag_config.get("esHost", "http://localhost:9200").rstrip("/")
+        index = rag_config.get("esIndex", "clicksense_rag")
+        auth = None
+        if rag_config.get("esUsername"):
+            auth = (rag_config["esUsername"], rag_config.get("esPassword", ""))
+
+        knn_query = {
+            "knn": {
+                "field": "embedding",
+                "query_vector": query_embedding,
+                "k": top_k,
+                "num_candidates": top_k * 10,
+            },
+            "_source": ["title", "content"],
+        }
+
+        resp = http_requests.post(
+            f"{host}/{index}/_search",
+            auth=auth,
+            json=knn_query,
+            verify=False,
+            timeout=10,
+        )
+
+        if not resp.ok:
+            return None
+
+        hits = resp.json().get("hits", {}).get("hits", [])
+        if not hits:
+            return None
+
+        parts = []
+        for hit in hits:
+            src = hit.get("_source", {})
+            parts.append(f"[{src.get('title', 'Knowledge')}]\n{src.get('content', '')}")
+
+        return "\n\n---\n\n".join(parts)
+
+    except Exception:
+        return None
+
+
 def _ensure_es_index(cfg: dict, dims: int):
     """Create ES index with dense_vector mapping if it doesn't exist."""
     index = cfg.get("esIndex", "clicksense_rag")
@@ -1466,12 +1520,28 @@ def chat():
     # tableMappingFilter: list of technical table names to restrict the schema to
     table_mapping_filter = data.get("tableMappingFilter", [])
 
-    # Build knowledge context from folders
+    # Build knowledge context from folders using similarity search when possible.
+    # Only the most relevant chunks (matched via embedding kNN) are sent to the
+    # LLM instead of the full knowledge base, reducing token usage and noise.
     db = read_db()
     folders = db.get("knowledge_folders", [])
-    knowledge_context = "\n\n".join(
-        f"[{f['title']}]\n{f['content']}" for f in folders if f.get("content")
-    ) or knowledge_base
+
+    # Derive the query text from the last user message for similarity search
+    _user_messages = [m for m in messages if m.get("role") == "user"]
+    _last_user_query = _user_messages[-1]["content"] if _user_messages else ""
+
+    # Attempt similarity search first; fall back to full content if unavailable
+    knowledge_context = None
+    if _last_user_query and folders:
+        knowledge_context = _get_knowledge_context_by_similarity(
+            _last_user_query, top_k=int(rag_config.get("topK", 5))
+        )
+
+    if not knowledge_context:
+        # Fallback: concatenate all folder content (old behaviour)
+        knowledge_context = "\n\n".join(
+            f"[{f['title']}]\n{f['content']}" for f in folders if f.get("content")
+        ) or knowledge_base
 
     # Build a map of technical name -> friendly mapping name
     all_mappings = {m["table_name"]: m["mapping_name"] for m in db.get("table_mappings", [])}
