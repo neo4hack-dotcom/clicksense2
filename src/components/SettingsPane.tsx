@@ -1,14 +1,15 @@
 import { useState, useEffect, useRef } from 'react';
-import { Save, Database, Cpu, CheckCircle2, RefreshCw, Search, AlertCircle, Layers, Download, Upload, Brain } from 'lucide-react';
+import { Save, Database, Cpu, CheckCircle2, RefreshCw, Search, AlertCircle, Layers, Download, Upload, Brain, Plus, X } from 'lucide-react';
 import { useAppStore } from '../store';
 
 export function SettingsPane() {
   const { ragConfig, setRagConfig, agentMaxSteps, setAgentMaxSteps } = useAppStore();
 
   const [config, setConfig] = useState({
-    clickhouse: { host: '', username: '', password: '', database: '' },
+    clickhouse: { host: '', username: '', password: '', databases: ['default'] as string[] },
     llm: { provider: 'ollama', model: '', baseUrl: '', apiKey: '' }
   });
+  const [newDbInput, setNewDbInput] = useState('');
   const [isSaving, setIsSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [models, setModels] = useState<string[]>([]);
@@ -33,8 +34,13 @@ export function SettingsPane() {
     fetch('/api/config')
       .then(res => res.json())
       .then(data => {
+        const ch = data.clickhouseConfig || {};
+        // Derive databases list from response (back-compat: fallback to database string)
+        const databases: string[] = Array.isArray(ch.databases) && ch.databases.length > 0
+          ? ch.databases
+          : ch.database ? [ch.database] : ['default'];
         setConfig({
-          clickhouse: data.clickhouseConfig,
+          clickhouse: { ...ch, databases },
           llm: data.llmConfig
         });
       });
@@ -91,7 +97,10 @@ export function SettingsPane() {
       const res = await fetch('/api/clickhouse/test', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(config.clickhouse),
+        body: JSON.stringify({
+          ...config.clickhouse,
+          database: config.clickhouse.databases[0] || 'default',
+        }),
       });
       const data = await res.json();
       if (data.error) throw new Error(data.error);
@@ -284,9 +293,60 @@ export function SettingsPane() {
             <label className={labelClass}>Host URL</label>
             <input type="text" value={config.clickhouse.host} onChange={e => setConfig({ ...config, clickhouse: { ...config.clickhouse, host: e.target.value } })} className={inputClass} placeholder="http://localhost:8123" />
           </div>
-          <div className="space-y-2">
-            <label className={labelClass}>Database</label>
-            <input type="text" value={config.clickhouse.database} onChange={e => setConfig({ ...config, clickhouse: { ...config.clickhouse, database: e.target.value } })} className={inputClass} placeholder="default" />
+          <div className="space-y-2 col-span-2">
+            <label className={labelClass}>Databases</label>
+            <p className="text-xs text-slate-400">Add one or more databases to expose their tables across the app. Tables will be prefixed with <code>db.</code> when multiple databases are configured.</p>
+            {/* Tags */}
+            <div className="flex flex-wrap gap-2 mb-2">
+              {config.clickhouse.databases.map((db, idx) => (
+                <span key={idx} className="flex items-center gap-1.5 bg-blue-50 text-blue-700 border border-blue-200 rounded-lg px-3 py-1 text-sm font-mono">
+                  {db}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const updated = config.clickhouse.databases.filter((_, i) => i !== idx);
+                      setConfig({ ...config, clickhouse: { ...config.clickhouse, databases: updated.length ? updated : ['default'] } });
+                    }}
+                    className="text-blue-400 hover:text-blue-700 transition-colors"
+                    title="Remove database"
+                  >
+                    <X size={13} />
+                  </button>
+                </span>
+              ))}
+            </div>
+            {/* Add new database */}
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={newDbInput}
+                onChange={e => setNewDbInput(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === 'Enter' && newDbInput.trim()) {
+                    const db = newDbInput.trim();
+                    if (!config.clickhouse.databases.includes(db)) {
+                      setConfig({ ...config, clickhouse: { ...config.clickhouse, databases: [...config.clickhouse.databases, db] } });
+                    }
+                    setNewDbInput('');
+                  }
+                }}
+                className={inputClass}
+                placeholder="Add a database name and press Enter..."
+              />
+              <button
+                type="button"
+                onClick={() => {
+                  const db = newDbInput.trim();
+                  if (db && !config.clickhouse.databases.includes(db)) {
+                    setConfig({ ...config, clickhouse: { ...config.clickhouse, databases: [...config.clickhouse.databases, db] } });
+                  }
+                  setNewDbInput('');
+                }}
+                className="shrink-0 flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2.5 rounded-lg text-sm font-medium transition-colors"
+              >
+                <Plus size={15} /> Add
+              </button>
+            </div>
           </div>
           <div className="space-y-2">
             <label className={labelClass}>Username</label>

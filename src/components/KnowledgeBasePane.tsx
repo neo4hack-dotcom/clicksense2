@@ -501,7 +501,62 @@ interface FkRelationsTabProps {
   setDeletingFkId: (id: number | null) => void;
 }
 
+const DIRECTION_OPTIONS = [
+  { value: 'A → B', label: 'A → B  (FK in Table A references Table B)' },
+  { value: 'B → A', label: 'B → A  (FK in Table B references Table A)' },
+  { value: 'A ↔ B', label: 'A ↔ B  (bidirectional / many-to-many)' },
+];
+
 function FkRelationsTab({ fkRelations, setFkRelations, deletingFkId, setDeletingFkId }: FkRelationsTabProps) {
+  const { schema } = useAppStore();
+
+  // Manual creation form state
+  const [showForm, setShowForm] = useState(false);
+  const [formTableA, setFormTableA] = useState('');
+  const [formFieldA, setFormFieldA] = useState('');
+  const [formTableB, setFormTableB] = useState('');
+  const [formFieldB, setFormFieldB] = useState('');
+  const [formDirection, setFormDirection] = useState('A → B');
+  const [isSaving, setIsSaving] = useState(false);
+
+  const allTables = Object.keys(schema).sort();
+  const columnsA = formTableA ? (schema[formTableA] || []).map(c => c.name) : [];
+  const columnsB = formTableB ? (schema[formTableB] || []).map(c => c.name) : [];
+
+  const resetForm = () => {
+    setFormTableA(''); setFormFieldA('');
+    setFormTableB(''); setFormFieldB('');
+    setFormDirection('A → B');
+    setShowForm(false);
+  };
+
+  const handleCreate = async () => {
+    if (!formTableA || !formFieldA || !formTableB || !formFieldB) return;
+    setIsSaving(true);
+    try {
+      const res = await fetch('/api/fk-relations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          table_a: formTableA,
+          field_a: formFieldA,
+          table_b: formTableB,
+          field_b: formFieldB,
+          direction: formDirection,
+          llm_reason: '',
+        }),
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      setFkRelations([...fkRelations, data]);
+      resetForm();
+    } catch (e: any) {
+      alert(`Failed to create relation: ${e.message}`);
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
   const handleDelete = async (id: number) => {
     if (!confirm('Delete this FK relationship?')) return;
     setDeletingFkId(id);
@@ -515,28 +570,131 @@ function FkRelationsTab({ fkRelations, setFkRelations, deletingFkId, setDeleting
     }
   };
 
-  const CONFIDENCE_COLORS: Record<string, string> = {
-    high: 'bg-emerald-100 text-emerald-700',
-    medium: 'bg-amber-100 text-amber-700',
-    low: 'bg-slate-100 text-slate-500',
-  };
+  const selectClass = "w-full bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-violet-500/20 focus:border-violet-500 transition-all";
 
   return (
     <div>
       <div className="mb-4 flex items-start justify-between">
         <div>
           <p className="text-slate-500 text-sm max-w-2xl">
-            Foreign key relationships identified by the <strong>Key Identifier Agent</strong> and confirmed by you.
+            Foreign key relationships identified by the <strong>Key Identifier Agent</strong> or added manually.
             These relationships are automatically injected into the AI context to improve SQL query generation (JOINs).
           </p>
         </div>
+        <button
+          onClick={() => setShowForm(v => !v)}
+          className="shrink-0 flex items-center gap-2 bg-violet-500 hover:bg-violet-600 text-white px-4 py-2.5 rounded-xl font-medium text-sm transition-colors shadow-sm"
+        >
+          <Plus size={16} />
+          Add manually
+        </button>
       </div>
+
+      {/* Manual creation form */}
+      <AnimatePresence>
+        {showForm && (
+          <motion.div
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -10 }}
+            className="mb-5 bg-white rounded-2xl border-2 border-violet-200 shadow-sm overflow-hidden"
+          >
+            <div className="p-4 border-b border-slate-100 flex items-center justify-between bg-violet-50/50">
+              <div className="flex items-center gap-2 text-violet-700">
+                <GitFork size={17} />
+                <span className="font-semibold text-sm">New FK Relation</span>
+              </div>
+              <button onClick={resetForm} className="text-slate-400 hover:text-slate-600">
+                <X size={16} />
+              </button>
+            </div>
+            <div className="p-4 space-y-4">
+              <div className="grid grid-cols-2 gap-4">
+                {/* Table A */}
+                <div className="space-y-2">
+                  <label className="text-xs font-semibold text-slate-600 uppercase tracking-wide block">Table A <span className="text-violet-500">*</span></label>
+                  <select value={formTableA} onChange={e => { setFormTableA(e.target.value); setFormFieldA(''); }} className={selectClass}>
+                    <option value="">— Select table —</option>
+                    {allTables.map(t => <option key={t} value={t}>{t}</option>)}
+                  </select>
+                </div>
+                {/* Field A */}
+                <div className="space-y-2">
+                  <label className="text-xs font-semibold text-slate-600 uppercase tracking-wide block">Field A <span className="text-violet-500">*</span></label>
+                  <select value={formFieldA} onChange={e => setFormFieldA(e.target.value)} className={selectClass} disabled={!formTableA}>
+                    <option value="">— Select field —</option>
+                    {columnsA.map(c => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                </div>
+                {/* Table B */}
+                <div className="space-y-2">
+                  <label className="text-xs font-semibold text-slate-600 uppercase tracking-wide block">Table B <span className="text-violet-500">*</span></label>
+                  <select value={formTableB} onChange={e => { setFormTableB(e.target.value); setFormFieldB(''); }} className={selectClass}>
+                    <option value="">— Select table —</option>
+                    {allTables.map(t => <option key={t} value={t}>{t}</option>)}
+                  </select>
+                </div>
+                {/* Field B */}
+                <div className="space-y-2">
+                  <label className="text-xs font-semibold text-slate-600 uppercase tracking-wide block">Field B <span className="text-violet-500">*</span></label>
+                  <select value={formFieldB} onChange={e => setFormFieldB(e.target.value)} className={selectClass} disabled={!formTableB}>
+                    <option value="">— Select field —</option>
+                    {columnsB.map(c => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                </div>
+              </div>
+
+              {/* Direction */}
+              <div className="space-y-2">
+                <label className="text-xs font-semibold text-slate-600 uppercase tracking-wide block">Relation direction</label>
+                <div className="flex gap-3">
+                  {DIRECTION_OPTIONS.map(opt => (
+                    <label key={opt.value} className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="radio"
+                        name="fk-direction"
+                        value={opt.value}
+                        checked={formDirection === opt.value}
+                        onChange={() => setFormDirection(opt.value)}
+                        className="accent-violet-600"
+                      />
+                      <span className="text-sm text-slate-700">{opt.label}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              {/* Preview */}
+              {formTableA && formFieldA && formTableB && formFieldB && (
+                <div className="flex items-center gap-2 p-3 bg-slate-50 rounded-xl border border-slate-100 text-sm font-mono">
+                  <span className="text-slate-800 font-semibold">{formTableA}.<span className="text-violet-600">{formFieldA}</span></span>
+                  <ArrowRight size={14} className="text-slate-400" />
+                  <span className="text-slate-800 font-semibold">{formTableB}.<span className="text-emerald-600">{formFieldB}</span></span>
+                  <span className="ml-2 text-xs text-slate-400 font-sans">({formDirection})</span>
+                </div>
+              )}
+
+              <div className="flex justify-end gap-2">
+                <button onClick={resetForm} className="px-4 py-2 text-sm text-slate-600 hover:bg-slate-100 rounded-lg transition-colors">Cancel</button>
+                <button
+                  onClick={handleCreate}
+                  disabled={isSaving || !formTableA || !formFieldA || !formTableB || !formFieldB}
+                  className="flex items-center gap-2 bg-violet-500 hover:bg-violet-600 disabled:opacity-50 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+                >
+                  <Save size={14} />
+                  {isSaving ? 'Saving...' : 'Add relation'}
+                </button>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {fkRelations.length === 0 ? (
         <div className="flex flex-col items-center justify-center h-48 text-slate-400 bg-white rounded-2xl border border-dashed border-slate-200">
           <GitFork size={36} className="mb-3 opacity-20" />
           <p className="text-sm font-medium">No FK relationships registered.</p>
-          <p className="text-xs mt-1 text-slate-400">Run the <strong>Key Identifier Agent</strong> from the Agents tab to discover relationships.</p>
+          <p className="text-xs mt-1 text-slate-400">Run the <strong>Key Identifier Agent</strong> or add one manually.</p>
         </div>
       ) : (
         <div className="space-y-2">
@@ -593,8 +751,8 @@ function FkRelationsTab({ fkRelations, setFkRelations, deletingFkId, setDeleting
 
       <div className="mt-4 p-3 bg-violet-50 border border-violet-100 rounded-xl text-xs text-violet-700">
         <strong>How does it work?</strong> The Key Identifier Agent analyzes your tables, samples up to 5 values per candidate field,
-        then uses the local LLM to identify FK↔PK matches. You confirm the relationships from the Agents tab
-        — they appear here and automatically enrich SQL generation.
+        then uses the local LLM to identify FK↔PK matches. You can also add relationships manually above.
+        All relations are automatically injected into the AI context to improve SQL JOIN generation.
       </div>
     </div>
   );

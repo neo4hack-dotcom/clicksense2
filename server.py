@@ -126,6 +126,7 @@ clickhouse_config = {
     "username": os.environ.get("CLICKHOUSE_USER", "default"),
     "password": os.environ.get("CLICKHOUSE_PASSWORD", ""),
     "database": os.environ.get("CLICKHOUSE_DB", "default"),
+    "databases": [os.environ.get("CLICKHOUSE_DB", "default")],
 }
 
 llm_config = {
@@ -758,8 +759,12 @@ def _call_llm(system_prompt: str, messages: list, temperature: float = 0.7,
 # ---------------------------------------------------------------------------
 @app.route("/api/config", methods=["GET"])
 def get_config():
+    cfg = dict(clickhouse_config)
+    # Always expose databases as a list (back-compat: derive from database if missing)
+    if not cfg.get("databases"):
+        cfg["databases"] = [cfg.get("database", "default")]
     return jsonify({
-        "clickhouseConfig": clickhouse_config,
+        "clickhouseConfig": cfg,
         "llmConfig": llm_config,
         "knowledgeBase": knowledge_base,
     })
@@ -770,7 +775,17 @@ def update_config():
     global clickhouse_config, llm_config, knowledge_base
     data = request.get_json()
     if data.get("clickhouse"):
-        clickhouse_config.update(data["clickhouse"])
+        ch = data["clickhouse"]
+        clickhouse_config.update(ch)
+        # Sync: if databases list provided, keep database = databases[0]
+        if ch.get("databases") and isinstance(ch["databases"], list):
+            dbs = [d.strip() for d in ch["databases"] if d.strip()]
+            if dbs:
+                clickhouse_config["databases"] = dbs
+                clickhouse_config["database"] = dbs[0]
+        # If only database string provided (old clients), sync databases list
+        elif ch.get("database") and not ch.get("databases"):
+            clickhouse_config["databases"] = [ch["database"]]
     if data.get("llm"):
         llm_config.update(data["llm"])
     if "knowledge" in data:
@@ -1017,11 +1032,14 @@ Instructions:
 def test_clickhouse():
     data = request.get_json()
     try:
+        # Support both databases[] and legacy database field
+        databases = data.get("databases") or []
+        db = databases[0].strip() if databases else data.get("database", "default")
         client = get_clickhouse_client({
             "host": data["host"],
             "username": data["username"],
             "password": data["password"],
-            "database": data["database"],
+            "database": db,
         })
         client.query("SELECT 1")
         return jsonify({"success": True})
@@ -1131,18 +1149,30 @@ def get_llm_models():
 def get_schema():
     try:
         client = get_clickhouse_client()
+        # Resolve the list of databases to expose
+        databases = clickhouse_config.get("databases") or []
+        if not databases:
+            databases = [clickhouse_config.get("database", "default")]
+        databases = [d.strip() for d in databases if d.strip()]
+        if not databases:
+            databases = ["default"]
+
+        multi_db = len(databases) > 1
+        dbs_in = ", ".join(f"'{d}'" for d in databases)
         result = client.query(
-            "SELECT table, name, type FROM system.columns"
-            " WHERE database = currentDatabase()"
-            " ORDER BY table, name"
+            f"SELECT database, table, name, type FROM system.columns"
+            f" WHERE database IN ({dbs_in})"
+            f" ORDER BY database, table, name"
         )
         rows = _rows_to_dicts(result)
         schema: dict = {}
         for row in rows:
+            db_name = row["database"]
             tbl = row["table"]
-            if tbl not in schema:
-                schema[tbl] = []
-            schema[tbl].append({"name": row["name"], "type": row["type"]})
+            key = f"{db_name}.{tbl}" if multi_db else tbl
+            if key not in schema:
+                schema[key] = []
+            schema[key].append({"name": row["name"], "type": row["type"]})
         return jsonify({"schema": schema})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
@@ -2944,6 +2974,12 @@ def import_config():
 
     if "clickhouseConfig" in data:
         clickhouse_config.update(data["clickhouseConfig"])
+        # Sync database with databases[0] if databases list is present
+        if data["clickhouseConfig"].get("databases"):
+            dbs = [d.strip() for d in data["clickhouseConfig"]["databases"] if d.strip()]
+            if dbs:
+                clickhouse_config["databases"] = dbs
+                clickhouse_config["database"] = dbs[0]
     if "llmConfig" in data:
         llm_config.update(data["llmConfig"])
     if "ragConfig" in data:
