@@ -1677,7 +1677,7 @@ export function ChatPane() {
           <span className="text-xs text-slate-500">Use knowledge base</span>
         </label>
         <button
-          onClick={handleAgentSend}
+          onClick={() => handleAgentSend()}
           disabled={!input.trim() || isLoading || isAgentLoading}
           className={clsx(
             "w-full flex items-center justify-center gap-2 py-2 px-4 rounded-full text-sm font-medium transition-all shadow-sm border",
