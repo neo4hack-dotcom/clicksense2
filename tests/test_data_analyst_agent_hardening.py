@@ -38,6 +38,18 @@ class _FailUnknownTableClient:
         raise Exception("Unknown table 'missing_table'")
 
 
+class _LargeRowsClient:
+    def query(self, sql, settings=None):
+        _ = sql
+        _ = settings
+        rows = [(i % 11, float(i) * 1.5, f"seg_{i % 5}") for i in range(600)]
+        return _FakeResult(rows=rows, cols=["client_id", "amount", "segment"])
+
+    def command(self, sql):
+        _ = sql
+        return None
+
+
 @pytest.fixture(autouse=True)
 def _reset_model_cache():
     server._model_context_cache.clear()
@@ -395,3 +407,38 @@ def test_data_analyst_compose_question_trims_memory_and_notes():
     }
     heavy_combined = server._da_compose_question(heavy_session, question)
     assert len(heavy_combined) <= 600
+
+
+def test_execute_sql_guarded_condenses_large_result_sets():
+    out = server._execute_sql_guarded(
+        "SELECT client_id, amount, segment FROM big_table",
+        read_only=True,
+        client=_LargeRowsClient(),
+    )
+    assert out["ok"] is True
+    assert out["total_rows"] == 600
+    assert "Condensed summary applied for token safety." in out["summary"]
+    assert "Descriptive stats computed on a" in out["summary"]
+
+
+def test_resolve_sql_memory_placeholders_supports_last_alias_and_unknown_refs():
+    memory = {
+        "artifacts": {
+            "step1": {"id_sets": {"client_id": [101, 202, 303]}},
+        },
+        "order": ["step1"],
+    }
+    sql = (
+        "SELECT * FROM sales "
+        "WHERE client_id IN ({{step1.client_id}}) "
+        "OR client_id IN ({{last.client_id}})"
+    )
+    resolved = server._resolve_sql_memory_placeholders(sql, memory)
+    assert "{{" not in resolved
+    assert "101, 202, 303" in resolved
+
+    with pytest.raises(ValueError):
+        server._resolve_sql_memory_placeholders(
+            "SELECT * FROM sales WHERE client_id IN ({{step99.client_id}})",
+            memory,
+        )

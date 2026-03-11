@@ -1114,6 +1114,198 @@ def _normalize_sql_fingerprint(sql: str) -> str:
     return raw
 
 
+_MEMORY_SQL_PLACEHOLDER_RE = re.compile(r"\{\{\s*([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\s*\}\}")
+
+
+def _sql_literal(value) -> str:
+    """Serialize a primitive Python value into a safe SQL literal."""
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, (int, float)):
+        return str(value)
+    txt = str(value).replace("\\", "\\\\").replace("'", "''")
+    return f"'{txt}'"
+
+
+def _coerce_float(value):
+    """Best-effort numeric coercion for descriptive summaries."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return float(int(value))
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        txt = value.strip()
+        if not txt:
+            return None
+        if re.fullmatch(r"-?\d+(?:\.\d+)?", txt):
+            try:
+                return float(txt)
+            except Exception:
+                return None
+    return None
+
+
+def _build_query_result_summary(
+    rows: list,
+    columns: list,
+    preview_rows: list,
+    *,
+    large_result_threshold: int = 250,
+) -> str:
+    """Return a compact query summary; auto-condense large datasets."""
+    total_rows = len(rows)
+    safe_columns = list(columns or [])
+    if total_rows <= large_result_threshold:
+        sample_lines = [
+            ", ".join(str(r.get(c, "")) for c in safe_columns)
+            for r in preview_rows[:10]
+        ]
+        return (
+            f"{total_rows} row(s) returned. Columns: {safe_columns}."
+            + (f"\nSample:\n{chr(10).join(sample_lines)}" if sample_lines else "")
+        )
+
+    inspected = rows[: min(total_rows, 300)]
+    lines = [
+        f"{total_rows} row(s) returned. Condensed summary applied for token safety.",
+        f"Columns: {safe_columns}.",
+        f"Descriptive stats computed on a {len(inspected)}-row analysis window.",
+    ]
+
+    for col in safe_columns[:8]:
+        vals = []
+        for row in inspected:
+            if not isinstance(row, dict):
+                continue
+            val = row.get(col)
+            if val is None:
+                continue
+            if isinstance(val, str) and not val.strip():
+                continue
+            vals.append(val)
+        if not vals:
+            continue
+
+        numeric_vals = [v for v in (_coerce_float(vv) for vv in vals) if v is not None]
+        numeric_coverage = len(numeric_vals) / max(1, len(vals))
+        if numeric_coverage >= 0.8 and len(numeric_vals) >= 2:
+            n_min = min(numeric_vals)
+            n_max = max(numeric_vals)
+            n_avg = sum(numeric_vals) / len(numeric_vals)
+            lines.append(
+                f"- {col}: min={n_min:.4g}, max={n_max:.4g}, avg={n_avg:.4g} "
+                f"(sample n={len(numeric_vals)})."
+            )
+            continue
+
+        uniq_all = set()
+        examples = []
+        for val in vals:
+            txt = str(val).strip()
+            if not txt:
+                continue
+            uniq_all.add(txt)
+            if len(examples) < 4 and txt not in examples:
+                examples.append(txt[:36])
+        lines.append(
+            f"- {col}: non-null sample={len(vals)}, approx unique(sample)={len(uniq_all)}, "
+            f"examples={'; '.join(examples) if examples else 'n/a'}."
+        )
+
+    return "\n".join(lines[:14])
+
+
+def _extract_intermediate_id_sets(
+    rows: list,
+    columns: list,
+    *,
+    max_scan_rows: int = 800,
+    max_values_per_set: int = 200,
+) -> dict:
+    """Extract reusable ID lists from a query result for multi-hop retrieval."""
+    if not rows or not columns:
+        return {}
+    out = {}
+    for col in columns:
+        col_name = str(col or "").strip()
+        if not col_name:
+            continue
+        lower = col_name.lower()
+        if lower != "id" and not lower.endswith("_id"):
+            continue
+
+        vals = []
+        seen = set()
+        for row in rows[:max_scan_rows]:
+            if not isinstance(row, dict):
+                continue
+            value = row.get(col_name)
+            if value is None:
+                continue
+            if isinstance(value, str):
+                value = value.strip()
+                if not value:
+                    continue
+            if isinstance(value, (list, tuple, dict, set)):
+                continue
+            fp = f"{type(value).__name__}:{value}"
+            if fp in seen:
+                continue
+            seen.add(fp)
+            vals.append(value)
+            if len(vals) >= max_values_per_set:
+                break
+        if vals:
+            out[col_name] = vals
+    return out
+
+
+def _resolve_sql_memory_placeholders(sql: str, working_memory: dict | None) -> str:
+    """Resolve placeholders like {{step1.client_id}} or {{last.order_id}}."""
+    raw = (sql or "").strip()
+    if not raw or "{{" not in raw:
+        return raw
+
+    memory = working_memory or {}
+    artifacts = memory.get("artifacts") or {}
+    order = memory.get("order") or []
+
+    def _replace(match: re.Match) -> str:
+        artifact_ref = str(match.group(1) or "").strip()
+        field_ref = str(match.group(2) or "").strip()
+        if not artifact_ref or not field_ref:
+            raise ValueError("Invalid working-memory placeholder.")
+
+        target_key = artifact_ref
+        if artifact_ref.lower() == "last":
+            if not order:
+                raise ValueError("Placeholder {{last.*}} used but working memory is empty.")
+            target_key = str(order[-1])
+
+        artifact = artifacts.get(target_key)
+        if not isinstance(artifact, dict):
+            raise ValueError(f"Unknown working-memory artifact '{artifact_ref}'.")
+
+        id_sets = artifact.get("id_sets") or {}
+        values = id_sets.get(field_ref)
+        if values is None:
+            for k, v in id_sets.items():
+                if str(k).lower() == field_ref.lower():
+                    values = v
+                    break
+        if not isinstance(values, list) or not values:
+            raise ValueError(f"No stored values for placeholder '{artifact_ref}.{field_ref}'.")
+
+        literals = ", ".join(_sql_literal(v) for v in values[:200])
+        return literals or "NULL"
+
+    return _MEMORY_SQL_PLACEHOLDER_RE.sub(_replace, raw)
+
+
 def _force_limit_for_retry(sql: str, preferred_limit: int = 200, hard_cap: int = 5000) -> str:
     """Force a bounded LIMIT in retries to reduce timeout/memory failures."""
     statement = (sql or "").strip().rstrip(";")
@@ -1301,14 +1493,7 @@ def _execute_sql_guarded(
             rows = _rows_to_dicts(result)
             preview = rows[:max_preview_rows]
             columns = list(preview[0].keys()) if preview else list(result.column_names or [])
-            sample_lines = [
-                ", ".join(str(r.get(c, "")) for c in columns)
-                for r in preview[:10]
-            ]
-            summary = (
-                f"{len(rows)} row(s) returned. Columns: {columns}."
-                + (f"\nSample:\n{chr(10).join(sample_lines)}" if sample_lines else "")
-            )
+            summary = _build_query_result_summary(rows, columns, preview)
             return {
                 "ok": True,
                 "sql": sql,
@@ -3332,6 +3517,55 @@ Requirements:
     midcourse_review_done = False
     midcourse_guidance = ""
     force_finish_now = False
+    # Transient per-run working memory for multi-hop retrieval.
+    working_memory = {"artifacts": {}, "order": []}
+
+    def _working_memory_snapshot(max_items: int = 4) -> str:
+        order = working_memory.get("order") or []
+        artifacts = working_memory.get("artifacts") or {}
+        if not order:
+            return "No reusable intermediate memory yet."
+        lines = []
+        for key in order[-max_items:]:
+            artifact = artifacts.get(key) or {}
+            id_sets = artifact.get("id_sets") or {}
+            if id_sets:
+                id_desc = ", ".join(
+                    f"{name}({len(vals)})"
+                    for name, vals in list(id_sets.items())[:5]
+                )
+            else:
+                id_desc = "none"
+            lines.append(
+                f"- {key}: rows={artifact.get('row_count', 0)}, "
+                f"columns={len(artifact.get('columns', []))}, id_sets={id_desc}"
+            )
+        return "\n".join(lines)
+
+    def _update_working_memory(step_number: int, sql_text: str, exec_result: dict) -> None:
+        if not exec_result.get("ok"):
+            return
+        rows = exec_result.get("rows") or []
+        cols = exec_result.get("columns") or []
+        if not rows or not cols:
+            return
+        id_sets = _extract_intermediate_id_sets(rows, cols, max_scan_rows=800, max_values_per_set=200)
+        artifact_key = f"step{step_number}"
+        artifacts = working_memory.setdefault("artifacts", {})
+        order = working_memory.setdefault("order", [])
+        artifacts[artifact_key] = {
+            "step": step_number,
+            "sql": str(exec_result.get("normalized_sql") or sql_text or "")[:380],
+            "row_count": int(exec_result.get("total_rows", 0) or 0),
+            "columns": list(cols)[:14],
+            "id_sets": id_sets,
+        }
+        if artifact_key in order:
+            order.remove(artifact_key)
+        order.append(artifact_key)
+        while len(order) > 12:
+            old = order.pop(0)
+            artifacts.pop(old, None)
 
     def _search_knowledge_for_agent(query: str) -> str:
         """Search the knowledge base (ES RAG) for context relevant to the query.
@@ -3453,6 +3687,7 @@ Your goal is to answer the user's question by executing a sequence of targeted a
 You may run up to {MAX_AGENT_STEPS} distinct actions in total. Each action must bring NEW information.
 After gathering enough evidence you MUST produce a final answer.
 """
+        working_memory_block = _working_memory_snapshot(max_items=5)
         static_footer = f"""
 
 CLICKHOUSE INSTRUCTIONS:
@@ -3461,6 +3696,7 @@ CLICKHOUSE INSTRUCTIONS:
 - Avoid advanced/specialized functions: windowFunnel, retention, sequenceMatch, argMax, topK, uniqHLL12, quantiles*, JSONExtract*, sumIf, countIf.
 - SQL MUST remain read-only in this agent: SELECT/SHOW/DESCRIBE/EXPLAIN/WITH only.
 - Always write highly optimised SQL with LIMIT <= 5000.
+- For exploratory steps, default to LIMIT 200 unless a broader scan is strictly required.
 - Each query must explore a genuinely distinct angle (different aggregation, filter, dimension, or sub-question).
 - Do not repeat the same SQL logic twice.
 - Emit exactly one SQL statement (no semicolon-separated batch).
@@ -3472,6 +3708,19 @@ DATE HANDLING — CRITICAL:
 - NEVER use date extraction/transformation functions for filtering: no year(), month(), toYear(), toMonth(), date_trunc(), toStartOf*().
 - NEVER use >, <, >=, <= with date literals.
 - If the user asks a relative period, translate it to explicit literal dates and use BETWEEN.
+
+REACT DISCIPLINE:
+- Think before acting: each step MUST contain a clear reasoning thought before the action.
+- For action "query", explicitly include a hypothesis and expected signal before SQL execution.
+- If the previous query failed or was weak, first explain how the next action corrects trajectory.
+
+WORKING MEMORY (TRANSIENT, FOR MULTI-HOP RETRIEVAL):
+{working_memory_block}
+- You may reuse stored ID sets with SQL placeholders (best used inside IN (...)):
+  `{{{{step1.client_id}}}}`
+  `{{{{last.order_id}}}}`  (last = most recent successful SQL step)
+- Placeholders expand to a bounded list (max 200 values).
+- If no suitable memory set exists, run a query first to create it.
 
 CURRENT ANALYSIS PROGRESS ({effective_used}/{MAX_AGENT_STEPS} steps used):
 {steps_context if steps_context else "None yet — this is the first step."}
@@ -3664,6 +3913,7 @@ Allowed JSON:
             max_steps=8,
             max_result_chars=220,
         )
+        working_memory_block = _working_memory_snapshot(max_items=4)
         if no_prompt_context_injection:
             retry_context_note = (
                 "No static schema/metadata/knowledge context is available in this run. "
@@ -3697,6 +3947,10 @@ ISSUE DETAIL:
 
 PREVIOUS STEPS FOR CONTEXT:
 {steps_context if steps_context else "None yet."}
+
+TRANSIENT WORKING MEMORY:
+{working_memory_block}
+You can reference stored IDs with placeholders like `{{{{step1.client_id}}}}` or `{{{{last.order_id}}}}`.
 
 RULES:
 - Read-only SQL only: SELECT/SHOW/DESCRIBE/EXPLAIN/WITH.
@@ -3739,7 +3993,7 @@ Respond ONLY with valid JSON (no markdown):
             enforce_simple_compat=True,
             max_preview_rows=max_rows,
             max_execution_time=15,
-            default_limit=1000,
+            default_limit=500,
             hard_limit_cap=5000,
             client=agent_client,
         )
@@ -3842,8 +4096,24 @@ Respond ONLY with valid JSON (no markdown):
                     technical_retries_used += 1
 
                     if alt_sql and steps:
-                        query_attempts_used += 1
-                        alt_result = _execute_and_summarise(alt_sql)
+                        resolved_alt_sql = alt_sql
+                        alt_resolution_error = ""
+                        try:
+                            resolved_alt_sql = _resolve_sql_memory_placeholders(alt_sql, working_memory)
+                        except Exception as mem_exc:
+                            alt_resolution_error = str(mem_exc)
+
+                        if alt_resolution_error:
+                            alt_result = {
+                                "ok": False,
+                                "normalized_sql": alt_sql.strip(),
+                                "total_rows": 0,
+                                "summary": f"Query blocked before execution: {alt_resolution_error}",
+                                "error_class": "memory_reference",
+                            }
+                        else:
+                            query_attempts_used += 1
+                            alt_result = _execute_and_summarise(resolved_alt_sql)
                         alt_norm = (alt_result.get("normalized_sql") or alt_sql).strip()
                         alt_fp = _normalize_sql_fingerprint(alt_norm)
                         is_dup = bool(alt_fp and alt_fp in seen_query_fingerprints)
@@ -3878,6 +4148,11 @@ Respond ONLY with valid JSON (no markdown):
                                     steps[:-1],
                                     score,
                                 )
+                            _update_working_memory(
+                                int(steps[-1].get("step", used_steps) or used_steps),
+                                alt_norm,
+                                alt_result,
+                            )
                         else:
                             steps[-1]["result_summary"] += (
                                 f" | Corrective retry failed ({retry_mode}): {alt_result['summary']}"
@@ -3909,12 +4184,29 @@ Respond ONLY with valid JSON (no markdown):
 
             if action == "query":
                 used_steps += 1
-                sql = decision.get("sql", "").strip()
+                sql_template = decision.get("sql", "").strip()
                 hypothesis = str(decision.get("hypothesis", "")).strip()[:220]
                 expected_signal = str(decision.get("expected_signal", "")).strip()[:220]
-                query_attempts_used += 1
-                exec_result = _execute_and_summarise(sql)
-                normalized_sql = (exec_result.get("normalized_sql") or sql).strip()
+                resolved_sql = sql_template
+                resolution_error = ""
+                try:
+                    resolved_sql = _resolve_sql_memory_placeholders(sql_template, working_memory)
+                except Exception as mem_exc:
+                    resolution_error = str(mem_exc)
+
+                if resolution_error:
+                    exec_result = {
+                        "ok": False,
+                        "normalized_sql": sql_template,
+                        "total_rows": 0,
+                        "summary": f"Query blocked before execution: {resolution_error}",
+                        "error_class": "memory_reference",
+                    }
+                else:
+                    query_attempts_used += 1
+                    exec_result = _execute_and_summarise(resolved_sql)
+
+                normalized_sql = (exec_result.get("normalized_sql") or resolved_sql or sql_template).strip()
                 normalized_fp = _normalize_sql_fingerprint(normalized_sql)
 
                 # Prevent pointless loops on repeated queries.
@@ -3942,6 +4234,8 @@ Respond ONLY with valid JSON (no markdown):
                     "error_class": exec_result.get("error_class", ""),
                     "technical_retry_used": False,
                 }
+                if sql_template and sql_template != normalized_sql:
+                    step_entry["sql_template"] = sql_template
                 step_entry["self_evaluation"] = _agent_self_evaluate(step_entry, used_steps)
                 if isinstance(step_entry.get("self_evaluation"), dict):
                     step_entry["confidence_delta"] = _compute_confidence_delta(
@@ -3953,10 +4247,12 @@ Respond ONLY with valid JSON (no markdown):
                         f"\nSelf-evaluation: {step_entry['self_evaluation']['reason']}"
                     )
                 steps.append(step_entry)
+                if exec_result["ok"]:
+                    _update_working_memory(used_steps, normalized_sql, exec_result)
 
                 if not exec_result["ok"]:
                     retry_pending = {
-                        "failed_sql": normalized_sql or sql,
+                        "failed_sql": normalized_sql or sql_template,
                         "error": exec_result["summary"],
                         "error_class": exec_result.get("error_class", ""),
                         "playbook_attempted": False,
