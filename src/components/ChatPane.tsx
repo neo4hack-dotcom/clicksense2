@@ -667,6 +667,7 @@ export function ChatPane() {
 
   const [input, setInput] = useState('');
   const [useKnowledgeBase, setUseKnowledgeBase] = useState(true);
+  const [useKnowledgeAgentMode, setUseKnowledgeAgentMode] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [isAgentLoading, setIsAgentLoading] = useState(false);
   const [expandedSteps, setExpandedSteps] = useState<Record<number, boolean>>({});
@@ -776,7 +777,7 @@ export function ChatPane() {
         tableMappingFilter: selectedTableMappings,
         maxSteps: agentMaxSteps,
         use_knowledge_base: useKnowledgeBase,
-        use_knowledge_agent: useKnowledgeBase,
+        use_knowledge_agent: useKnowledgeAgentMode,
       };
       if (confirmedTables && confirmedTables.length > 0) {
         body.confirmedTables = confirmedTables;
@@ -823,7 +824,10 @@ export function ChatPane() {
       const res = await fetch('/api/query', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: sql }),
+        body: JSON.stringify({
+          query: sql,
+          enforce_simple_compat: true,
+        }),
       });
       const data = await res.json();
       if (data.error) {
@@ -1677,6 +1681,17 @@ export function ChatPane() {
             className="w-3.5 h-3.5 rounded accent-emerald-500 cursor-pointer"
           />
           <span className="text-xs text-slate-500">Use knowledge base</span>
+        </label>
+        <label className="flex items-center gap-2 cursor-pointer select-none w-fit">
+          <input
+            type="checkbox"
+            checked={useKnowledgeAgentMode}
+            onChange={(e) => setUseKnowledgeAgentMode(e.target.checked)}
+            className="w-3.5 h-3.5 rounded accent-indigo-500 cursor-pointer"
+          />
+          <span className="text-xs text-slate-500">
+            Use knowledge agent mode (no static schema/metadata injection)
+          </span>
         </label>
         <button
           onClick={() => handleAgentSend()}
