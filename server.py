@@ -3076,6 +3076,76 @@ Réponds UNIQUEMENT avec du JSON valide (sans markdown) :
     return {"tables": [], "needs_selection": True, "candidates": all_table_names}
 
 
+_KNOWLEDGE_MODE_CONTEXT_ONCE = "kb_context_once"
+_KNOWLEDGE_MODE_AGENTIC = "kb_agentic"
+_KNOWLEDGE_MODE_SCHEMA_ONLY = "schema_only"
+_KNOWLEDGE_MODE_MINIMAL = "minimal"
+
+
+def _coerce_bool_any(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "oui"}
+    return bool(value)
+
+
+def _normalize_knowledge_mode(raw_mode) -> str:
+    txt = str(raw_mode or "").strip().lower()
+    aliases = {
+        _KNOWLEDGE_MODE_CONTEXT_ONCE: _KNOWLEDGE_MODE_CONTEXT_ONCE,
+        "context_once": _KNOWLEDGE_MODE_CONTEXT_ONCE,
+        "default": _KNOWLEDGE_MODE_CONTEXT_ONCE,
+        "standard": _KNOWLEDGE_MODE_CONTEXT_ONCE,
+        _KNOWLEDGE_MODE_AGENTIC: _KNOWLEDGE_MODE_AGENTIC,
+        "agentic": _KNOWLEDGE_MODE_AGENTIC,
+        "knowledge_agent": _KNOWLEDGE_MODE_AGENTIC,
+        _KNOWLEDGE_MODE_SCHEMA_ONLY: _KNOWLEDGE_MODE_SCHEMA_ONLY,
+        "schema_only_no_kb": _KNOWLEDGE_MODE_SCHEMA_ONLY,
+        "no_kb_schema": _KNOWLEDGE_MODE_SCHEMA_ONLY,
+        _KNOWLEDGE_MODE_MINIMAL: _KNOWLEDGE_MODE_MINIMAL,
+        "minimal_no_context": _KNOWLEDGE_MODE_MINIMAL,
+        "no_kb_no_context": _KNOWLEDGE_MODE_MINIMAL,
+    }
+    return aliases.get(txt, "")
+
+
+def _resolve_knowledge_mode_flags(
+    *,
+    knowledge_mode_raw,
+    use_knowledge_base_raw,
+    use_knowledge_agent_raw,
+) -> tuple[str, bool, bool]:
+    mode = _normalize_knowledge_mode(knowledge_mode_raw)
+    if not mode:
+        use_knowledge_base = _coerce_bool_any(use_knowledge_base_raw, True)
+        use_knowledge_agent = _coerce_bool_any(use_knowledge_agent_raw, False)
+        if use_knowledge_base and not use_knowledge_agent:
+            mode = _KNOWLEDGE_MODE_CONTEXT_ONCE
+        elif use_knowledge_base and use_knowledge_agent:
+            mode = _KNOWLEDGE_MODE_AGENTIC
+        elif (not use_knowledge_base) and (not use_knowledge_agent):
+            mode = _KNOWLEDGE_MODE_SCHEMA_ONLY
+        else:
+            mode = _KNOWLEDGE_MODE_MINIMAL
+
+    mapping = {
+        _KNOWLEDGE_MODE_CONTEXT_ONCE: (True, False),
+        _KNOWLEDGE_MODE_AGENTIC: (True, True),
+        _KNOWLEDGE_MODE_SCHEMA_ONLY: (False, False),
+        _KNOWLEDGE_MODE_MINIMAL: (False, True),
+    }
+    use_knowledge_base, use_knowledge_agent = mapping.get(
+        mode,
+        mapping[_KNOWLEDGE_MODE_CONTEXT_ONCE],
+    )
+    return mode, use_knowledge_base, use_knowledge_agent
+
+
 @app.route("/api/agent", methods=["POST"])
 def agent_analysis():
     """Orchestrated multi-step analysis: the LLM autonomously decides which
@@ -3097,24 +3167,12 @@ def agent_analysis():
     table_mapping_filter = data.get("tableMappingFilter", [])
     # Tables explicitly confirmed by the user via the selection UI (skips auto-identification)
     confirmed_tables = data.get("confirmedTables", [])
-    # Chat UI flags (robust parsing for bool/string/int payloads)
-    def _as_bool(value, default: bool = False) -> bool:
-        if value is None:
-            return default
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, (int, float)):
-            return bool(value)
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "on"}
-        return bool(value)
-
-    use_knowledge_base = _as_bool(data.get("use_knowledge_base", True), True)
-    # "knowledge agent" mode: do not inject static context in prompts.
-    use_knowledge_agent = _as_bool(
-        data.get("use_knowledge_agent", data.get("useKnowledgeAgent", False)),
-        False,
+    knowledge_mode, use_knowledge_base, use_knowledge_agent = _resolve_knowledge_mode_flags(
+        knowledge_mode_raw=data.get("knowledge_mode", data.get("knowledgeMode", "")),
+        use_knowledge_base_raw=data.get("use_knowledge_base", True),
+        use_knowledge_agent_raw=data.get("use_knowledge_agent", data.get("useKnowledgeAgent", False)),
     )
+    # "knowledge agent" mode: do not inject static context in prompts.
     no_prompt_context_injection = use_knowledge_agent
     control_session_id = str(data.get("control_session_id", "")).strip()
 
@@ -4038,6 +4096,7 @@ Respond ONLY with valid JSON (no markdown):
                     "current_plan": current_plan_steps,
                     "midcourse_review": midcourse_review or {},
                     "no_prompt_context_injection": bool(no_prompt_context_injection),
+                    "knowledge_mode": knowledge_mode,
                     "interrupted": True,
                     "interrupt_reason": interrupt_reason,
                 })
@@ -4328,6 +4387,7 @@ Respond ONLY with valid JSON (no markdown):
             "current_plan": current_plan_steps,
             "midcourse_review": midcourse_review or {},
             "no_prompt_context_injection": bool(no_prompt_context_injection),
+            "knowledge_mode": knowledge_mode,
         })
 
     except Exception as exc:
@@ -5212,10 +5272,16 @@ def _da_parse_table_filter(raw_value) -> list:
 
 def _da_normalize_params(raw_params: dict | None) -> dict:
     params = raw_params or {}
+    knowledge_mode, use_knowledge_base, use_knowledge_agent = _resolve_knowledge_mode_flags(
+        knowledge_mode_raw=params.get("knowledge_mode", params.get("knowledgeMode", "")),
+        use_knowledge_base_raw=params.get("use_knowledge_base", "yes"),
+        use_knowledge_agent_raw=params.get("use_knowledge_agent", "no"),
+    )
     return {
         "max_steps": _da_coerce_int(params.get("max_steps", 8), 8, 1, 50),
-        "use_knowledge_base": _da_coerce_bool(params.get("use_knowledge_base", "yes"), True),
-        "use_knowledge_agent": _da_coerce_bool(params.get("use_knowledge_agent", "no"), False),
+        "knowledge_mode": knowledge_mode,
+        "use_knowledge_base": use_knowledge_base,
+        "use_knowledge_agent": use_knowledge_agent,
         "memory_turn_limit": _da_coerce_int(params.get("memory_turn_limit", 8), 8, 2, 24),
         "memory_token_budget": _da_coerce_int(params.get("memory_token_budget", 700), 700, 120, 2400),
         "auto_run": _da_coerce_bool(params.get("auto_run", "yes"), True),
@@ -5471,6 +5537,7 @@ def _da_worker_loop(session_id: str, run_seq: int) -> None:
             "tableMetadata": table_metadata,
             "tableMappingFilter": table_filter,
             "maxSteps": _da_coerce_int(params.get("max_steps", 8), 8, 1, 50),
+            "knowledge_mode": str(params.get("knowledge_mode", _KNOWLEDGE_MODE_CONTEXT_ONCE)),
             "use_knowledge_base": _da_coerce_bool(params.get("use_knowledge_base", True), True),
             "use_knowledge_agent": _da_coerce_bool(params.get("use_knowledge_agent", False), False),
             "control_session_id": session_id,
@@ -5517,6 +5584,7 @@ def _da_worker_loop(session_id: str, run_seq: int) -> None:
                     "current_plan": result.get("current_plan", []),
                     "midcourse_review": result.get("midcourse_review", {}),
                     "no_prompt_context_injection": bool(result.get("no_prompt_context_injection", False)),
+                    "knowledge_mode": str(result.get("knowledge_mode", params.get("knowledge_mode", _KNOWLEDGE_MODE_CONTEXT_ONCE))),
                     "interrupted": interrupted,
                     "interrupt_reason": interrupt_reason,
                 }
@@ -7306,20 +7374,12 @@ AGENTS_CATALOG = [
                 "description": "Crédit de steps par run (1-50). Les retries techniques gratuits restent plafonnés globalement.",
             },
             {
-                "name": "use_knowledge_base",
-                "label": "Use knowledge base",
+                "name": "knowledge_mode",
+                "label": "Knowledge strategy",
                 "type": "select",
-                "options": ["yes", "no"],
-                "default": "yes",
-                "description": "Active la recherche de contexte métier via la base de connaissance.",
-            },
-            {
-                "name": "use_knowledge_agent",
-                "label": "Knowledge agent mode",
-                "type": "select",
-                "options": ["no", "yes"],
-                "default": "no",
-                "description": "Si 'yes': aucune injection statique schéma/métadonnées/KB dans les prompts.",
+                "options": ["kb_context_once", "kb_agentic", "schema_only", "minimal"],
+                "default": "kb_context_once",
+                "description": "Choix unique (4 modes) pour contrôler l'usage KB et l'injection de contexte.",
             },
             {
                 "name": "memory_turn_limit",

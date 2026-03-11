@@ -103,6 +103,27 @@ def _base_agent_payload(**overrides):
     return payload
 
 
+@pytest.mark.parametrize(
+    "knowledge_mode_raw,use_kb_raw,use_agent_raw,expected",
+    [
+        ("kb_context_once", True, False, ("kb_context_once", True, False)),
+        ("kb_agentic", True, False, ("kb_agentic", True, True)),
+        ("schema_only", True, True, ("schema_only", False, False)),
+        ("minimal", True, False, ("minimal", False, True)),
+        ("", False, True, ("minimal", False, True)),
+    ],
+)
+def test_resolve_knowledge_mode_flags_supports_unified_modes(
+    knowledge_mode_raw, use_kb_raw, use_agent_raw, expected
+):
+    resolved = server._resolve_knowledge_mode_flags(
+        knowledge_mode_raw=knowledge_mode_raw,
+        use_knowledge_base_raw=use_kb_raw,
+        use_knowledge_agent_raw=use_agent_raw,
+    )
+    assert resolved == expected
+
+
 def test_agent_retry_budget_caps_total_attempts(client, monkeypatch):
     monkeypatch.setattr(server, "get_clickhouse_client", lambda: _FailUnknownTableClient())
 

@@ -11,6 +11,12 @@ import {
 import clsx from 'clsx';
 import { useAppStore } from '../store';
 import { DataQualityPane } from './DataQualityPane';
+import {
+  KNOWLEDGE_MODE_OPTIONS,
+  knowledgeModeDescription,
+  knowledgeModeLabel,
+  normalizeKnowledgeMode,
+} from '../knowledgeMode';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -226,6 +232,7 @@ interface AnalystResult {
     should_finish_early?: boolean;
     source?: string;
   };
+  knowledge_mode?: string;
   no_prompt_context_injection?: boolean;
   interrupted?: boolean;
   interrupt_reason?: string;
@@ -332,6 +339,17 @@ interface ChatMessage {
   agent_kind?: 'analyst' | 'wrangling';
   analyst_runtime_status?: string;
   analyst_memory_summary?: string;
+}
+
+function isKnowledgeModeParam(paramName: string): boolean {
+  return paramName === 'knowledge_mode';
+}
+
+function getParamOptionLabel(paramName: string, optionValue: string): string {
+  if (isKnowledgeModeParam(paramName)) {
+    return knowledgeModeLabel(optionValue);
+  }
+  return optionValue;
 }
 
 // ── Data Dictionary Sub-components ─────────────────────────────────────────
@@ -2439,6 +2457,9 @@ function AnalystMessageView({ msg }: { msg: ChatMessage }) {
   const result = msg.analyst_result;
   if (!result) return null;
   const interrupted = !!result.interrupted;
+  const knowledgeMode = normalizeKnowledgeMode(
+    result.knowledge_mode || (result.no_prompt_context_injection ? 'kb_agentic' : 'kb_context_once'),
+  );
   return (
     <div className="mt-3 space-y-3">
       <div className={clsx(
@@ -2457,11 +2478,9 @@ function AnalystMessageView({ msg }: { msg: ChatMessage }) {
           <span className="px-2 py-1 rounded-full border bg-white text-slate-700 border-slate-200">
             {result.technical_retries_used} free retries used
           </span>
-          {result.no_prompt_context_injection && (
-            <span className="px-2 py-1 rounded-full border bg-violet-50 text-violet-700 border-violet-200">
-              Knowledge agent mode
-            </span>
-          )}
+          <span className="px-2 py-1 rounded-full border bg-violet-50 text-violet-700 border-violet-200">
+            {knowledgeModeLabel(knowledgeMode)}
+          </span>
           {interrupted && (
             <span className="px-2 py-1 rounded-full border bg-amber-100 text-amber-800 border-amber-300">
               Interrupted ({result.interrupt_reason || 'manual'})
@@ -3352,44 +3371,57 @@ export function AgentsPane() {
               {showParams && (
                 <div className="px-6 pb-4">
                   <div className="grid grid-cols-2 gap-x-6 gap-y-3">
-                    {selectedAgent.parameters.map((p) => (
-                      <div key={p.name}>
-                        <label className="text-xs font-semibold text-slate-600 mb-1 flex items-center gap-1.5">
-                          {p.label}
-                          {isAnalyst && (
-                            <span title={p.description}>
-                              <Info size={12} className="text-sky-400" />
-                            </span>
+                    {selectedAgent.parameters.map((p) => {
+                      const selectOptions = isKnowledgeModeParam(p.name)
+                        ? KNOWLEDGE_MODE_OPTIONS.map((opt) => opt.value)
+                        : (p.options || []);
+                      const selectValue = isKnowledgeModeParam(p.name)
+                        ? normalizeKnowledgeMode(params[p.name] ?? p.default)
+                        : String(params[p.name] ?? p.default ?? '');
+                      return (
+                        <div key={p.name}>
+                          <label className="text-xs font-semibold text-slate-600 mb-1 flex items-center gap-1.5">
+                            {p.label}
+                            {isAnalyst && (
+                              <span title={p.description}>
+                                <Info size={12} className="text-sky-400" />
+                              </span>
+                            )}
+                          </label>
+                          {p.type === 'select' ? (
+                            <select
+                              value={selectValue}
+                              onChange={(e) => setParam(p.name, e.target.value)}
+                              className={clsx(
+                                'w-full px-3 py-1.5 text-xs border rounded-lg bg-white focus:outline-none focus:ring-2 focus:border-transparent',
+                                isAnalyst ? 'border-sky-200 focus:ring-sky-400' : 'border-slate-200 focus:ring-emerald-400',
+                              )}
+                            >
+                              {selectOptions.map((opt) => (
+                                <option key={opt} value={opt}>{getParamOptionLabel(p.name, opt)}</option>
+                              ))}
+                            </select>
+                          ) : (
+                            <input
+                              type={p.type === 'number' ? 'number' : 'text'}
+                              value={params[p.name] as string}
+                              onChange={(e) => setParam(p.name, p.type === 'number' ? Number(e.target.value) : e.target.value)}
+                              placeholder={p.description}
+                              className={clsx(
+                                'w-full px-3 py-1.5 text-xs border rounded-lg bg-white focus:outline-none focus:ring-2 focus:border-transparent',
+                                isAnalyst ? 'border-sky-200 focus:ring-sky-400' : 'border-slate-200 focus:ring-emerald-400',
+                              )}
+                            />
                           )}
-                        </label>
-                        {p.type === 'select' ? (
-                          <select
-                            value={params[p.name] as string}
-                            onChange={(e) => setParam(p.name, e.target.value)}
-                            className={clsx(
-                              'w-full px-3 py-1.5 text-xs border rounded-lg bg-white focus:outline-none focus:ring-2 focus:border-transparent',
-                              isAnalyst ? 'border-sky-200 focus:ring-sky-400' : 'border-slate-200 focus:ring-emerald-400',
-                            )}
-                          >
-                            {p.options?.map((opt) => (
-                              <option key={opt} value={opt}>{opt}</option>
-                            ))}
-                          </select>
-                        ) : (
-                          <input
-                            type={p.type === 'number' ? 'number' : 'text'}
-                            value={params[p.name] as string}
-                            onChange={(e) => setParam(p.name, p.type === 'number' ? Number(e.target.value) : e.target.value)}
-                            placeholder={p.description}
-                            className={clsx(
-                              'w-full px-3 py-1.5 text-xs border rounded-lg bg-white focus:outline-none focus:ring-2 focus:border-transparent',
-                              isAnalyst ? 'border-sky-200 focus:ring-sky-400' : 'border-slate-200 focus:ring-emerald-400',
-                            )}
-                          />
-                        )}
-                        <p className="text-[10px] text-slate-400 mt-0.5">{p.description}</p>
-                      </div>
-                    ))}
+                          <p className="text-[10px] text-slate-400 mt-0.5">{p.description}</p>
+                          {isKnowledgeModeParam(p.name) && (
+                            <p className="text-[10px] text-indigo-500 mt-1">
+                              {knowledgeModeDescription(selectValue)}
+                            </p>
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
                   {isAnalyst && (
                     <div className="mt-3 rounded-xl border border-sky-200 bg-sky-50 p-3 text-xs text-slate-600">
