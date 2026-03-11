@@ -666,6 +666,7 @@ export function ChatPane() {
   const [historyOpen, setHistoryOpen] = useState(false);
 
   const [input, setInput] = useState('');
+  const [useKnowledgeBase, setUseKnowledgeBase] = useState(true);
   const [isLoading, setIsLoading] = useState(false);
   const [isAgentLoading, setIsAgentLoading] = useState(false);
   const [expandedSteps, setExpandedSteps] = useState<Record<number, boolean>>({});
@@ -717,6 +718,7 @@ export function ChatPane() {
           tableMetadata,
           tableMappingFilter: selectedTableMappings,
           conversation_id: chatConversationId,
+          use_knowledge_base: useKnowledgeBase,
         }),
       });
 
@@ -1665,6 +1667,15 @@ export function ChatPane() {
             <Send size={16} />
           </button>
         </div>
+        <label className="flex items-center gap-2 cursor-pointer select-none w-fit">
+          <input
+            type="checkbox"
+            checked={useKnowledgeBase}
+            onChange={(e) => setUseKnowledgeBase(e.target.checked)}
+            className="w-3.5 h-3.5 rounded accent-emerald-500 cursor-pointer"
+          />
+          <span className="text-xs text-slate-500">Use knowledge base</span>
+        </label>
         <button
           onClick={handleAgentSend}
           disabled={!input.trim() || isLoading || isAgentLoading}

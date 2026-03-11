@@ -1519,6 +1519,8 @@ def chat():
     table_metadata = data.get("tableMetadata", {})
     # tableMappingFilter: list of technical table names to restrict the schema to
     table_mapping_filter = data.get("tableMappingFilter", [])
+    # use_knowledge_base: when False, skip knowledge context entirely
+    use_knowledge_base = data.get("use_knowledge_base", True)
 
     # Build knowledge context from folders using similarity search when possible.
     # Only the most relevant chunks (matched via embedding kNN) are sent to the
@@ -1526,22 +1528,25 @@ def chat():
     db = read_db()
     folders = db.get("knowledge_folders", [])
 
-    # Derive the query text from the last user message for similarity search
-    _user_messages = [m for m in messages if m.get("role") == "user"]
-    _last_user_query = _user_messages[-1]["content"] if _user_messages else ""
+    if not use_knowledge_base:
+        knowledge_context = ""
+    else:
+        # Derive the query text from the last user message for similarity search
+        _user_messages = [m for m in messages if m.get("role") == "user"]
+        _last_user_query = _user_messages[-1]["content"] if _user_messages else ""
 
-    # Attempt similarity search first; fall back to full content if unavailable
-    knowledge_context = None
-    if _last_user_query and folders:
-        knowledge_context = _get_knowledge_context_by_similarity(
-            _last_user_query, top_k=int(rag_config.get("topK", 5))
-        )
+        # Attempt similarity search first; fall back to full content if unavailable
+        knowledge_context = None
+        if _last_user_query and folders:
+            knowledge_context = _get_knowledge_context_by_similarity(
+                _last_user_query, top_k=int(rag_config.get("topK", 5))
+            )
 
-    if not knowledge_context:
-        # Fallback: concatenate all folder content (old behaviour)
-        knowledge_context = "\n\n".join(
-            f"[{f['title']}]\n{f['content']}" for f in folders if f.get("content")
-        ) or knowledge_base
+        if not knowledge_context:
+            # Fallback: concatenate all folder content (old behaviour)
+            knowledge_context = "\n\n".join(
+                f"[{f['title']}]\n{f['content']}" for f in folders if f.get("content")
+            ) or knowledge_base
 
     # Build a map of technical name -> friendly mapping name
     all_mappings = {m["table_name"]: m["mapping_name"] for m in db.get("table_mappings", [])}
@@ -1665,6 +1670,19 @@ Do not include markdown formatting. Just the raw JSON.
         schema, table_metadata, knowledge_context, base_tokens
     )
 
+    # Build optional knowledge base block for the system prompt
+    if knowledge_context:
+        _kb_block = f"""Here is the functional knowledge base:
+{knowledge_context}
+
+KNOWLEDGE BASE — CRITICAL:
+Before generating SQL or asking for clarification, you MUST consult the functional knowledge base above.
+If the knowledge base contains a definition or mapping for a concept mentioned by the user
+(e.g., "a trade corresponds to a row in table toto"), use that information directly to build the SQL.
+Do NOT ask for clarification on a concept that is already explained in the knowledge base."""
+    else:
+        _kb_block = ""
+
     system_prompt = f"""You are an expert ClickHouse data analyst and a proactive guide.
 Your goal is to help the user query their database by asking smart clarifying questions BEFORE generating SQL.
 
@@ -1678,14 +1696,7 @@ Here is the table metadata (functional descriptions):
 
 {fk_context}
 
-Here is the functional knowledge base:
-{knowledge_context}
-
-KNOWLEDGE BASE — CRITICAL:
-Before generating SQL or asking for clarification, you MUST consult the functional knowledge base above.
-If the knowledge base contains a definition or mapping for a concept mentioned by the user
-(e.g., "a trade corresponds to a row in table toto"), use that information directly to build the SQL.
-Do NOT ask for clarification on a concept that is already explained in the knowledge base.
+{_kb_block}
 
 PROACTIVE CLARIFICATION — CRITICAL:
 You must ask for clarification in ALL of these situations. Prefer asking over guessing.
