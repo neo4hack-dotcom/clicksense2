@@ -41,8 +41,12 @@ class _FailUnknownTableClient:
 @pytest.fixture(autouse=True)
 def _reset_model_cache():
     server._model_context_cache.clear()
+    with server._data_analyst_sessions_lock:
+        server._data_analyst_sessions.clear()
     yield
     server._model_context_cache.clear()
+    with server._data_analyst_sessions_lock:
+        server._data_analyst_sessions.clear()
 
 
 @pytest.fixture()
@@ -297,3 +301,97 @@ def test_api_query_can_enforce_simple_compat(client, monkeypatch):
     assert resp.status_code == 500
     payload = resp.get_json()
     assert payload["error_class"] == "simple_compat"
+
+
+def test_data_analyst_session_queue_when_auto_run_disabled(client):
+    resp = client.post(
+        "/api/agents/ai-data-analyst/chat",
+        json={
+            "messages": [{"role": "user", "content": "Analyse revenue by week"}],
+            "params": {"auto_run": "no", "max_steps": 4},
+        },
+    )
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["session_id"]
+    assert payload["running"] is False
+    assert payload["pending_user_inputs"] == 1
+    assert "Message queued. Click Run to start." in payload["content"]
+
+
+def test_data_analyst_session_pause_note_then_resume(client, monkeypatch):
+    status_resp = client.post(
+        "/api/agents/ai-data-analyst/chat",
+        json={"control": "status", "params": {"auto_run": "yes"}},
+    )
+    assert status_resp.status_code == 200
+    session_id = status_resp.get_json()["session_id"]
+
+    pause_resp = client.post(
+        "/api/agents/ai-data-analyst/chat",
+        json={"control": "pause", "session_id": session_id, "params": {"auto_run": "yes"}},
+    )
+    assert pause_resp.status_code == 200
+    assert pause_resp.get_json()["status"] == "paused"
+
+    note_text = "Use only the B2B segment and keep date filter explicit."
+    note_resp = client.post(
+        "/api/agents/ai-data-analyst/chat",
+        json={
+            "session_id": session_id,
+            "messages": [{"role": "user", "content": note_text}],
+            "params": {"auto_run": "yes", "memory_token_budget": 240},
+        },
+    )
+    assert note_resp.status_code == 200
+    note_payload = note_resp.get_json()
+    assert note_payload["pending_user_inputs"] == 0
+    assert "Context saved (paused)" in note_payload["content"]
+    assert note_text[:20] in note_payload["memory_summary"]
+
+    started = {"count": 0}
+
+    def _fake_start_worker(session):
+        started["count"] += 1
+        session["running"] = True
+        session["status"] = "running"
+        return True
+
+    monkeypatch.setattr(server, "_da_start_worker_if_needed", _fake_start_worker)
+
+    resume_resp = client.post(
+        "/api/agents/ai-data-analyst/chat",
+        json={
+            "control": "resume",
+            "session_id": session_id,
+            "messages": [{"role": "user", "content": "Now compute monthly churn for 2025"}],
+            "params": {"auto_run": "yes"},
+        },
+    )
+    assert resume_resp.status_code == 200
+    resume_payload = resume_resp.get_json()
+    assert started["count"] == 1
+    assert resume_payload["status"] == "running"
+    assert "Session resumed. Agent run started." in resume_payload["content"]
+
+
+def test_data_analyst_compose_question_trims_memory_and_notes():
+    session = {
+        "params": {"memory_token_budget": 260, "memory_turn_limit": 8},
+        "memory_summary": "Recent discussion summary: conversion impacted by channel mix.",
+        "paused_notes": ["note_1", "note_2", "note_3", "note_4", "note_5"],
+    }
+    question = "What changed in conversion rate this month compared to the previous one?"
+    combined = server._da_compose_question(session, question)
+    assert combined.startswith("What changed in conversion rate")
+    assert "note_1" not in combined
+    assert "note_2" not in combined
+    assert "note_5" in combined
+
+    heavy_session = {
+        "params": {"memory_token_budget": 120, "memory_turn_limit": 8},
+        "memory_summary": "A" * 6000,
+        "paused_notes": [],
+    }
+    heavy_combined = server._da_compose_question(heavy_session, question)
+    assert len(heavy_combined) <= 600

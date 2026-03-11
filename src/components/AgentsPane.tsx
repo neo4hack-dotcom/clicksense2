@@ -5,7 +5,8 @@ import {
   MessageSquare, Play, RefreshCw, Zap, AlertTriangle, Info,
   RotateCcw, Trash2, BookOpen, TrendingUp, Star, Code2, Download,
   GitFork, ArrowRight, ArrowLeftRight, ThumbsUp, ThumbsDown,
-  FolderOpen, Upload, Layers, Calculator, ShieldCheck,
+  FolderOpen, Upload, Layers, Calculator, ShieldCheck, PauseCircle,
+  Square, Activity, Sparkles,
 } from 'lucide-react';
 import clsx from 'clsx';
 import { useAppStore } from '../store';
@@ -187,6 +188,74 @@ interface EtlSynthesis {
   next_steps: string[];
 }
 
+// ── AI Data Analyst Session Types ────────────────────────────────────────────
+
+interface AnalystStepEval {
+  status?: string;
+  score?: number;
+  reason?: string;
+}
+
+interface AnalystStep {
+  step: number;
+  type: string;
+  reasoning: string;
+  hypothesis?: string;
+  expected_signal?: string;
+  sql?: string | null;
+  result_summary?: string;
+  row_count?: number;
+  ok?: boolean;
+  error_class?: string;
+  confidence_delta?: number;
+  self_evaluation?: AnalystStepEval;
+}
+
+interface AnalystResult {
+  final_answer: string;
+  steps: AnalystStep[];
+  total_steps: number;
+  technical_retries_used: number;
+  query_attempts_used: number;
+  max_total_query_attempts: number;
+  initial_plan: string[];
+  current_plan: string[];
+  midcourse_review?: {
+    judgement?: string;
+    guidance?: string;
+    should_finish_early?: boolean;
+    source?: string;
+  };
+  no_prompt_context_injection?: boolean;
+  interrupted?: boolean;
+  interrupt_reason?: string;
+}
+
+interface AnalystRuntimeEvent {
+  seq: number;
+  ts: string;
+  level: 'info' | 'warn' | 'error';
+  kind: string;
+  message: string;
+}
+
+interface AnalystRuntimeState {
+  status: string;
+  running: boolean;
+  pause_requested: boolean;
+  stop_requested: boolean;
+  pending_user_inputs: number;
+  memory_summary: string;
+  event_log: AnalystRuntimeEvent[];
+  response_seq: number;
+  latest_assistant?: {
+    content: string;
+    analyst_result?: AnalystResult | null;
+    error?: string;
+  } | null;
+  last_result?: AnalystResult | null;
+}
+
 interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
@@ -219,30 +288,40 @@ interface ChatMessage {
   etl_synthesis?: EtlSynthesis;
   // Optional suggestions (non-blocking)
   optional_suggestions?: { label: string; value: string }[];
+  // AI Data Analyst session fields
+  analyst_result?: AnalystResult;
+  analyst_runtime_status?: string;
+  analyst_memory_summary?: string;
 }
 
 // ── Data Dictionary Sub-components ─────────────────────────────────────────
 
 function AgentCard({ agent, selected, onClick }: { agent: Agent; selected: boolean; onClick: () => void }) {
+  const isAnalyst = agent.id === 'ai-data-analyst';
   const isWriter = agent.id === 'clickhouse-writer';
   const isKeyId = agent.id === 'key-identifier';
   const isEtl = agent.id === 'etl-agent';
 
-  const iconEl = isWriter ? <Zap size={16} /> : isKeyId ? <GitFork size={16} /> : isEtl ? <Upload size={16} /> : <Cpu size={16} />;
+  const iconEl = isAnalyst ? <Activity size={16} /> : isWriter ? <Zap size={16} /> : isKeyId ? <GitFork size={16} /> : isEtl ? <Upload size={16} /> : <Cpu size={16} />;
 
-  const selectedBg = isWriter ? 'border-violet-500 bg-violet-500/10'
+  const selectedBg = isAnalyst ? 'border-sky-500 bg-sky-500/10'
+    : isWriter ? 'border-violet-500 bg-violet-500/10'
     : isKeyId ? 'border-indigo-500 bg-indigo-500/10'
     : isEtl ? 'border-orange-500 bg-orange-500/10'
     : 'border-emerald-500 bg-emerald-500/10';
-  const hoverBg = isWriter ? 'hover:border-violet-300' : isKeyId ? 'hover:border-indigo-300'
+  const hoverBg = isAnalyst ? 'hover:border-sky-300'
+    : isWriter ? 'hover:border-violet-300' : isKeyId ? 'hover:border-indigo-300'
     : isEtl ? 'hover:border-orange-300' : 'hover:border-emerald-300';
-  const iconSelected = isWriter ? 'bg-violet-500 text-white' : isKeyId ? 'bg-indigo-500 text-white'
+  const iconSelected = isAnalyst ? 'bg-sky-500 text-white'
+    : isWriter ? 'bg-violet-500 text-white' : isKeyId ? 'bg-indigo-500 text-white'
     : isEtl ? 'bg-orange-500 text-white' : 'bg-emerald-500 text-white';
-  const iconHover = isWriter ? 'group-hover:bg-violet-100 group-hover:text-violet-600'
+  const iconHover = isAnalyst ? 'group-hover:bg-sky-100 group-hover:text-sky-600'
+    : isWriter ? 'group-hover:bg-violet-100 group-hover:text-violet-600'
     : isKeyId ? 'group-hover:bg-indigo-100 group-hover:text-indigo-600'
     : isEtl ? 'group-hover:bg-orange-100 group-hover:text-orange-600'
     : 'group-hover:bg-emerald-100 group-hover:text-emerald-600';
-  const textColor = isWriter ? 'text-violet-700' : isKeyId ? 'text-indigo-700'
+  const textColor = isAnalyst ? 'text-sky-700'
+    : isWriter ? 'text-violet-700' : isKeyId ? 'text-indigo-700'
     : isEtl ? 'text-orange-700' : 'text-emerald-700';
 
   return (
@@ -2238,6 +2317,230 @@ function EtlMessageView({
   );
 }
 
+function AnalystStepsView({ steps }: { steps: AnalystStep[] }) {
+  const [open, setOpen] = useState(false);
+  if (!steps || steps.length === 0) return null;
+  return (
+    <div className="mt-3 border border-sky-200 rounded-xl overflow-hidden bg-sky-50/40">
+      <button
+        onClick={() => setOpen(v => !v)}
+        className="w-full px-3 py-2 text-xs font-semibold text-sky-700 flex items-center gap-2 hover:bg-sky-100/70 transition-colors"
+      >
+        {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+        <Activity size={13} />
+        SQL execution trace ({steps.length} step{steps.length > 1 ? 's' : ''})
+      </button>
+      {open && (
+        <div className="max-h-72 overflow-y-auto divide-y divide-sky-100 bg-white">
+          {steps.map((s, idx) => (
+            <div key={`${s.step}-${idx}`} className="p-3 text-xs space-y-1.5">
+              <div className="flex items-center gap-2">
+                <span className="font-semibold text-slate-700">Step {s.step}</span>
+                <span className={clsx(
+                  'px-1.5 py-0.5 rounded-full text-[10px] border',
+                  s.ok
+                    ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                    : 'bg-red-50 text-red-700 border-red-200',
+                )}>
+                  {s.ok ? 'OK' : 'FAIL'}
+                </span>
+                {typeof s.confidence_delta === 'number' && (
+                  <span className={clsx(
+                    'px-1.5 py-0.5 rounded-full text-[10px] border',
+                    s.confidence_delta >= 0
+                      ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                      : 'bg-amber-50 text-amber-700 border-amber-200',
+                  )}>
+                    Δ confidence {s.confidence_delta >= 0 ? '+' : ''}{s.confidence_delta}
+                  </span>
+                )}
+              </div>
+              {s.reasoning && (
+                <p className="text-slate-600"><span className="font-medium">Reasoning:</span> {s.reasoning}</p>
+              )}
+              {s.hypothesis && (
+                <p className="text-slate-600"><span className="font-medium">Hypothesis:</span> {s.hypothesis}</p>
+              )}
+              {s.expected_signal && (
+                <p className="text-slate-600"><span className="font-medium">Expected signal:</span> {s.expected_signal}</p>
+              )}
+              {s.sql && (
+                <pre className="mt-1 bg-slate-900 text-slate-100 rounded-lg p-2 overflow-x-auto text-[10px] leading-relaxed">
+                  {s.sql}
+                </pre>
+              )}
+              {s.result_summary && (
+                <p className="text-slate-600 whitespace-pre-wrap">
+                  <span className="font-medium">Result:</span> {s.result_summary}
+                </p>
+              )}
+              {s.self_evaluation?.reason && (
+                <p className="text-slate-500">
+                  <span className="font-medium">Self-eval:</span> {s.self_evaluation.reason}
+                </p>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AnalystMessageView({ msg }: { msg: ChatMessage }) {
+  const result = msg.analyst_result;
+  if (!result) return null;
+  const interrupted = !!result.interrupted;
+  return (
+    <div className="mt-3 space-y-3">
+      <div className={clsx(
+        'rounded-xl border p-3',
+        interrupted
+          ? 'bg-amber-50 border-amber-200'
+          : 'bg-sky-50 border-sky-200',
+      )}>
+        <div className="flex flex-wrap items-center gap-2 text-[11px]">
+          <span className="px-2 py-1 rounded-full border bg-white text-slate-700 border-slate-200">
+            {result.total_steps} step{result.total_steps > 1 ? 's' : ''}
+          </span>
+          <span className="px-2 py-1 rounded-full border bg-white text-slate-700 border-slate-200">
+            {result.query_attempts_used}/{result.max_total_query_attempts} query attempts
+          </span>
+          <span className="px-2 py-1 rounded-full border bg-white text-slate-700 border-slate-200">
+            {result.technical_retries_used} free retries used
+          </span>
+          {result.no_prompt_context_injection && (
+            <span className="px-2 py-1 rounded-full border bg-violet-50 text-violet-700 border-violet-200">
+              Knowledge agent mode
+            </span>
+          )}
+          {interrupted && (
+            <span className="px-2 py-1 rounded-full border bg-amber-100 text-amber-800 border-amber-300">
+              Interrupted ({result.interrupt_reason || 'manual'})
+            </span>
+          )}
+        </div>
+        {result.midcourse_review?.guidance && (
+          <p className="mt-2 text-xs text-slate-600">
+            <span className="font-semibold">Mid-course guidance:</span> {result.midcourse_review.guidance}
+          </p>
+        )}
+      </div>
+
+      {(result.initial_plan?.length || result.current_plan?.length) ? (
+        <div className="grid grid-cols-2 gap-2 text-xs">
+          <div className="bg-white border border-slate-200 rounded-xl p-3">
+            <p className="font-semibold text-slate-700 mb-2">Initial plan</p>
+            <div className="space-y-1 text-slate-600">
+              {(result.initial_plan || []).slice(0, 5).map((p, i) => (
+                <p key={`ip-${i}`}>{i + 1}. {p}</p>
+              ))}
+            </div>
+          </div>
+          <div className="bg-white border border-slate-200 rounded-xl p-3">
+            <p className="font-semibold text-slate-700 mb-2">Current plan</p>
+            <div className="space-y-1 text-slate-600">
+              {(result.current_plan || []).slice(0, 5).map((p, i) => (
+                <p key={`cp-${i}`}>{i + 1}. {p}</p>
+              ))}
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      <AnalystStepsView steps={result.steps || []} />
+    </div>
+  );
+}
+
+function AnalystRuntimePanel({
+  runtime,
+  showPanel,
+  onToggle,
+}: {
+  runtime: AnalystRuntimeState | null;
+  showPanel: boolean;
+  onToggle: () => void;
+}) {
+  if (!runtime) return null;
+  return (
+    <div className={clsx(
+      'border-l border-slate-200 bg-white transition-all duration-200',
+      showPanel ? 'w-[340px]' : 'w-[46px]',
+    )}>
+      <div className="h-full flex flex-col">
+        <button
+          onClick={onToggle}
+          className="h-11 px-3 border-b border-slate-100 text-xs font-semibold text-slate-600 hover:bg-slate-50 transition-colors flex items-center gap-2"
+          title="Toggle runtime panel"
+        >
+          <Sparkles size={14} className="text-sky-500" />
+          {showPanel && <span>Session Runtime</span>}
+        </button>
+
+        {showPanel && (
+          <>
+            <div className="p-3 border-b border-slate-100 space-y-2">
+              <div className="flex items-center gap-2 text-xs">
+                <span className={clsx(
+                  'px-2 py-1 rounded-full border',
+                  runtime.running
+                    ? 'bg-sky-50 text-sky-700 border-sky-200'
+                    : runtime.status === 'paused'
+                      ? 'bg-amber-50 text-amber-700 border-amber-200'
+                      : runtime.status === 'error'
+                        ? 'bg-red-50 text-red-700 border-red-200'
+                        : 'bg-slate-50 text-slate-700 border-slate-200',
+                )}>
+                  Status: {runtime.status}
+                </span>
+                <span className="px-2 py-1 rounded-full border bg-slate-50 text-slate-700 border-slate-200">
+                  Pending: {runtime.pending_user_inputs}
+                </span>
+              </div>
+              <div>
+                <p className="text-[10px] uppercase tracking-wide text-slate-400 mb-1">
+                  Compact memory
+                </p>
+                <div className="text-[11px] text-slate-600 bg-slate-50 border border-slate-200 rounded-lg p-2 max-h-24 overflow-y-auto whitespace-pre-wrap">
+                  {runtime.memory_summary || 'No memory yet.'}
+                </div>
+              </div>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-3 space-y-2 bg-slate-50">
+              <p className="text-[10px] uppercase tracking-wide text-slate-400">Live event log</p>
+              {runtime.event_log.length === 0 ? (
+                <p className="text-xs text-slate-400">No runtime events yet.</p>
+              ) : (
+                runtime.event_log.slice(-160).map((evt) => (
+                  <div key={evt.seq} className="rounded-lg border border-slate-200 bg-white p-2 text-[11px]">
+                    <div className="flex items-center gap-2 mb-1">
+                      <span className={clsx(
+                        'px-1.5 py-0.5 rounded border text-[10px]',
+                        evt.level === 'error'
+                          ? 'bg-red-50 text-red-700 border-red-200'
+                          : evt.level === 'warn'
+                            ? 'bg-amber-50 text-amber-700 border-amber-200'
+                            : 'bg-sky-50 text-sky-700 border-sky-200',
+                      )}>
+                        {evt.level}
+                      </span>
+                      <span className="text-slate-400">{new Date(evt.ts).toLocaleTimeString()}</span>
+                      <span className="ml-auto text-slate-400">{evt.kind}</span>
+                    </div>
+                    <p className="text-slate-700 whitespace-pre-wrap">{evt.message}</p>
+                  </div>
+                ))
+              )}
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── Generic AssistantMessage ────────────────────────────────────────────────
 
 function AssistantMessage({
@@ -2262,8 +2565,9 @@ function AssistantMessage({
     );
   }
 
+  const isAnalyst = !!msg.analyst_result;
   const isWriter = !!(msg.plan || msg.action_log || msg.synthesis
-    || (msg.question && !msg.etl_plan && !msg.files_found) || (msg.status && !msg.etl_plan && !msg.files_found));
+    || (msg.question && !msg.etl_plan && !msg.files_found) || (msg.status && !msg.etl_plan && !msg.files_found)) && !isAnalyst;
   const isKeyId = msg.suggestions !== undefined;
   const isEtl = !!(msg.files_found || msg.etl_plan || msg.etl_action_log || msg.etl_synthesis
     || (msg.status && (msg.files_found || msg.etl_plan)));
@@ -2272,9 +2576,11 @@ function AssistantMessage({
     <div className="flex gap-3 justify-start">
       <div className={clsx(
         'p-2 rounded-full flex-shrink-0 self-start mt-1',
-        isWriter ? 'bg-violet-100' : isKeyId ? 'bg-indigo-100' : isEtl ? 'bg-orange-100' : 'bg-emerald-100',
+        isAnalyst ? 'bg-sky-100' : isWriter ? 'bg-violet-100' : isKeyId ? 'bg-indigo-100' : isEtl ? 'bg-orange-100' : 'bg-emerald-100',
       )}>
-        {isWriter
+        {isAnalyst
+          ? <Activity size={14} className="text-sky-600" />
+          : isWriter
           ? <Zap size={14} className="text-violet-600" />
           : isKeyId
             ? <GitFork size={14} className="text-indigo-600" />
@@ -2285,7 +2591,8 @@ function AssistantMessage({
       <div className="flex-1 max-w-full overflow-hidden">
         <div className={clsx(
           'border rounded-xl px-4 py-3 shadow-sm',
-          isWriter ? 'bg-white border-violet-100'
+          isAnalyst ? 'bg-white border-sky-100'
+            : isWriter ? 'bg-white border-violet-100'
             : isKeyId ? 'bg-white border-indigo-100'
             : isEtl ? 'bg-white border-orange-100'
             : 'bg-white border-slate-200',
@@ -2315,6 +2622,14 @@ function AssistantMessage({
               <Database size={13} className="text-orange-500" />
               <span className="text-xs text-orange-700 font-medium">
                 {msg.created_tables.length} BOT_ETL_ table{msg.created_tables.length > 1 ? 's' : ''} created
+              </span>
+            </div>
+          )}
+          {isAnalyst && msg.analyst_runtime_status && (
+            <div className="flex items-center gap-2 mt-2">
+              <Activity size={13} className="text-sky-500" />
+              <span className="text-xs text-sky-700 font-medium">
+                Session status: {msg.analyst_runtime_status}
               </span>
             </div>
           )}
@@ -2364,6 +2679,11 @@ function AssistantMessage({
         {isEtl && (
           <EtlMessageView msg={msg} onChoice={onChoice} isLast={isLast} />
         )}
+
+        {/* AI data analyst session views */}
+        {isAnalyst && (
+          <AnalystMessageView msg={msg} />
+        )}
       </div>
     </div>
   );
@@ -2382,6 +2702,10 @@ export function AgentsPane() {
   const [loading, setLoading] = useState(false);
   const [showParams, setShowParams] = useState(true);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [analystRuntime, setAnalystRuntime] = useState<AnalystRuntimeState | null>(null);
+  const [analystControlBusy, setAnalystControlBusy] = useState(false);
+  const [showAnalystRuntimePanel, setShowAnalystRuntimePanel] = useState(true);
+  const analystSeenResponseSeqRef = useRef(0);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -2399,6 +2723,12 @@ export function AgentsPane() {
     setSelectedAgent(agent);
     setMessages([]);
     setSessionId(null);
+    setLoading(false);
+    setInput('');
+    setAnalystRuntime(null);
+    analystSeenResponseSeqRef.current = 0;
+    setAnalystControlBusy(false);
+    setShowAnalystRuntimePanel(true);
     const defaults: Record<string, string | number> = {};
     agent.parameters.forEach(p => { defaults[p.name] = p.default; });
     setParams(defaults);
@@ -2408,22 +2738,151 @@ export function AgentsPane() {
     setParams(prev => ({ ...prev, [name]: value }));
   }
 
+  function applyAnalystRuntimeResponse(data: any, options?: { injectStatusMessage?: boolean }) {
+    if (!data) return;
+    if (data.session_id) setSessionId(data.session_id);
+    const runtime: AnalystRuntimeState = {
+      status: data.status || 'idle',
+      running: !!data.running,
+      pause_requested: !!data.pause_requested,
+      stop_requested: !!data.stop_requested,
+      pending_user_inputs: Number(data.pending_user_inputs || 0),
+      memory_summary: data.memory_summary || '',
+      event_log: Array.isArray(data.event_log) ? data.event_log : [],
+      response_seq: Number(data.response_seq || 0),
+      latest_assistant: data.latest_assistant || null,
+      last_result: data.last_result || null,
+    };
+    setAnalystRuntime(runtime);
+    setLoading(runtime.running);
+
+    if (
+      runtime.response_seq > analystSeenResponseSeqRef.current
+      && runtime.latest_assistant
+      && runtime.latest_assistant.content
+    ) {
+      setMessages(prev => [...prev, {
+        role: 'assistant',
+        content: runtime.latest_assistant?.content || 'Analysis complete.',
+        analyst_result: runtime.latest_assistant?.analyst_result || runtime.last_result || undefined,
+        analyst_runtime_status: runtime.status,
+        error: runtime.latest_assistant?.error || undefined,
+      }]);
+      analystSeenResponseSeqRef.current = runtime.response_seq;
+    }
+
+    if (options?.injectStatusMessage && data.content) {
+      setMessages(prev => [...prev, {
+        role: 'assistant',
+        content: data.content,
+        analyst_runtime_status: runtime.status,
+      }]);
+    }
+  }
+
+  async function sendAnalystControl(control: 'status' | 'pause' | 'resume' | 'stop' | 'run') {
+    if (!selectedAgent || selectedAgent.id !== 'ai-data-analyst') return;
+    setAnalystControlBusy(true);
+    try {
+      const body: Record<string, unknown> = {
+        control,
+        params,
+        messages: [],
+      };
+      if (sessionId) body.session_id = sessionId;
+
+      // If user typed a note while paused/resuming/running manually, attach it.
+      if ((control === 'run' || control === 'resume') && input.trim()) {
+        const note = input.trim();
+        const userMsg: ChatMessage = { role: 'user', content: note };
+        setMessages(prev => [...prev, userMsg]);
+        body.messages = [{ role: 'user', content: note }];
+        setInput('');
+      }
+
+      const res = await fetch(`/api/agents/${selectedAgent.id}/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (data.error) {
+        setMessages(prev => [...prev, { role: 'assistant', content: data.error, error: data.error }]);
+      } else {
+        applyAnalystRuntimeResponse(data, { injectStatusMessage: control !== 'status' });
+      }
+    } catch {
+      setMessages(prev => [...prev, {
+        role: 'assistant',
+        content: 'Server connection error.',
+        error: 'Connection error',
+      }]);
+    } finally {
+      setAnalystControlBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!selectedAgent || selectedAgent.id !== 'ai-data-analyst') return;
+    if (!sessionId) return;
+    const runtimeStatus = analystRuntime?.status || '';
+    const shouldPoll = !!analystRuntime?.running || ['running', 'pausing', 'stopping'].includes(runtimeStatus);
+    if (!shouldPoll) return;
+
+    const timer = window.setInterval(async () => {
+      try {
+        const res = await fetch('/api/agents/ai-data-analyst/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            control: 'status',
+            session_id: sessionId,
+            params,
+          }),
+        });
+        const data = await res.json();
+        if (!data.error) {
+          applyAnalystRuntimeResponse(data);
+        }
+      } catch {
+        // Silent polling errors to avoid noisy UX.
+      }
+    }, 1200);
+
+    return () => window.clearInterval(timer);
+  }, [
+    selectedAgent?.id,
+    sessionId,
+    analystRuntime?.running,
+    analystRuntime?.status,
+    params,
+  ]);
+
   async function sendMessage(overrideContent?: string) {
     const text = (overrideContent ?? input).trim();
-    if (!text || !selectedAgent || loading) return;
+    if (!text || !selectedAgent) return;
+    if (analystControlBusy) return;
+    if (selectedAgent.id !== 'ai-data-analyst' && loading) return;
 
     const userMsg: ChatMessage = { role: 'user', content: text };
     setMessages(prev => [...prev, userMsg]);
     if (!overrideContent) setInput('');
     setLoading(true);
+    let keepLoading = false;
 
     try {
       const allMsgs = [...messages, userMsg];
       const body: Record<string, unknown> = {
-        messages: allMsgs.map(m => ({ role: m.role, content: m.content })),
+        messages: selectedAgent.id === 'ai-data-analyst'
+          ? [{ role: 'user', content: text }]
+          : allMsgs.map(m => ({ role: m.role, content: m.content })),
         params,
       };
       if (sessionId) body.session_id = sessionId;
+
+      if (selectedAgent.id === 'ai-data-analyst' && analystRuntime?.status === 'paused') {
+        body.control = 'note';
+      }
 
       const res = await fetch(`/api/agents/${selectedAgent.id}/chat`, {
         method: 'POST',
@@ -2432,11 +2891,14 @@ export function AgentsPane() {
       });
       const data = await res.json();
 
-      // Save session id for writer agent
+      // Save session id for stateful agents
       if (data.session_id) setSessionId(data.session_id);
 
       if (data.error) {
         setMessages(prev => [...prev, { role: 'assistant', content: data.error, error: data.error }]);
+      } else if (selectedAgent.id === 'ai-data-analyst') {
+        applyAnalystRuntimeResponse(data, { injectStatusMessage: true });
+        keepLoading = !!data.running;
       } else if (selectedAgent.id === 'clickhouse-writer') {
         // Writer agent: rich message
         setMessages(prev => [...prev, {
@@ -2490,7 +2952,7 @@ export function AgentsPane() {
         error: 'Connection error',
       }]);
     } finally {
-      setLoading(false);
+      if (!keepLoading) setLoading(false);
     }
   }
 
@@ -2505,9 +2967,57 @@ export function AgentsPane() {
     }
   }
 
+  async function resetConversation() {
+    try {
+      if (selectedAgent?.id === 'ai-data-analyst' && sessionId) {
+        await fetch('/api/agents/ai-data-analyst/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            control: 'stop',
+            session_id: sessionId,
+            params,
+          }),
+        });
+      }
+    } catch {
+      // Ignore reset-stop failures and continue with local reset.
+    }
+    setMessages([]);
+    setSessionId(null);
+    setLoading(false);
+    setInput('');
+    setAnalystRuntime(null);
+    analystSeenResponseSeqRef.current = 0;
+    setAnalystControlBusy(false);
+  }
+
+  const isAnalyst = selectedAgent?.id === 'ai-data-analyst';
   const isWriter = selectedAgent?.id === 'clickhouse-writer';
   const isKeyId = selectedAgent?.id === 'key-identifier';
   const isEtl = selectedAgent?.id === 'etl-agent';
+  const analystStatus = analystRuntime?.status || 'idle';
+  const analystRunningLike = !!analystRuntime?.running || ['running', 'pausing', 'stopping'].includes(analystStatus);
+  const analystCanPause = isAnalyst && !analystControlBusy && !!sessionId && analystRunningLike;
+  const analystCanResume = isAnalyst && !analystControlBusy && !!sessionId && ['paused', 'stopped'].includes(analystStatus);
+  const analystCanRun = isAnalyst && !analystControlBusy && !analystRunningLike && (
+    !!input.trim() || !!sessionId || (analystRuntime?.pending_user_inputs || 0) > 0
+  );
+  const analystCanStop = isAnalyst && !analystControlBusy && !!sessionId && analystStatus !== 'stopped' && analystStatus !== 'idle';
+  const analystRuntimeForUi: AnalystRuntimeState | null = isAnalyst
+    ? (analystRuntime || {
+      status: 'idle',
+      running: false,
+      pause_requested: false,
+      stop_requested: false,
+      pending_user_inputs: 0,
+      memory_summary: '',
+      event_log: [],
+      response_seq: 0,
+      latest_assistant: null,
+      last_result: null,
+    })
+    : null;
 
   // ── Render ────────────────────────────────────────────────────────────
 
@@ -2588,19 +3098,74 @@ export function AgentsPane() {
           {/* Agent header */}
           <div className={clsx(
             'bg-white border-b px-6 py-3 flex items-center gap-3 flex-shrink-0',
-            isWriter ? 'border-violet-100' : isKeyId ? 'border-indigo-100' : isEtl ? 'border-orange-100' : 'border-slate-200',
+            isAnalyst ? 'border-sky-100' : isWriter ? 'border-violet-100' : isKeyId ? 'border-indigo-100' : isEtl ? 'border-orange-100' : 'border-slate-200',
           )}>
-            <div className={clsx('p-2 rounded-lg', isWriter ? 'bg-violet-600' : isKeyId ? 'bg-indigo-500' : isEtl ? 'bg-orange-500' : 'bg-emerald-500')}>
-              {isWriter ? <Zap size={16} className="text-white" />
-                : isKeyId ? <GitFork size={16} className="text-white" />
-                : isEtl ? <Upload size={16} className="text-white" />
-                : <Cpu size={16} className="text-white" />}
+            <div className={clsx('p-2 rounded-lg', isAnalyst ? 'bg-sky-500' : isWriter ? 'bg-violet-600' : isKeyId ? 'bg-indigo-500' : isEtl ? 'bg-orange-500' : 'bg-emerald-500')}>
+              {isAnalyst ? <Activity size={16} className="text-white" />
+                : isWriter ? <Zap size={16} className="text-white" />
+                  : isKeyId ? <GitFork size={16} className="text-white" />
+                    : isEtl ? <Upload size={16} className="text-white" />
+                      : <Cpu size={16} className="text-white" />}
             </div>
             <div className="flex-1 min-w-0">
               <h2 className="text-sm font-bold text-slate-800">{selectedAgent.name}</h2>
               <p className="text-xs text-slate-400 truncate">{selectedAgent.description}</p>
             </div>
-            {(isWriter || isEtl) && sessionId && (
+
+            {isAnalyst && (
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className={clsx(
+                  'px-2 py-1 rounded-full text-[10px] border',
+                  analystStatus === 'running'
+                    ? 'bg-sky-50 border-sky-200 text-sky-700'
+                    : analystStatus === 'paused'
+                      ? 'bg-amber-50 border-amber-200 text-amber-700'
+                      : analystStatus === 'stopped'
+                        ? 'bg-red-50 border-red-200 text-red-700'
+                        : 'bg-slate-50 border-slate-200 text-slate-600',
+                )}>
+                  {analystStatus}
+                </span>
+                <button
+                  onClick={() => sendAnalystControl('run')}
+                  disabled={!analystCanRun}
+                  className="px-2.5 py-1.5 text-[11px] rounded-lg border border-sky-200 text-sky-700 bg-sky-50 hover:bg-sky-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-1.5"
+                  title="Run queued message(s)"
+                >
+                  <Play size={12} />
+                  Run
+                </button>
+                <button
+                  onClick={() => sendAnalystControl('pause')}
+                  disabled={!analystCanPause}
+                  className="px-2.5 py-1.5 text-[11px] rounded-lg border border-amber-200 text-amber-700 bg-amber-50 hover:bg-amber-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-1.5"
+                  title="Pause current run"
+                >
+                  <PauseCircle size={12} />
+                  Pause
+                </button>
+                <button
+                  onClick={() => sendAnalystControl('resume')}
+                  disabled={!analystCanResume}
+                  className="px-2.5 py-1.5 text-[11px] rounded-lg border border-emerald-200 text-emerald-700 bg-emerald-50 hover:bg-emerald-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-1.5"
+                  title="Resume paused session"
+                >
+                  <Play size={12} />
+                  Resume
+                </button>
+                <button
+                  onClick={() => sendAnalystControl('stop')}
+                  disabled={!analystCanStop}
+                  className="px-2.5 py-1.5 text-[11px] rounded-lg border border-red-200 text-red-700 bg-red-50 hover:bg-red-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-1.5"
+                  title="Stop current run"
+                >
+                  <Square size={12} />
+                  Stop
+                </button>
+              </div>
+            )}
+
+            {!isAnalyst && (isWriter || isEtl) && sessionId && (
               <span className={clsx(
                 'px-2 py-1 rounded-full text-[9px] font-mono border',
                 isEtl ? 'bg-orange-50 border-orange-200 text-orange-600' : 'bg-violet-50 border-violet-200 text-violet-600',
@@ -2608,8 +3173,9 @@ export function AgentsPane() {
                 Session active
               </span>
             )}
+
             <button
-              onClick={() => { setMessages([]); setSessionId(null); }}
+              onClick={resetConversation}
               title="Reset conversation"
               className="p-1.5 rounded-lg hover:bg-slate-100 text-slate-400 hover:text-slate-600 transition-colors"
             >
@@ -2631,273 +3197,391 @@ export function AgentsPane() {
                 </span>
               </button>
               {showParams && (
-                <div className="px-6 pb-4 grid grid-cols-2 gap-x-6 gap-y-3">
-                  {selectedAgent.parameters.map((p) => (
-                    <div key={p.name}>
-                      <label className="block text-xs font-semibold text-slate-600 mb-1">
-                        {p.label}
-                      </label>
-                      {p.type === 'select' ? (
-                        <select
-                          value={params[p.name] as string}
-                          onChange={(e) => setParam(p.name, e.target.value)}
-                          className="w-full px-3 py-1.5 text-xs border border-slate-200 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-emerald-400 focus:border-transparent"
-                        >
-                          {p.options?.map((opt) => (
-                            <option key={opt} value={opt}>{opt}</option>
-                          ))}
-                        </select>
-                      ) : (
-                        <input
-                          type={p.type === 'number' ? 'number' : 'text'}
-                          value={params[p.name] as string}
-                          onChange={(e) => setParam(p.name, p.type === 'number' ? Number(e.target.value) : e.target.value)}
-                          placeholder={p.description}
-                          className="w-full px-3 py-1.5 text-xs border border-slate-200 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-emerald-400 focus:border-transparent"
-                        />
-                      )}
-                      <p className="text-[10px] text-slate-400 mt-0.5">{p.description}</p>
+                <div className="px-6 pb-4">
+                  <div className="grid grid-cols-2 gap-x-6 gap-y-3">
+                    {selectedAgent.parameters.map((p) => (
+                      <div key={p.name}>
+                        <label className="text-xs font-semibold text-slate-600 mb-1 flex items-center gap-1.5">
+                          {p.label}
+                          {isAnalyst && (
+                            <span title={p.description}>
+                              <Info size={12} className="text-sky-400" />
+                            </span>
+                          )}
+                        </label>
+                        {p.type === 'select' ? (
+                          <select
+                            value={params[p.name] as string}
+                            onChange={(e) => setParam(p.name, e.target.value)}
+                            className={clsx(
+                              'w-full px-3 py-1.5 text-xs border rounded-lg bg-white focus:outline-none focus:ring-2 focus:border-transparent',
+                              isAnalyst ? 'border-sky-200 focus:ring-sky-400' : 'border-slate-200 focus:ring-emerald-400',
+                            )}
+                          >
+                            {p.options?.map((opt) => (
+                              <option key={opt} value={opt}>{opt}</option>
+                            ))}
+                          </select>
+                        ) : (
+                          <input
+                            type={p.type === 'number' ? 'number' : 'text'}
+                            value={params[p.name] as string}
+                            onChange={(e) => setParam(p.name, p.type === 'number' ? Number(e.target.value) : e.target.value)}
+                            placeholder={p.description}
+                            className={clsx(
+                              'w-full px-3 py-1.5 text-xs border rounded-lg bg-white focus:outline-none focus:ring-2 focus:border-transparent',
+                              isAnalyst ? 'border-sky-200 focus:ring-sky-400' : 'border-slate-200 focus:ring-emerald-400',
+                            )}
+                          />
+                        )}
+                        <p className="text-[10px] text-slate-400 mt-0.5">{p.description}</p>
+                      </div>
+                    ))}
+                  </div>
+                  {isAnalyst && (
+                    <div className="mt-3 rounded-xl border border-sky-200 bg-sky-50 p-3 text-xs text-slate-600">
+                      <p className="font-semibold text-sky-800 mb-1">Best-practice session flow</p>
+                      <p>1) Ask a focused question, 2) check live runtime logs, 3) pause to add context, 4) resume/run follow-up.</p>
+                      <p className="mt-1">The agent keeps compact memory with a strict token budget to avoid local LLM context overflow.</p>
                     </div>
-                  ))}
+                  )}
                 </div>
               )}
             </div>
           )}
 
-          {/* Messages area */}
-          <div className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
-            {messages.length === 0 && (
-              <div className="flex flex-col items-center justify-center h-full text-center opacity-60">
-                {isWriter ? (
-                  <>
-                    <div className="p-4 bg-violet-50 rounded-2xl mb-4">
-                      <Zap size={36} className="text-violet-400" />
-                    </div>
-                    <p className="text-sm text-slate-600 font-semibold mb-1">
-                      Agent ClickHouse Writer
-                    </p>
-                    <p className="text-xs text-slate-400 max-w-sm leading-relaxed mb-4">
-                      Describe your need in natural language. The agent will automatically plan and execute
-                      up to 12 complex operations, create intermediate tables if necessary,
-                      and produce a detailed summary.
-                    </p>
-                    <div className="flex flex-wrap gap-2 justify-center">
-                      {[
-                        'Analyze the 10 largest tables and summarize their content',
-                        'Create an aggregated BOT_ table with key metrics from my database',
-                        'Identify duplicates across all tables and produce a report',
-                        'Calculate the value distribution for each numeric column',
-                      ].map(s => (
-                        <button
-                          key={s}
-                          onClick={() => setInput(s)}
-                          className="px-3 py-1.5 text-xs bg-white border border-violet-200 rounded-full text-violet-700 hover:border-violet-400 hover:bg-violet-50 transition-colors text-left"
-                        >
-                          {s}
-                        </button>
-                      ))}
-                    </div>
-                  </>
-                ) : isKeyId ? (
-                  <>
-                    <div className="p-4 bg-indigo-50 rounded-2xl mb-4">
-                      <GitFork size={36} className="text-indigo-400" />
-                    </div>
-                    <p className="text-sm text-slate-600 font-semibold mb-1">
-                      Agent Key Identifier
-                    </p>
-                    <p className="text-xs text-slate-400 max-w-sm leading-relaxed mb-4">
-                      This agent will scan all your tables, sample up to 5 values per candidate field,
-                      then use the LLM to detect potential FK relationships.
-                      Configure the parameters above, then launch the analysis.
-                    </p>
-                    <div className="flex flex-wrap gap-2 justify-center">
-                      {[
-                        'Analyze all tables and identify foreign keys',
-                        'Find the relationships between tables in my database',
-                        'Identify fields that correspond to each other across tables',
-                      ].map(s => (
-                        <button
-                          key={s}
-                          onClick={() => setInput(s)}
-                          className="px-3 py-1.5 text-xs bg-white border border-indigo-200 rounded-full text-indigo-700 hover:border-indigo-400 hover:bg-indigo-50 transition-colors text-left"
-                        >
-                          {s}
-                        </button>
-                      ))}
-                    </div>
-                  </>
-                ) : isEtl ? (
-                  <>
-                    <div className="p-4 bg-orange-50 rounded-2xl mb-4">
-                      <Upload size={36} className="text-orange-400" />
-                    </div>
-                    <p className="text-sm text-slate-600 font-semibold mb-1">
-                      ETL Agent — File Import
-                    </p>
-                    <p className="text-xs text-slate-400 max-w-sm leading-relaxed mb-4">
-                      Set the <strong>source folder</strong> in the parameters.
-                      The agent will list the files (CSV, Excel, Parquet, JSON, TXT),
-                      generate an import plan and create <span className="font-mono">BOT_ETL_*</span> tables in ClickHouse.
-                      Calculated fields will be prefixed with <span className="font-mono">C_*</span>.
-                    </p>
-                    <div className="flex flex-wrap gap-2 justify-center">
-                      {[
-                        'Import all files into a single clients table',
-                        'Create one table per file with enrichment from t_ref',
-                        'Import the data and add the calculated C_total_amount field',
-                        'Split the data into multiple tables by type',
-                      ].map(s => (
-                        <button
-                          key={s}
-                          onClick={() => setInput(s)}
-                          className="px-3 py-1.5 text-xs bg-white border border-orange-200 rounded-full text-orange-700 hover:border-orange-400 hover:bg-orange-50 transition-colors text-left"
-                        >
-                          {s}
-                        </button>
-                      ))}
-                    </div>
-                  </>
-                ) : (
-                  <>
-                    <MessageSquare size={32} className="text-slate-300 mb-3" />
-                    <p className="text-sm text-slate-400 font-medium">Start the conversation</p>
-                    <p className="text-xs text-slate-400 mt-1 max-w-xs">
-                      Type your request below or use the starter suggestions.
-                    </p>
-                    <div className="mt-4 flex flex-wrap gap-2 justify-center">
-                      {[
-                        'Generate the complete data dictionary',
-                        'Document all available tables',
-                        'Analyze and describe the database schema',
-                      ].map(s => (
-                        <button
-                          key={s}
-                          onClick={() => setInput(s)}
-                          className="px-3 py-1.5 text-xs bg-white border border-slate-200 rounded-full text-slate-600 hover:border-emerald-400 hover:text-emerald-600 transition-colors"
-                        >
-                          {s}
-                        </button>
-                      ))}
-                    </div>
-                  </>
+          <div className="flex-1 flex min-h-0 overflow-hidden">
+            <div className="flex-1 flex flex-col min-w-0">
+              {/* Messages area */}
+              <div className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
+                {messages.length === 0 && (
+                  <div className="flex flex-col items-center justify-center h-full text-center opacity-60">
+                    {isAnalyst ? (
+                      <>
+                        <div className="p-4 bg-sky-50 rounded-2xl mb-4">
+                          <Activity size={36} className="text-sky-400" />
+                        </div>
+                        <p className="text-sm text-slate-600 font-semibold mb-1">
+                          AI Data Analyst Session Agent
+                        </p>
+                        <p className="text-xs text-slate-400 max-w-md leading-relaxed mb-4">
+                          Ask one complex question or chain follow-ups in the same thread. The agent plans SQL actions,
+                          self-evaluates mid-run, and keeps compact memory for stable local LLM usage.
+                        </p>
+                        <div className="flex flex-wrap gap-2 justify-center">
+                          {[
+                            'Compare weekly revenue between January and February 2025',
+                            'Identify the 5 products with the biggest margin drop this quarter',
+                            'Continue from previous result and explain anomalies by country',
+                            'Pause after first findings so I can provide more business context',
+                          ].map(s => (
+                            <button
+                              key={s}
+                              onClick={() => setInput(s)}
+                              className="px-3 py-1.5 text-xs bg-white border border-sky-200 rounded-full text-sky-700 hover:border-sky-400 hover:bg-sky-50 transition-colors text-left"
+                            >
+                              {s}
+                            </button>
+                          ))}
+                        </div>
+                      </>
+                    ) : isWriter ? (
+                      <>
+                        <div className="p-4 bg-violet-50 rounded-2xl mb-4">
+                          <Zap size={36} className="text-violet-400" />
+                        </div>
+                        <p className="text-sm text-slate-600 font-semibold mb-1">
+                          Agent ClickHouse Writer
+                        </p>
+                        <p className="text-xs text-slate-400 max-w-sm leading-relaxed mb-4">
+                          Describe your need in natural language. The agent will automatically plan and execute
+                          up to 12 complex operations, create intermediate tables if necessary,
+                          and produce a detailed summary.
+                        </p>
+                        <div className="flex flex-wrap gap-2 justify-center">
+                          {[
+                            'Analyze the 10 largest tables and summarize their content',
+                            'Create an aggregated BOT_ table with key metrics from my database',
+                            'Identify duplicates across all tables and produce a report',
+                            'Calculate the value distribution for each numeric column',
+                          ].map(s => (
+                            <button
+                              key={s}
+                              onClick={() => setInput(s)}
+                              className="px-3 py-1.5 text-xs bg-white border border-violet-200 rounded-full text-violet-700 hover:border-violet-400 hover:bg-violet-50 transition-colors text-left"
+                            >
+                              {s}
+                            </button>
+                          ))}
+                        </div>
+                      </>
+                    ) : isKeyId ? (
+                      <>
+                        <div className="p-4 bg-indigo-50 rounded-2xl mb-4">
+                          <GitFork size={36} className="text-indigo-400" />
+                        </div>
+                        <p className="text-sm text-slate-600 font-semibold mb-1">
+                          Agent Key Identifier
+                        </p>
+                        <p className="text-xs text-slate-400 max-w-sm leading-relaxed mb-4">
+                          This agent will scan all your tables, sample up to 5 values per candidate field,
+                          then use the LLM to detect potential FK relationships.
+                          Configure the parameters above, then launch the analysis.
+                        </p>
+                        <div className="flex flex-wrap gap-2 justify-center">
+                          {[
+                            'Analyze all tables and identify foreign keys',
+                            'Find the relationships between tables in my database',
+                            'Identify fields that correspond to each other across tables',
+                          ].map(s => (
+                            <button
+                              key={s}
+                              onClick={() => setInput(s)}
+                              className="px-3 py-1.5 text-xs bg-white border border-indigo-200 rounded-full text-indigo-700 hover:border-indigo-400 hover:bg-indigo-50 transition-colors text-left"
+                            >
+                              {s}
+                            </button>
+                          ))}
+                        </div>
+                      </>
+                    ) : isEtl ? (
+                      <>
+                        <div className="p-4 bg-orange-50 rounded-2xl mb-4">
+                          <Upload size={36} className="text-orange-400" />
+                        </div>
+                        <p className="text-sm text-slate-600 font-semibold mb-1">
+                          ETL Agent — File Import
+                        </p>
+                        <p className="text-xs text-slate-400 max-w-sm leading-relaxed mb-4">
+                          Set the <strong>source folder</strong> in the parameters.
+                          The agent will list the files (CSV, Excel, Parquet, JSON, TXT),
+                          generate an import plan and create <span className="font-mono">BOT_ETL_*</span> tables in ClickHouse.
+                          Calculated fields will be prefixed with <span className="font-mono">C_*</span>.
+                        </p>
+                        <div className="flex flex-wrap gap-2 justify-center">
+                          {[
+                            'Import all files into a single clients table',
+                            'Create one table per file with enrichment from t_ref',
+                            'Import the data and add the calculated C_total_amount field',
+                            'Split the data into multiple tables by type',
+                          ].map(s => (
+                            <button
+                              key={s}
+                              onClick={() => setInput(s)}
+                              className="px-3 py-1.5 text-xs bg-white border border-orange-200 rounded-full text-orange-700 hover:border-orange-400 hover:bg-orange-50 transition-colors text-left"
+                            >
+                              {s}
+                            </button>
+                          ))}
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <MessageSquare size={32} className="text-slate-300 mb-3" />
+                        <p className="text-sm text-slate-400 font-medium">Start the conversation</p>
+                        <p className="text-xs text-slate-400 mt-1 max-w-xs">
+                          Type your request below or use the starter suggestions.
+                        </p>
+                        <div className="mt-4 flex flex-wrap gap-2 justify-center">
+                          {[
+                            'Generate the complete data dictionary',
+                            'Document all available tables',
+                            'Analyze and describe the database schema',
+                          ].map(s => (
+                            <button
+                              key={s}
+                              onClick={() => setInput(s)}
+                              className="px-3 py-1.5 text-xs bg-white border border-slate-200 rounded-full text-slate-600 hover:border-emerald-400 hover:text-emerald-600 transition-colors"
+                            >
+                              {s}
+                            </button>
+                          ))}
+                        </div>
+                      </>
+                    )}
+                  </div>
                 )}
-              </div>
-            )}
 
-            {messages.map((msg, i) => (
-              <div key={i}>
-                {msg.role === 'user' ? (
-                  <div className="flex justify-end">
+                {messages.map((msg, i) => (
+                  <div key={i}>
+                    {msg.role === 'user' ? (
+                      <div className="flex justify-end">
+                        <div className={clsx(
+                          'text-white rounded-xl px-4 py-2.5 max-w-md text-sm',
+                          isAnalyst ? 'bg-sky-600' : isWriter ? 'bg-violet-600' : isEtl ? 'bg-orange-500' : 'bg-emerald-500',
+                        )}>
+                          {msg.content}
+                        </div>
+                      </div>
+                    ) : (
+                      <AssistantMessage
+                        msg={msg}
+                        onChoice={handleChoice}
+                        isLast={i === messages.length - 1}
+                      />
+                    )}
+                  </div>
+                ))}
+
+                {loading && (
+                  <div className="flex gap-3 justify-start">
                     <div className={clsx(
-                      'text-white rounded-xl px-4 py-2.5 max-w-md text-sm',
-                      isWriter ? 'bg-violet-600' : isEtl ? 'bg-orange-500' : 'bg-emerald-500',
+                      'p-2 rounded-full flex-shrink-0',
+                      isAnalyst ? 'bg-sky-100' : isWriter ? 'bg-violet-100' : isEtl ? 'bg-orange-100' : 'bg-emerald-100',
                     )}>
-                      {msg.content}
+                      <Loader2 size={14} className={clsx(
+                        'animate-spin',
+                        isAnalyst ? 'text-sky-600' : isWriter ? 'text-violet-600' : isEtl ? 'text-orange-600' : 'text-emerald-600',
+                      )} />
+                    </div>
+                    <div className="bg-white border border-slate-200 rounded-xl px-4 py-3 shadow-sm">
+                      <div className="flex items-center gap-2 text-sm text-slate-400">
+                        <span>{isAnalyst ? 'Analyst agent planning and executing SQL chain' : isWriter ? 'Agent planning and executing' : isEtl ? 'ETL agent analyzing and importing' : 'Analysis in progress'}</span>
+                        <span className="flex gap-0.5">
+                          {[0, 150, 300].map(d => (
+                            <span
+                              key={d}
+                              className={clsx(
+                                'w-1 h-1 rounded-full animate-bounce',
+                                isAnalyst ? 'bg-sky-400' : isWriter ? 'bg-violet-400' : isEtl ? 'bg-orange-400' : 'bg-emerald-400',
+                              )}
+                              style={{ animationDelay: `${d}ms` }}
+                            />
+                          ))}
+                        </span>
+                      </div>
+                      {(isWriter || isEtl || isAnalyst) && (
+                        <p className="text-[10px] text-slate-300 mt-1">
+                          This may take a few moments depending on schema size and query complexity…
+                        </p>
+                      )}
                     </div>
                   </div>
-                ) : (
-                  <AssistantMessage
-                    msg={msg}
-                    onChoice={handleChoice}
-                    isLast={i === messages.length - 1}
-                  />
                 )}
-              </div>
-            ))}
 
-            {loading && (
-              <div className="flex gap-3 justify-start">
-                <div className={clsx(
-                  'p-2 rounded-full flex-shrink-0',
-                  isWriter ? 'bg-violet-100' : isEtl ? 'bg-orange-100' : 'bg-emerald-100',
-                )}>
-                  <Loader2 size={14} className={clsx(
-                    'animate-spin',
-                    isWriter ? 'text-violet-600' : isEtl ? 'text-orange-600' : 'text-emerald-600',
-                  )} />
-                </div>
-                <div className="bg-white border border-slate-200 rounded-xl px-4 py-3 shadow-sm">
-                  <div className="flex items-center gap-2 text-sm text-slate-400">
-                    <span>{isWriter ? 'Agent planning and executing' : isEtl ? 'ETL agent analyzing and importing' : 'Analysis in progress'}</span>
-                    <span className="flex gap-0.5">
-                      {[0, 150, 300].map(d => (
-                        <span
-                          key={d}
-                          className={clsx(
-                            'w-1 h-1 rounded-full animate-bounce',
-                            isWriter ? 'bg-violet-400' : isEtl ? 'bg-orange-400' : 'bg-emerald-400',
-                          )}
-                          style={{ animationDelay: `${d}ms` }}
-                        />
-                      ))}
+                <div ref={bottomRef} />
+              </div>
+
+              {/* Input area */}
+              <div className="bg-white border-t border-slate-200 p-4 flex-shrink-0">
+                {isAnalyst && (
+                  <div className="mb-3 flex flex-wrap items-center gap-2">
+                    <button
+                      onClick={() => sendAnalystControl('run')}
+                      disabled={!analystCanRun}
+                      className="px-2.5 py-1.5 text-[11px] rounded-lg border border-sky-200 text-sky-700 bg-sky-50 hover:bg-sky-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-1.5"
+                    >
+                      <Play size={12} />
+                      Run
+                    </button>
+                    <button
+                      onClick={() => sendAnalystControl('pause')}
+                      disabled={!analystCanPause}
+                      className="px-2.5 py-1.5 text-[11px] rounded-lg border border-amber-200 text-amber-700 bg-amber-50 hover:bg-amber-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-1.5"
+                    >
+                      <PauseCircle size={12} />
+                      Pause
+                    </button>
+                    <button
+                      onClick={() => sendAnalystControl('resume')}
+                      disabled={!analystCanResume}
+                      className="px-2.5 py-1.5 text-[11px] rounded-lg border border-emerald-200 text-emerald-700 bg-emerald-50 hover:bg-emerald-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-1.5"
+                    >
+                      <Play size={12} />
+                      Resume
+                    </button>
+                    <button
+                      onClick={() => sendAnalystControl('stop')}
+                      disabled={!analystCanStop}
+                      className="px-2.5 py-1.5 text-[11px] rounded-lg border border-red-200 text-red-700 bg-red-50 hover:bg-red-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-1.5"
+                    >
+                      <Square size={12} />
+                      Stop
+                    </button>
+                    <button
+                      onClick={() => setShowAnalystRuntimePanel(v => !v)}
+                      className="px-2.5 py-1.5 text-[11px] rounded-lg border border-slate-200 text-slate-600 bg-slate-50 hover:bg-slate-100 transition-colors"
+                    >
+                      {showAnalystRuntimePanel ? 'Hide logs' : 'Show logs'}
+                    </button>
+                    <span className="text-[11px] text-slate-400 ml-auto">
+                      Tip: pause, add context, then resume for higher-quality synthesis.
                     </span>
                   </div>
-                  {(isWriter || isEtl) && (
-                    <p className="text-[10px] text-slate-300 mt-1">
-                      This may take a few moments depending on file size…
-                    </p>
-                  )}
+                )}
+                <div className="flex gap-3 items-end">
+                  <textarea
+                    value={input}
+                    onChange={e => setInput(e.target.value)}
+                    onKeyDown={handleKey}
+                    placeholder={
+                      isAnalyst
+                        ? (analystStatus === 'paused'
+                          ? 'Session paused: add a note/context, then click Resume…'
+                          : 'Ask a business question, then chain follow-ups in this same thread…')
+                        : isWriter
+                          ? 'Describe your analysis in natural language…'
+                          : isEtl
+                            ? 'Describe how to import your data, tables to create, calculated fields…'
+                            : `Ask the "${selectedAgent.name}" agent…`
+                    }
+                    rows={2}
+                    disabled={(loading && !isAnalyst) || analystControlBusy}
+                    className={clsx(
+                      'flex-1 resize-none px-4 py-3 text-sm border rounded-xl bg-slate-50 focus:outline-none focus:ring-2 focus:border-transparent disabled:opacity-50 transition-colors',
+                      isAnalyst
+                        ? 'border-sky-200 focus:ring-sky-400'
+                        : isWriter
+                          ? 'border-violet-200 focus:ring-violet-400'
+                          : isEtl
+                            ? 'border-orange-200 focus:ring-orange-400'
+                            : 'border-slate-200 focus:ring-emerald-400',
+                    )}
+                  />
+                  <button
+                    onClick={() => sendMessage()}
+                    disabled={!input.trim() || analystControlBusy || (!isAnalyst && loading)}
+                    className={clsx(
+                      'p-3 disabled:bg-slate-200 disabled:cursor-not-allowed text-white rounded-xl transition-colors flex-shrink-0',
+                      isAnalyst
+                        ? 'bg-sky-600 hover:bg-sky-700'
+                        : isWriter
+                          ? 'bg-violet-600 hover:bg-violet-700'
+                          : isEtl
+                            ? 'bg-orange-500 hover:bg-orange-600'
+                            : 'bg-emerald-500 hover:bg-emerald-600',
+                    )}
+                  >
+                    {loading && !isAnalyst ? <Loader2 size={18} className="animate-spin" /> : <Send size={18} />}
+                  </button>
                 </div>
+                <p className="text-[10px] text-slate-400 mt-1.5 ml-1">
+                  Enter to send · Shift+Enter for new line
+                  {isAnalyst && (
+                    <span className="ml-2 text-sky-500 font-medium">
+                      · Status: {analystStatus} · Pending queue: {analystRuntime?.pending_user_inputs || 0}
+                    </span>
+                  )}
+                  {isWriter && sessionId && (
+                    <span className="ml-2 text-violet-400 font-medium">
+                      · Session in progress
+                    </span>
+                  )}
+                  {isEtl && sessionId && (
+                    <span className="ml-2 text-orange-400 font-medium">
+                      · ETL session active
+                    </span>
+                  )}
+                </p>
               </div>
-            )}
-
-            <div ref={bottomRef} />
-          </div>
-
-          {/* Input area */}
-          <div className="bg-white border-t border-slate-200 p-4 flex-shrink-0">
-            <div className="flex gap-3 items-end">
-              <textarea
-                value={input}
-                onChange={e => setInput(e.target.value)}
-                onKeyDown={handleKey}
-                placeholder={
-                  isWriter
-                    ? 'Describe your analysis in natural language…'
-                    : isEtl
-                      ? 'Describe how to import your data, tables to create, calculated fields…'
-                      : `Ask the "${selectedAgent.name}" agent…`
-                }
-                rows={2}
-                disabled={loading}
-                className={clsx(
-                  'flex-1 resize-none px-4 py-3 text-sm border rounded-xl bg-slate-50 focus:outline-none focus:ring-2 focus:border-transparent disabled:opacity-50 transition-colors',
-                  isWriter
-                    ? 'border-violet-200 focus:ring-violet-400'
-                    : isEtl
-                      ? 'border-orange-200 focus:ring-orange-400'
-                      : 'border-slate-200 focus:ring-emerald-400',
-                )}
-              />
-              <button
-                onClick={() => sendMessage()}
-                disabled={!input.trim() || loading}
-                className={clsx(
-                  'p-3 disabled:bg-slate-200 disabled:cursor-not-allowed text-white rounded-xl transition-colors flex-shrink-0',
-                  isWriter
-                    ? 'bg-violet-600 hover:bg-violet-700'
-                    : isEtl
-                      ? 'bg-orange-500 hover:bg-orange-600'
-                      : 'bg-emerald-500 hover:bg-emerald-600',
-                )}
-              >
-                {loading ? <Loader2 size={18} className="animate-spin" /> : <Send size={18} />}
-              </button>
             </div>
-            <p className="text-[10px] text-slate-400 mt-1.5 ml-1">
-              Enter to send · Shift+Enter for new line
-              {isWriter && sessionId && (
-                <span className="ml-2 text-violet-400 font-medium">
-                  · Session in progress
-                </span>
-              )}
-              {isEtl && sessionId && (
-                <span className="ml-2 text-orange-400 font-medium">
-                  · ETL session active
-                </span>
-              )}
-            </p>
+            {isAnalyst && (
+              <AnalystRuntimePanel
+                runtime={analystRuntimeForUi}
+                showPanel={showAnalystRuntimePanel}
+                onToggle={() => setShowAnalystRuntimePanel(v => !v)}
+              />
+            )}
           </div>
         </div>
       )}

@@ -2929,6 +2929,24 @@ def agent_analysis():
         False,
     )
     no_prompt_context_injection = use_knowledge_agent
+    control_session_id = str(data.get("control_session_id", "")).strip()
+
+    def _check_external_interrupt() -> str:
+        """Allow session agent controls (pause/stop) to interrupt long runs."""
+        if not control_session_id:
+            return ""
+        try:
+            with _data_analyst_sessions_lock:
+                sess = _data_analyst_sessions.get(control_session_id)
+                if not sess:
+                    return ""
+                if sess.get("stop_requested"):
+                    return "stopped"
+                if sess.get("pause_requested"):
+                    return "paused"
+        except Exception:
+            return ""
+        return ""
 
     if not user_question.strip():
         return jsonify({"error": "No question provided"}), 400
@@ -3740,6 +3758,33 @@ Respond ONLY with valid JSON (no markdown):
             if used_steps >= MAX_AGENT_STEPS and not retry_pending:
                 break
             safety_counter += 1
+
+            interrupt_reason = _check_external_interrupt()
+            if interrupt_reason:
+                final_answer = (
+                    _synthesize_final_answer_from_steps(steps)
+                    if steps
+                    else (
+                        "Analyse interrompue avant exécution complète. "
+                        "Ajoutez du contexte puis relancez la session."
+                    )
+                )
+                return jsonify({
+                    "steps": steps,
+                    "final_answer": final_answer,
+                    "total_steps": len(steps),
+                    "technical_retries_used": technical_retries_used,
+                    "free_retries_used": technical_retries_used,
+                    "query_attempts_used": query_attempts_used,
+                    "max_technical_retries": MAX_TECHNICAL_RETRIES,
+                    "max_total_query_attempts": MAX_AGENT_STEPS + MAX_TECHNICAL_RETRIES,
+                    "initial_plan": initial_plan.get("plan_steps", []),
+                    "current_plan": current_plan_steps,
+                    "midcourse_review": midcourse_review or {},
+                    "no_prompt_context_injection": bool(no_prompt_context_injection),
+                    "interrupted": True,
+                    "interrupt_reason": interrupt_reason,
+                })
 
             # ── Mid-course review (halfway OR early stagnation trigger) ─────────
             if (
@@ -4830,7 +4875,663 @@ _writer_sessions: dict = {}
 # In-memory session store for the ETL agent
 _etl_sessions: dict = {}
 
+# In-memory session store for the AI Data Analyst session agent
+_data_analyst_sessions: dict = {}
+_data_analyst_sessions_lock = _threading.Lock()
+_DATA_ANALYST_MAX_EVENTS = 500
+_DATA_ANALYST_SCHEMA_CACHE_TTL_SEC = 180
+
+
+def _da_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _da_coerce_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "oui"}
+    return bool(value)
+
+
+def _da_coerce_int(value, default: int, min_value: int, max_value: int) -> int:
+    parsed = _parse_int_like(value, default)
+    return max(min_value, min(max_value, parsed))
+
+
+def _da_parse_table_filter(raw_value) -> list:
+    if isinstance(raw_value, list):
+        values = [str(v).strip() for v in raw_value if str(v).strip()]
+    else:
+        txt = str(raw_value or "").strip()
+        values = [p.strip() for p in txt.split(",") if p.strip()] if txt else []
+    return values[:200]
+
+
+def _da_normalize_params(raw_params: dict | None) -> dict:
+    params = raw_params or {}
+    return {
+        "max_steps": _da_coerce_int(params.get("max_steps", 8), 8, 1, 50),
+        "use_knowledge_base": _da_coerce_bool(params.get("use_knowledge_base", "yes"), True),
+        "use_knowledge_agent": _da_coerce_bool(params.get("use_knowledge_agent", "no"), False),
+        "memory_turn_limit": _da_coerce_int(params.get("memory_turn_limit", 8), 8, 2, 24),
+        "memory_token_budget": _da_coerce_int(params.get("memory_token_budget", 700), 700, 120, 2400),
+        "auto_run": _da_coerce_bool(params.get("auto_run", "yes"), True),
+        "table_filter": _da_parse_table_filter(params.get("table_filter", "")),
+    }
+
+
+def _da_log_event(session: dict, message: str, level: str = "info", kind: str = "runtime") -> None:
+    level_norm = str(level or "info").lower()
+    if level_norm not in {"info", "warn", "error"}:
+        level_norm = "info"
+    entry = {
+        "seq": int(session.get("event_seq", 0)) + 1,
+        "ts": _da_now_iso(),
+        "level": level_norm,
+        "kind": str(kind or "runtime"),
+        "message": str(message or "").strip(),
+    }
+    session["event_seq"] = entry["seq"]
+    session.setdefault("event_log", []).append(entry)
+    if len(session["event_log"]) > _DATA_ANALYST_MAX_EVENTS:
+        session["event_log"] = session["event_log"][-_DATA_ANALYST_MAX_EVENTS:]
+    session["updated_at"] = entry["ts"]
+    try:
+        _log(
+            f"[{session.get('id', '?')[:8]}] {entry['message']}",
+            level=level_norm,
+            source="ai-data-analyst",
+        )
+    except Exception:
+        pass
+
+
+def _da_refresh_memory_summary(session: dict) -> None:
+    params = session.get("params", {})
+    turn_limit = _da_coerce_int(params.get("memory_turn_limit", 8), 8, 2, 24)
+    token_budget = _da_coerce_int(params.get("memory_token_budget", 700), 700, 120, 2400)
+    convo = session.get("conversation", [])
+    lines = []
+    for msg in convo[-(turn_limit * 2):]:
+        role = "U" if msg.get("role") == "user" else "A"
+        text = " ".join(str(msg.get("content", "")).split())
+        if not text:
+            continue
+        lines.append(f"{role}: {text[:220]}")
+
+    last_result = session.get("last_result") or {}
+    if last_result:
+        lines.append(
+            "Last run: "
+            f"steps={last_result.get('total_steps', 0)}, "
+            f"retries={last_result.get('technical_retries_used', 0)}, "
+            f"queries={last_result.get('query_attempts_used', 0)}."
+        )
+
+    raw_summary = "\n".join(lines)
+    session["memory_summary"] = _truncate_text_to_budget(raw_summary, token_budget)
+    session["updated_at"] = _da_now_iso()
+
+
+def _da_compose_question(session: dict, question: str) -> str:
+    user_question = (question or "").strip()
+    if not user_question:
+        return ""
+    params = session.get("params", {})
+    token_budget = _da_coerce_int(params.get("memory_token_budget", 700), 700, 120, 2400)
+    memory_summary = (session.get("memory_summary") or "").strip()
+    notes = session.get("paused_notes", [])[-3:]
+
+    blocks = [user_question]
+    if memory_summary:
+        blocks.append(
+            "CONVERSATION MEMORY (compact, may be partial):\n"
+            + memory_summary
+            + "\nUse this memory only when relevant to the new question."
+        )
+    if notes:
+        note_text = "\n".join(f"- {str(n)[:220]}" for n in notes)
+        blocks.append(
+            "ADDITIONAL USER NOTES PROVIDED DURING PAUSE:\n"
+            + note_text
+        )
+
+    combined = "\n\n".join(blocks)
+    # Keep enough room for the current question while bounding historical memory.
+    return _truncate_text_to_budget(combined, max(180, int(token_budget * 1.35)))
+
+
+def _da_build_table_metadata_map() -> dict:
+    db = read_db()
+    out = {}
+    for row in db.get("table_metadata", []):
+        table_name = str(row.get("table_name", "")).strip()
+        if not table_name:
+            continue
+        out[table_name] = {
+            "description": row.get("description", ""),
+            "is_favorite": bool(row.get("is_favorite", False)),
+        }
+    return out
+
+
+def _da_fetch_schema_for_agent() -> dict:
+    client = get_clickhouse_client()
+    databases = clickhouse_config.get("databases") or []
+    if not databases:
+        databases = [clickhouse_config.get("database", "default")]
+    databases = [d.strip() for d in databases if d.strip()]
+    if not databases:
+        databases = ["default"]
+    multi_db = len(databases) > 1
+    dbs_in = ", ".join(f"'{d}'" for d in databases)
+    result = client.query(
+        f"SELECT database, table, name, type FROM system.columns "
+        f"WHERE database IN ({dbs_in}) "
+        f"ORDER BY database, table, name"
+    )
+    rows = _rows_to_dicts(result)
+    schema = {}
+    for row in rows:
+        db_name = row.get("database", "")
+        tbl = row.get("table", "")
+        key = f"{db_name}.{tbl}" if multi_db else tbl
+        schema.setdefault(key, []).append({
+            "name": row.get("name", ""),
+            "type": row.get("type", ""),
+        })
+    return schema
+
+
+def _da_get_schema_with_cache(session: dict) -> dict:
+    now_ts = datetime.now(timezone.utc).timestamp()
+    cached_schema = session.get("cached_schema")
+    cached_ts = float(session.get("cached_schema_ts", 0) or 0)
+    if cached_schema and (now_ts - cached_ts) <= _DATA_ANALYST_SCHEMA_CACHE_TTL_SEC:
+        return cached_schema
+
+    schema = _da_fetch_schema_for_agent()
+    session["cached_schema"] = schema
+    session["cached_schema_ts"] = now_ts
+    return schema
+
+
+def _da_session_payload(session: dict) -> dict:
+    return {
+        "session_id": session.get("id"),
+        "status": session.get("status", "idle"),
+        "running": bool(session.get("running", False)),
+        "pause_requested": bool(session.get("pause_requested", False)),
+        "stop_requested": bool(session.get("stop_requested", False)),
+        "pending_user_inputs": len(session.get("pending_user_inputs", [])),
+        "memory_summary": session.get("memory_summary", ""),
+        "event_log": session.get("event_log", [])[-220:],
+        "response_seq": int(session.get("response_seq", 0)),
+        "latest_assistant": session.get("latest_assistant"),
+        "last_result": session.get("last_result"),
+        "params": session.get("params", {}),
+        "created_at": session.get("created_at"),
+        "updated_at": session.get("updated_at"),
+    }
+
+
+def _da_start_worker_if_needed(session: dict) -> bool:
+    if session.get("running"):
+        return False
+    if not session.get("pending_user_inputs"):
+        return False
+    session["running"] = True
+    session["status"] = "running"
+    session["run_seq"] = int(session.get("run_seq", 0)) + 1
+    run_seq = session["run_seq"]
+    session["updated_at"] = _da_now_iso()
+    t = _threading.Thread(
+        target=_da_worker_loop,
+        args=(session.get("id"), run_seq),
+        daemon=True,
+    )
+    session["worker"] = t
+    t.start()
+    return True
+
+
+def _da_extract_response_payload(resp_obj):
+    status_code = 200
+    response = resp_obj
+    if isinstance(resp_obj, tuple):
+        response = resp_obj[0]
+        if len(resp_obj) > 1 and isinstance(resp_obj[1], int):
+            status_code = resp_obj[1]
+    if hasattr(response, "status_code"):
+        status_code = int(getattr(response, "status_code", status_code) or status_code)
+    if hasattr(response, "get_json"):
+        data = response.get_json(silent=True) or {}
+    else:
+        data = {}
+    return status_code, data
+
+
+def _da_worker_loop(session_id: str, run_seq: int) -> None:
+    while True:
+        with _data_analyst_sessions_lock:
+            session = _data_analyst_sessions.get(session_id)
+            if not session:
+                return
+            if int(session.get("run_seq", 0)) != int(run_seq):
+                # A newer run superseded this worker.
+                return
+            if session.get("stop_requested"):
+                session["running"] = False
+                session["status"] = "stopped"
+                _da_log_event(session, "Run cancelled before start (stop requested).", "warn", "control")
+                return
+            if session.get("pause_requested"):
+                session["running"] = False
+                session["status"] = "paused"
+                _da_log_event(session, "Run paused before start.", "warn", "control")
+                return
+            if not session.get("pending_user_inputs"):
+                session["running"] = False
+                if session.get("status") not in {"paused", "stopped", "error"}:
+                    session["status"] = "idle"
+                session["updated_at"] = _da_now_iso()
+                return
+            user_question = str(session["pending_user_inputs"].pop(0)).strip()
+            params = dict(session.get("params", {}))
+            _da_refresh_memory_summary(session)
+            composed_question = _da_compose_question(session, user_question)
+            _da_log_event(
+                session,
+                f"Run #{run_seq}: starting analysis for question '{user_question[:120]}'",
+                "info",
+                "run",
+            )
+
+            try:
+                schema = _da_get_schema_with_cache(session)
+                table_metadata = _da_build_table_metadata_map()
+            except Exception as schema_exc:
+                schema = {}
+                table_metadata = {}
+                _da_log_event(
+                    session,
+                    f"Schema/metadata loading failed ({schema_exc}). Running with empty schema context.",
+                    "warn",
+                    "schema",
+                )
+
+            table_filter = _da_parse_table_filter(params.get("table_filter", []))
+
+        payload = {
+            "question": composed_question or user_question,
+            "schema": schema,
+            "tableMetadata": table_metadata,
+            "tableMappingFilter": table_filter,
+            "maxSteps": _da_coerce_int(params.get("max_steps", 8), 8, 1, 50),
+            "use_knowledge_base": _da_coerce_bool(params.get("use_knowledge_base", True), True),
+            "use_knowledge_agent": _da_coerce_bool(params.get("use_knowledge_agent", False), False),
+            "control_session_id": session_id,
+        }
+
+        try:
+            with app.app_context():
+                with app.test_request_context("/api/agent", method="POST", json=payload):
+                    resp = agent_analysis()
+            status_code, result = _da_extract_response_payload(resp)
+        except Exception as run_exc:
+            status_code = 500
+            result = {"error": str(run_exc)}
+
+        with _data_analyst_sessions_lock:
+            session = _data_analyst_sessions.get(session_id)
+            if not session or int(session.get("run_seq", 0)) != int(run_seq):
+                return
+
+            assistant_payload = {
+                "content": "",
+                "analyst_result": None,
+                "error": "",
+            }
+
+            if status_code >= 400 or result.get("error"):
+                err_txt = str(result.get("error") or f"Agent returned HTTP {status_code}")
+                session["status"] = "error"
+                session["running"] = False
+                assistant_payload["content"] = f"Agent error: {err_txt}"
+                assistant_payload["error"] = err_txt
+                _da_log_event(session, f"Run failed: {err_txt}", "error", "run")
+            else:
+                interrupted = bool(result.get("interrupted", False))
+                interrupt_reason = str(result.get("interrupt_reason", "")).strip().lower()
+                analyst_result = {
+                    "final_answer": result.get("final_answer", ""),
+                    "steps": result.get("steps", []),
+                    "total_steps": result.get("total_steps", len(result.get("steps", []))),
+                    "technical_retries_used": result.get("technical_retries_used", 0),
+                    "query_attempts_used": result.get("query_attempts_used", 0),
+                    "max_total_query_attempts": result.get("max_total_query_attempts", 0),
+                    "initial_plan": result.get("initial_plan", []),
+                    "current_plan": result.get("current_plan", []),
+                    "midcourse_review": result.get("midcourse_review", {}),
+                    "no_prompt_context_injection": bool(result.get("no_prompt_context_injection", False)),
+                    "interrupted": interrupted,
+                    "interrupt_reason": interrupt_reason,
+                }
+                session["last_result"] = analyst_result
+                assistant_payload["analyst_result"] = analyst_result
+                assistant_payload["content"] = (
+                    str(result.get("final_answer", "")).strip()
+                    or "Analysis complete."
+                )
+                if interrupted and interrupt_reason == "paused":
+                    session["status"] = "paused"
+                    _da_log_event(session, "Run paused after interruption request.", "warn", "control")
+                elif interrupted and interrupt_reason == "stopped":
+                    session["status"] = "stopped"
+                    _da_log_event(session, "Run stopped after interruption request.", "warn", "control")
+                else:
+                    session["status"] = "completed"
+                    _da_log_event(
+                        session,
+                        (
+                            "Run completed: "
+                            f"{analyst_result['total_steps']} step(s), "
+                            f"{analyst_result['technical_retries_used']} free retry(ies), "
+                            f"{analyst_result['query_attempts_used']} SQL attempt(s)."
+                        ),
+                        "info",
+                        "run",
+                    )
+
+            if assistant_payload["content"]:
+                session.setdefault("conversation", []).append({
+                    "role": "assistant",
+                    "content": assistant_payload["content"],
+                    "ts": _da_now_iso(),
+                })
+            session["latest_assistant"] = assistant_payload
+            session["response_seq"] = int(session.get("response_seq", 0)) + 1
+            _da_refresh_memory_summary(session)
+
+            if session.get("stop_requested"):
+                session["running"] = False
+                session["status"] = "stopped"
+                session["updated_at"] = _da_now_iso()
+                return
+            if session.get("pause_requested"):
+                session["running"] = False
+                session["status"] = "paused"
+                session["updated_at"] = _da_now_iso()
+                return
+
+            should_continue = bool(
+                session.get("params", {}).get("auto_run", True)
+                and session.get("pending_user_inputs")
+            )
+            if should_continue:
+                session["running"] = True
+                session["status"] = "running"
+                session["updated_at"] = _da_now_iso()
+                _da_log_event(session, "Continuing with queued follow-up question.", "info", "queue")
+                continue
+
+            session["running"] = False
+            if session.get("status") not in {"paused", "stopped", "error"}:
+                session["status"] = "idle"
+            session["updated_at"] = _da_now_iso()
+            return
+
+
+def _run_ai_data_analyst_session_agent():
+    data = request.get_json(silent=True) or {}
+    params_raw = data.get("params", {}) or {}
+    control = str(data.get("control", "")).strip().lower()
+    session_id = str(data.get("session_id", "")).strip()
+    messages = data.get("messages", []) or []
+
+    last_user_text = ""
+    if isinstance(messages, list):
+        for m in reversed(messages):
+            if str(m.get("role", "")) == "user":
+                last_user_text = str(m.get("content", "")).strip()
+                if last_user_text:
+                    break
+
+    with _data_analyst_sessions_lock:
+        if session_id and session_id in _data_analyst_sessions:
+            session = _data_analyst_sessions[session_id]
+        else:
+            session_id = str(uuid.uuid4())
+            session = {
+                "id": session_id,
+                "created_at": _da_now_iso(),
+                "updated_at": _da_now_iso(),
+                "status": "idle",
+                "running": False,
+                "pause_requested": False,
+                "stop_requested": False,
+                "params": _da_normalize_params(params_raw),
+                "conversation": [],
+                "pending_user_inputs": [],
+                "paused_notes": [],
+                "memory_summary": "",
+                "event_log": [],
+                "event_seq": 0,
+                "response_seq": 0,
+                "latest_assistant": None,
+                "last_result": None,
+                "cached_schema": None,
+                "cached_schema_ts": 0,
+                "run_seq": 0,
+                "worker": None,
+            }
+            _data_analyst_sessions[session_id] = session
+            _da_log_event(session, "New AI data analyst session created.", "info", "session")
+
+        # Merge latest params at each call (keeps runtime tunable in the UI)
+        merged_params = dict(session.get("params", {}))
+        merged_params.update(_da_normalize_params(params_raw))
+        session["params"] = merged_params
+        session["updated_at"] = _da_now_iso()
+
+        # Control actions
+        if control == "status":
+            payload = _da_session_payload(session)
+            payload["content"] = "Runtime status fetched."
+            return jsonify(payload)
+
+        if control == "pause":
+            session["pause_requested"] = True
+            if session.get("running"):
+                session["status"] = "pausing"
+                _da_log_event(session, "Pause requested (will apply between steps).", "warn", "control")
+                content = "Pause requested. The agent will pause at the next safe checkpoint."
+            else:
+                session["status"] = "paused"
+                _da_log_event(session, "Session paused.", "warn", "control")
+                content = "Session paused. You can add more context, then click Resume."
+            payload = _da_session_payload(session)
+            payload["content"] = content
+            return jsonify(payload)
+
+        if control == "stop":
+            session["stop_requested"] = True
+            if session.get("running"):
+                session["status"] = "stopping"
+                _da_log_event(session, "Stop requested (will apply between steps).", "warn", "control")
+                content = "Stop requested. Current run will stop at the next safe checkpoint."
+            else:
+                session["running"] = False
+                session["status"] = "stopped"
+                _da_log_event(session, "Session stopped.", "warn", "control")
+                content = "Session stopped."
+            payload = _da_session_payload(session)
+            payload["content"] = content
+            return jsonify(payload)
+
+        if control == "resume":
+            session["pause_requested"] = False
+            session["stop_requested"] = False
+            if last_user_text:
+                session["conversation"].append({
+                    "role": "user",
+                    "content": last_user_text,
+                    "ts": _da_now_iso(),
+                })
+                session["pending_user_inputs"].append(last_user_text)
+                _da_log_event(session, "User added a new message while resuming.", "info", "input")
+            started = _da_start_worker_if_needed(session)
+            if started:
+                content = "Session resumed. Agent run started."
+                _da_log_event(session, "Session resumed and run started.", "info", "control")
+            else:
+                session["status"] = "idle" if not session.get("running") else session.get("status")
+                content = "Session resumed. No pending message to process."
+                _da_log_event(session, "Session resumed without pending run.", "info", "control")
+            payload = _da_session_payload(session)
+            payload["content"] = content
+            return jsonify(payload)
+
+        if control == "run":
+            session["pause_requested"] = False
+            session["stop_requested"] = False
+            if last_user_text:
+                session["conversation"].append({
+                    "role": "user",
+                    "content": last_user_text,
+                    "ts": _da_now_iso(),
+                })
+                session["pending_user_inputs"].append(last_user_text)
+                _da_log_event(session, "Queued new user message for manual run.", "info", "input")
+            started = _da_start_worker_if_needed(session)
+            payload = _da_session_payload(session)
+            payload["content"] = "Run started." if started else "No pending message to run."
+            return jsonify(payload)
+
+        if control == "note":
+            if last_user_text:
+                session["conversation"].append({
+                    "role": "user",
+                    "content": last_user_text,
+                    "ts": _da_now_iso(),
+                })
+                session.setdefault("paused_notes", []).append(last_user_text)
+                session["paused_notes"] = session["paused_notes"][-20:]
+                _da_refresh_memory_summary(session)
+                _da_log_event(session, "User note captured while paused.", "info", "input")
+            payload = _da_session_payload(session)
+            payload["content"] = "Context note saved. Resume the agent when ready."
+            return jsonify(payload)
+
+        # Default message flow
+        if not last_user_text:
+            payload = _da_session_payload(session)
+            payload["content"] = "No user message provided."
+            return jsonify(payload), 400
+
+        session["conversation"].append({
+            "role": "user",
+            "content": last_user_text,
+            "ts": _da_now_iso(),
+        })
+        if session.get("status") == "paused" or session.get("pause_requested"):
+            session.setdefault("paused_notes", []).append(last_user_text)
+            session["paused_notes"] = session["paused_notes"][-20:]
+            _da_refresh_memory_summary(session)
+            _da_log_event(session, "User context stored while session is paused.", "info", "input")
+            payload = _da_session_payload(session)
+            payload["content"] = "Context saved (paused). Click Resume to continue."
+            return jsonify(payload)
+
+        session["pending_user_inputs"].append(last_user_text)
+        _da_refresh_memory_summary(session)
+        _da_log_event(session, f"Queued user request: '{last_user_text[:120]}'", "info", "input")
+        started = False
+        if session.get("params", {}).get("auto_run", True):
+            session["pause_requested"] = False
+            session["stop_requested"] = False
+            started = _da_start_worker_if_needed(session)
+
+        payload = _da_session_payload(session)
+        if started:
+            payload["content"] = "Agent started. Follow live logs while it is running."
+        else:
+            payload["content"] = (
+                "Message queued. Click Run to start."
+                if not session.get("running")
+                else "Message queued while a run is already in progress."
+            )
+        return jsonify(payload)
+
 AGENTS_CATALOG = [
+    {
+        "id": "ai-data-analyst",
+        "name": "AI Data Analyst (Session)",
+        "description": (
+            "Agent analyste data en lecture seule, conçu pour des discussions multi-tours. "
+            "Il garde une mémoire compacte de la conversation, planifie des requêtes ClickHouse "
+            "simples, se réévalue et permet pause/reprise/arrêt avec logs temps réel."
+        ),
+        "parameters": [
+            {
+                "name": "max_steps",
+                "label": "Maximum steps",
+                "type": "number",
+                "default": 8,
+                "description": "Crédit de steps par run (1-50). Les retries techniques gratuits restent plafonnés globalement.",
+            },
+            {
+                "name": "use_knowledge_base",
+                "label": "Use knowledge base",
+                "type": "select",
+                "options": ["yes", "no"],
+                "default": "yes",
+                "description": "Active la recherche de contexte métier via la base de connaissance.",
+            },
+            {
+                "name": "use_knowledge_agent",
+                "label": "Knowledge agent mode",
+                "type": "select",
+                "options": ["no", "yes"],
+                "default": "no",
+                "description": "Si 'yes': aucune injection statique schéma/métadonnées/KB dans les prompts.",
+            },
+            {
+                "name": "memory_turn_limit",
+                "label": "Memory turns kept",
+                "type": "number",
+                "default": 8,
+                "description": "Nombre de tours récents conservés dans la mémoire compacte.",
+            },
+            {
+                "name": "memory_token_budget",
+                "label": "Memory token budget",
+                "type": "number",
+                "default": 700,
+                "description": "Budget tokens maximal pour la mémoire injectée à chaque nouveau run.",
+            },
+            {
+                "name": "table_filter",
+                "label": "Table filter (optional)",
+                "type": "string",
+                "default": "",
+                "description": "Liste de tables séparées par des virgules pour restreindre l'analyse.",
+            },
+            {
+                "name": "auto_run",
+                "label": "Auto-run after message",
+                "type": "select",
+                "options": ["yes", "no"],
+                "default": "yes",
+                "description": "Lance automatiquement une exécution après chaque nouveau message utilisateur.",
+            },
+        ],
+    },
     {
         "id": "data-dictionary",
         "name": "Générateur de Data Dictionary dynamique",
@@ -5005,6 +5706,8 @@ def list_agents():
 @app.route("/api/agents/<agent_id>/chat", methods=["POST"])
 def agent_chat(agent_id):
     """Dispatch a chat message to the requested agent."""
+    if agent_id == "ai-data-analyst":
+        return _run_ai_data_analyst_session_agent()
     if agent_id == "data-dictionary":
         return _run_data_dictionary_agent()
     if agent_id == "clickhouse-writer":
