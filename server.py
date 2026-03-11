@@ -542,7 +542,7 @@ def _parse_llm_json(content: str) -> dict:
 # ---------------------------------------------------------------------------
 import re as _re
 
-# Cache: model name -> max context window (tokens)
+# Cache: "<provider>::<model>" -> max context window (tokens)
 _model_context_cache: dict = {}
 
 # Known context windows for common models
@@ -567,13 +567,118 @@ _KNOWN_CONTEXT_LIMITS: dict = {
     "claude": 200000,
 }
 
-# Budget: reserve this fraction of the context for conversation + output
-_SYSTEM_PROMPT_BUDGET_FRACTION = 0.5
+# Budget: reserve this fraction of the effective context for system prompt context
+_SYSTEM_PROMPT_BUDGET_FRACTION = 0.45
+
+# Keep a conservative margin: local model tokenization/runtime context can differ
+# from nominal architecture limits.
+_CONTEXT_SAFETY_RATIO = 0.72
+_CONTEXT_OUTPUT_RESERVE = 256
 
 
 def _estimate_tokens(text: str) -> int:
-    """Rough token estimate: ~4 chars per token for typical text."""
-    return max(1, len(text) // 4)
+    """Conservative token estimate (biased high to avoid overflow)."""
+    if not text:
+        return 0
+    # JSON-heavy prompts tokenize denser than plain prose.
+    base = len(text) / 3.2
+    structure_penalty = (
+        text.count("{")
+        + text.count("}")
+        + text.count("[")
+        + text.count("]")
+        + text.count(":")
+        + text.count(",")
+        + text.count("\n")
+    ) * 0.04
+    return max(1, int(base + structure_penalty))
+
+
+def _parse_int_like(value, default: int = 0) -> int:
+    """Parse int from config values that may be int/float/string."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        m = _re.search(r"\d+", value)
+        if m:
+            try:
+                return int(m.group(0))
+            except Exception:
+                return default
+    return default
+
+
+def _is_context_overflow_error(error_text: str) -> bool:
+    """Detect provider error messages caused by context/token overflow."""
+    text = (error_text or "").lower()
+    if not text:
+        return False
+    markers = (
+        "context window",
+        "context length",
+        "maximum context",
+        "prompt is too long",
+        "input is too long",
+        "too many tokens",
+        "token limit",
+        "input length exceeds",
+        "requested tokens",
+        "num_ctx",
+    )
+    return any(m in text for m in markers)
+
+
+def _get_ollama_runtime_context_limit(model: str, base_url: str) -> int | None:
+    """Ask Ollama /api/show for the effective model/runtime context."""
+    try:
+        ollama_url = (base_url or "http://localhost:11434").rstrip("/")
+        resp = _http_post(
+            f"{ollama_url}/api/show",
+            json={"name": model},
+            timeout=20,
+        )
+        if not resp.ok:
+            return None
+        data = _parse_response_json(resp, "Ollama show")
+    except Exception:
+        return None
+
+    candidates: list[int] = []
+
+    details = data.get("details", {})
+    if isinstance(details, dict):
+        for key in ("context_length", "num_ctx"):
+            v = _parse_int_like(details.get(key), 0)
+            if v > 0:
+                candidates.append(v)
+
+    model_info = data.get("model_info", {})
+    if isinstance(model_info, dict):
+        for key, value in model_info.items():
+            if "context_length" in str(key):
+                v = _parse_int_like(value, 0)
+                if v > 0:
+                    candidates.append(v)
+
+    # "parameters" is often a raw multiline string (e.g. "num_ctx 8192").
+    params_raw = data.get("parameters")
+    if isinstance(params_raw, str):
+        for pattern in (r"\bnum_ctx\s+(\d+)\b", r"\bcontext_length\s+(\d+)\b"):
+            m = _re.search(pattern, params_raw, flags=_re.IGNORECASE)
+            if m:
+                v = _parse_int_like(m.group(1), 0)
+                if v > 0:
+                    candidates.append(v)
+
+    if not candidates:
+        return None
+
+    # Use the smallest discovered limit: this is safer than architecture max.
+    return max(512, min(candidates))
 
 
 def _get_model_context_limit() -> int:
@@ -585,15 +690,49 @@ def _get_model_context_limit() -> int:
     3. Ask the LLM itself, cache the result.
     4. Conservative default (4 096 tokens).
     """
+    provider = (llm_config.get("provider") or "ollama").lower()
     model = (llm_config.get("model") or "unknown").lower()
+    cache_key = f"{provider}::{model}"
 
-    if model in _model_context_cache:
-        return _model_context_cache[model]
+    if cache_key in _model_context_cache:
+        return _model_context_cache[cache_key]
+
+    # Explicit override from config/UI (if provided) has highest priority.
+    explicit = _parse_int_like(
+        llm_config.get("contextWindow")
+        or llm_config.get("maxContextTokens")
+        or llm_config.get("numCtx"),
+        0,
+    )
+    if explicit > 0:
+        _model_context_cache[cache_key] = explicit
+        print(f"[Token budget] Using explicit contextWindow={explicit} for '{cache_key}'")
+        return explicit
+
+    # For Ollama, prefer runtime context from /api/show over theoretical model limits.
+    if provider == "ollama":
+        runtime_limit = _get_ollama_runtime_context_limit(
+            llm_config.get("model") or "llama3",
+            llm_config.get("baseUrl") or "http://localhost:11434",
+        )
+        if runtime_limit:
+            _model_context_cache[cache_key] = runtime_limit
+            print(f"[Token budget] Ollama runtime context for '{model}': {runtime_limit} tokens")
+            return runtime_limit
+
+        # Safe fallback for local Ollama runs when runtime discovery is unavailable.
+        fallback = 8192
+        _model_context_cache[cache_key] = fallback
+        print(
+            f"[Token budget] Could not detect Ollama runtime context for '{model}', "
+            f"using conservative fallback: {fallback} tokens"
+        )
+        return fallback
 
     for known_name, limit in _KNOWN_CONTEXT_LIMITS.items():
         if known_name in model:
-            _model_context_cache[model] = limit
-            print(f"[Token budget] Known context limit for '{model}': {limit} tokens")
+            _model_context_cache[cache_key] = limit
+            print(f"[Token budget] Known context limit for '{cache_key}': {limit} tokens")
             return limit
 
     # Unknown model – ask the LLM
@@ -607,16 +746,24 @@ def _get_model_context_limit() -> int:
         match = _re.search(r"\d[\d,. ]*", answer)
         if match:
             limit = int(_re.sub(r"[^0-9]", "", match.group()))
-            _model_context_cache[model] = limit
-            print(f"[Token budget] Model '{model}' self-reported context limit: {limit} tokens")
+            _model_context_cache[cache_key] = limit
+            print(f"[Token budget] Model '{cache_key}' self-reported context limit: {limit} tokens")
             return limit
     except Exception as exc:
         print(f"[Token budget] Could not query model context limit: {exc}")
 
     default = 4096
-    _model_context_cache[model] = default
-    print(f"[Token budget] Unknown model '{model}', using conservative default: {default} tokens")
+    _model_context_cache[cache_key] = default
+    print(f"[Token budget] Unknown model '{cache_key}', using conservative default: {default} tokens")
     return default
+
+
+def _get_effective_context_limit() -> int:
+    """Return a conservative usable context limit with safety margin."""
+    raw = _get_model_context_limit()
+    effective = min(int(raw * _CONTEXT_SAFETY_RATIO), raw - _CONTEXT_OUTPUT_RESERVE)
+    # Never go below 512 tokens to keep minimal functionality.
+    return max(512, effective)
 
 
 def _truncate_prompt_context(
@@ -629,7 +776,7 @@ def _truncate_prompt_context(
 
     Returns (schema, table_metadata, knowledge_context) – possibly truncated.
     """
-    context_limit = _get_model_context_limit()
+    context_limit = _get_effective_context_limit()
     budget = int(context_limit * _SYSTEM_PROMPT_BUDGET_FRACTION)
     remaining = budget - base_tokens
 
@@ -668,9 +815,23 @@ def _truncate_prompt_context(
         print(f"[Token budget] Knowledge context truncated to ~{available_for_knowledge} tokens")
         return schema_compact, {}, truncated_knowledge
 
-    # Step 5 – only table names (no columns)
-    schema_names_only = {tbl: [] for tbl in schema}
-    print("[Token budget] Sending table names only – context extremely tight")
+    # Step 5 – only table names (no columns), capped to remaining budget
+    max_schema_tokens = max(40, remaining - 10)
+    schema_names_only = {}
+    consumed = 0
+    for tbl in schema:
+        cost = _estimate_tokens(tbl) + 3
+        if schema_names_only and consumed + cost > max_schema_tokens:
+            break
+        schema_names_only[tbl] = []
+        consumed += cost
+    if not schema_names_only and schema:
+        first_tbl = next(iter(schema.keys()))
+        schema_names_only[first_tbl] = []
+    print(
+        "[Token budget] Sending capped table names only "
+        f"({len(schema_names_only)}/{len(schema)}) – context extremely tight"
+    )
     return schema_names_only, {}, ""
 
 
@@ -697,6 +858,19 @@ def _trim_messages_to_budget(
         trimmed_reversed.append(msg)
         consumed += msg_tokens
     return list(reversed(trimmed_reversed))
+
+
+def _truncate_text_to_budget(text: str, token_budget: int) -> str:
+    """Trim free text to a token budget using the local estimator."""
+    if not text:
+        return ""
+    if token_budget <= 0:
+        return ""
+    if _estimate_tokens(text) <= token_budget:
+        return text
+    # Convert budget back to chars with conservative multiplier.
+    max_chars = max(80, int(token_budget * 3))
+    return text[:max_chars]
 
 
 def _summarize_agent_steps_for_prompt(
@@ -1810,11 +1984,11 @@ def chat():
         table_metadata = {t: v for t, v in table_metadata.items() if t in table_mapping_filter}
 
     formatted_messages = [{"role": m["role"], "content": m["content"]} for m in messages]
-    message_budget = int(_get_model_context_limit() * 0.18)
+    message_budget = int(_get_effective_context_limit() * 0.14)
     formatted_messages = _trim_messages_to_budget(
         formatted_messages,
         token_budget=message_budget,
-        keep_last=14,
+        keep_last=10,
     )
 
     # ------------------------------------------------------------------
@@ -1837,6 +2011,8 @@ def chat():
         "The following tables have friendly business names. When communicating with the user use the friendly name, but always use the technical name in SQL:\n"
         + "\n".join(mapping_lines)
     ) if mapping_lines else ""
+    mapping_note = _truncate_text_to_budget(mapping_note, token_budget=280)
+    fk_context = _truncate_text_to_budget(fk_context, token_budget=220)
 
     # ------------------------------------------------------------------
     # Token budget: base prompt without dynamic content
@@ -2009,8 +2185,39 @@ Do not include markdown formatting. Just the raw JSON.
     try:
         content = _call_llm(system_prompt, formatted_messages, temperature=0.3)
     except Exception as exc:
-        print(f"Chat error: {exc}")
-        return jsonify({"error": str(exc)}), 500
+        if _is_context_overflow_error(str(exc)):
+            print(f"[Chat] Context overflow detected, retrying with compact prompt: {exc}")
+            compact_tables = list(schema.items())[:24]
+            compact_schema = {}
+            for tbl, cols in compact_tables:
+                names = [c["name"] if isinstance(c, dict) else str(c) for c in cols][:8]
+                compact_schema[tbl] = names
+            compact_prompt = f"""You are an expert ClickHouse data analyst.
+Return ONLY valid JSON:
+{{
+  "sql": "SELECT ...",
+  "explanation": "Brief explanation.",
+  "suggestedVisual": "table" | "bar" | "line" | "pie"
+}}
+If critical ambiguity remains, return:
+{{"needs_clarification": true, "question": "...", "options": [], "type": "table_selection"}}
+
+Database schema hint (truncated):
+{json.dumps(compact_schema, indent=2)}
+"""
+            tiny_messages = _trim_messages_to_budget(
+                formatted_messages,
+                token_budget=int(_get_effective_context_limit() * 0.08),
+                keep_last=6,
+            )
+            try:
+                content = _call_llm(compact_prompt, tiny_messages, temperature=0.2)
+            except Exception as retry_exc:
+                print(f"Chat compact retry error: {retry_exc}")
+                return jsonify({"error": str(retry_exc)}), 500
+        else:
+            print(f"Chat error: {exc}")
+            return jsonify({"error": str(exc)}), 500
 
     conversation_id = (
         data.get("conversationId")
@@ -2568,30 +2775,96 @@ No markdown fences. Only raw JSON."""
 
         system_prompt = static_header + "\n\n" + context_section + static_footer
 
-        # ── Final safety check: abort if prompt still exceeds context window ──
-        context_limit = _get_model_context_limit()
+        # ── Final safety check: if still too large, fallback to ultra-compact prompt ──
+        context_limit = _get_effective_context_limit()
         total_tokens = _estimate_tokens(system_prompt + "Proceed with the next step.")
         if total_tokens > context_limit:
             print(
                 f"[Token safety] Prompt too large even after truncation: "
-                f"~{total_tokens} tokens > {context_limit} limit. Aborting step."
+                f"~{total_tokens} tokens > {context_limit} limit. Falling back to compact step prompt."
             )
-            return {
-                "action": "finish",
-                "reasoning": "Context window exceeded",
-                "final_answer": (
-                    "Désolé, la demande dépasse la fenêtre contextuelle du modèle même après "
-                    "réduction du contexte. Veuillez reformuler votre question de façon plus "
-                    "ciblée (par exemple en précisant les tables ou métriques concernées) afin "
-                    "que l'analyse puisse fonctionner correctement."
-                ),
-            }
+            compact_steps_context = _summarize_agent_steps_for_prompt(
+                steps_so_far,
+                max_steps=4,
+                max_result_chars=120,
+            )
+            system_prompt = f"""You are an autonomous ClickHouse data analyst agent.
+Your goal is to decide the next best action with minimal context.
 
-        content = _call_llm(
-            system_prompt,
-            [{"role": "user", "content": "Proceed with the next step."}],
-            temperature=0.2,
-        )
+CURRENT ANALYSIS PROGRESS:
+{compact_steps_context if compact_steps_context else "None yet — first step."}
+
+USER QUESTION:
+{user_question}
+
+INSTRUCTIONS:
+{actions_block}
+Return raw JSON only.
+
+For SQL:
+{{
+  "action": "query",
+  "reasoning": "Short reason",
+  "sql": "SELECT ..."
+}}
+{kb_json_schema}
+For final answer:
+{{
+  "action": "finish",
+  "reasoning": "Why enough information is available",
+  "final_answer": "Structured answer based on gathered evidence"
+}}"""
+            compact_total = _estimate_tokens(system_prompt + "Proceed with the next step.")
+            if compact_total > context_limit:
+                return {
+                    "action": "finish",
+                    "reasoning": "Context window exceeded",
+                    "final_answer": (
+                        "Désolé, la demande dépasse la fenêtre contextuelle du modèle, même en mode compact. "
+                        "Veuillez préciser un périmètre plus réduit (ex: moins de tables ou une période plus courte)."
+                    ),
+                }
+
+        try:
+            content = _call_llm(
+                system_prompt,
+                [{"role": "user", "content": "Proceed with the next step."}],
+                temperature=0.2,
+            )
+        except Exception as exc:
+            if _is_context_overflow_error(str(exc)):
+                compact_steps_context = _summarize_agent_steps_for_prompt(
+                    steps_so_far,
+                    max_steps=3,
+                    max_result_chars=90,
+                )
+                emergency_prompt = f"""You are an autonomous ClickHouse data analyst agent.
+Pick ONLY the next action in raw JSON.
+{actions_block}
+Current progress:
+{compact_steps_context}
+User question:
+{user_question}
+Allowed JSON:
+{{"action":"query","reasoning":"...","sql":"SELECT ..."}}
+{{"action":"finish","reasoning":"...","final_answer":"..."}}"""
+                try:
+                    content = _call_llm(
+                        emergency_prompt,
+                        [{"role": "user", "content": "Proceed with the next step."}],
+                        temperature=0.1,
+                    )
+                except Exception:
+                    return {
+                        "action": "finish",
+                        "reasoning": "Context window exceeded",
+                        "final_answer": (
+                            "Désolé, l'agent est bloqué par la limite de contexte du modèle local. "
+                            "Essayez de filtrer les tables (Table Mapping Filter) ou de désactiver la knowledge base."
+                        ),
+                    }
+                return _parse_llm_json(content)
+            raise
         return _parse_llm_json(content)
 
     def _run_agent_retry(steps_so_far: list, retry_info: dict) -> dict:
