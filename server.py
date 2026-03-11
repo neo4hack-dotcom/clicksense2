@@ -674,6 +674,233 @@ def _truncate_prompt_context(
     return schema_names_only, {}, ""
 
 
+def _trim_messages_to_budget(
+    messages: list,
+    token_budget: int,
+    keep_last: int = 10,
+) -> list:
+    """Keep the latest messages that fit into a token budget."""
+    if not messages or token_budget <= 0:
+        return []
+
+    tail = messages[-keep_last:] if keep_last > 0 else messages
+    trimmed_reversed = []
+    consumed = 0
+    for msg in reversed(tail):
+        msg_tokens = _estimate_tokens(str(msg.get("content", ""))) + 8
+        if trimmed_reversed and consumed + msg_tokens > token_budget:
+            break
+        if not trimmed_reversed and msg_tokens > token_budget:
+            # Always keep at least the latest user message.
+            trimmed_reversed.append(msg)
+            break
+        trimmed_reversed.append(msg)
+        consumed += msg_tokens
+    return list(reversed(trimmed_reversed))
+
+
+def _summarize_agent_steps_for_prompt(
+    steps: list,
+    max_steps: int = 8,
+    max_result_chars: int = 240,
+) -> str:
+    """Compact step history to reduce context pressure in agent prompts."""
+    if not steps:
+        return "None yet — this is the first step."
+
+    selected = steps[-max_steps:]
+    lines = []
+    for s in selected:
+        action_label = "SQL" if s.get("type") == "query" else "Knowledge search"
+        status = "OK" if s.get("ok", True) else "FAILED"
+        payload = (s.get("sql") or s.get("search_query") or "").strip()
+        result_preview = str(s.get("result_summary", "")).replace("\n", " ")
+        result_preview = result_preview[:max_result_chars]
+        lines.append(
+            f"Step {s.get('step', '?')} [{action_label} | {status}] "
+            f"Reasoning: {s.get('reasoning', '')[:180]} | "
+            f"Action: {payload[:220]} | "
+            f"Result: {result_preview}"
+        )
+    return "\n".join(lines)
+
+
+_READONLY_ALLOWED_PREFIXES = ("SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH")
+_READONLY_FORBIDDEN_KEYWORDS = (
+    "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE", "CREATE",
+    "RENAME", "ATTACH", "DETACH", "OPTIMIZE", "SYSTEM", "GRANT", "REVOKE",
+    "KILL", "SET ROLE", "USE",
+)
+
+
+def _classify_clickhouse_error(error_text: str) -> str:
+    """Map raw ClickHouse errors to stable categories for retry strategies."""
+    text = (error_text or "").lower()
+    if not text:
+        return "unknown"
+    if "syntax" in text or "parse" in text:
+        return "syntax_error"
+    if "unknown table" in text or "doesn't exist" in text:
+        return "unknown_table"
+    if "unknown column" in text or "missing columns" in text:
+        return "unknown_column"
+    if "type mismatch" in text or "cannot parse" in text or "illegal type" in text:
+        return "type_mismatch"
+    if "memory limit" in text:
+        return "memory_limit"
+    if "timeout" in text or "max_execution_time" in text:
+        return "timeout"
+    if "not enough privileges" in text or "readonly" in text:
+        return "permission"
+    if "aggregate function" in text:
+        return "aggregation_error"
+    if "join" in text and ("not found" in text or "cannot" in text):
+        return "join_error"
+    return "execution_error"
+
+
+def _normalize_sql_for_execution(
+    sql: str,
+    *,
+    read_only: bool,
+    default_limit: int = 1000,
+    hard_limit_cap: int = 5000,
+) -> str:
+    """Validate and normalize SQL before execution."""
+    raw = (sql or "").strip()
+    if not raw:
+        raise ValueError("Empty SQL query.")
+
+    # Disallow multi-statement payloads.
+    statement = raw.rstrip(";").strip()
+    if ";" in statement:
+        raise ValueError("Multiple SQL statements are not allowed.")
+    upper = statement.upper()
+
+    if read_only:
+        if not upper.startswith(_READONLY_ALLOWED_PREFIXES):
+            raise ValueError(
+                "Read-only agent accepts only SELECT/SHOW/DESCRIBE/EXPLAIN/WITH queries."
+            )
+        for keyword in _READONLY_FORBIDDEN_KEYWORDS:
+            if re.search(rf"\b{re.escape(keyword)}\b", upper):
+                raise ValueError(f"Forbidden SQL keyword for read-only mode: {keyword}")
+
+        # Ensure bounded result sets for better reliability with local LLM loops.
+        limit_match = re.search(r"\bLIMIT\s+(\d+)\b", statement, flags=re.IGNORECASE)
+        if limit_match:
+            current = int(limit_match.group(1))
+            if current > hard_limit_cap:
+                statement = re.sub(
+                    r"\bLIMIT\s+\d+\b",
+                    f"LIMIT {hard_limit_cap}",
+                    statement,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+        elif upper.startswith(("SELECT", "WITH")):
+            statement = f"{statement}\nLIMIT {default_limit}"
+
+    return statement
+
+
+def _execute_sql_guarded(
+    sql: str,
+    *,
+    read_only: bool,
+    max_preview_rows: int = 20,
+    max_execution_time: int = 15,
+    default_limit: int = 1000,
+    hard_limit_cap: int = 5000,
+    client=None,
+) -> dict:
+    """Execute SQL with safety rules and stable structured output."""
+    try:
+        normalized_sql = _normalize_sql_for_execution(
+            sql,
+            read_only=read_only,
+            default_limit=default_limit,
+            hard_limit_cap=hard_limit_cap,
+        )
+    except Exception as exc:
+        err = str(exc)
+        return {
+            "ok": False,
+            "sql": (sql or "").strip(),
+            "normalized_sql": (sql or "").strip(),
+            "rows": [],
+            "preview_rows": [],
+            "columns": [],
+            "total_rows": 0,
+            "summary": f"Query blocked before execution: {err}",
+            "error": err,
+            "error_class": _classify_clickhouse_error(err),
+        }
+
+    try:
+        db_client = client or get_clickhouse_client()
+        settings = {"max_execution_time": max(1, int(max_execution_time))}
+        if read_only:
+            settings["readonly"] = 1
+
+        sql_upper = normalized_sql.lstrip().upper()
+        is_query = any(sql_upper.startswith(p) for p in _READONLY_ALLOWED_PREFIXES)
+        if is_query:
+            result = db_client.query(normalized_sql, settings=settings)
+            rows = _rows_to_dicts(result)
+            preview = rows[:max_preview_rows]
+            columns = list(preview[0].keys()) if preview else list(result.column_names or [])
+            sample_lines = [
+                ", ".join(str(r.get(c, "")) for c in columns)
+                for r in preview[:10]
+            ]
+            summary = (
+                f"{len(rows)} row(s) returned. Columns: {columns}."
+                + (f"\nSample:\n{chr(10).join(sample_lines)}" if sample_lines else "")
+            )
+            return {
+                "ok": True,
+                "sql": sql,
+                "normalized_sql": normalized_sql,
+                "rows": rows,
+                "preview_rows": preview,
+                "columns": columns,
+                "total_rows": len(rows),
+                "summary": summary,
+                "error": "",
+                "error_class": "",
+            }
+
+        # Non-read query (used by writer agent only)
+        db_client.command(normalized_sql)
+        return {
+            "ok": True,
+            "sql": sql,
+            "normalized_sql": normalized_sql,
+            "rows": [],
+            "preview_rows": [],
+            "columns": [],
+            "total_rows": 0,
+            "summary": "Command executed successfully.",
+            "error": "",
+            "error_class": "",
+        }
+    except Exception as exc:
+        err = str(exc)
+        return {
+            "ok": False,
+            "sql": sql,
+            "normalized_sql": normalized_sql,
+            "rows": [],
+            "preview_rows": [],
+            "columns": [],
+            "total_rows": 0,
+            "summary": f"Query failed: {err}",
+            "error": err,
+            "error_class": _classify_clickhouse_error(err),
+        }
+
+
 def _is_list_tables_request(messages: list) -> bool:
     """Return True when the user's last message is asking to list all tables."""
     for msg in reversed(messages):
@@ -1499,13 +1726,24 @@ def delete_saved_query(query_id):
 def execute_query():
     data = request.get_json()
     query = data["query"]
-    try:
-        client = get_clickhouse_client()
-        result = client.query(query, settings={"max_execution_time": 15, "readonly": 1})
-        rows = _rows_to_dicts(result)
-        return jsonify({"data": rows})
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+    exec_result = _execute_sql_guarded(
+        query,
+        read_only=True,
+        max_preview_rows=200,
+        max_execution_time=15,
+        default_limit=2000,
+        hard_limit_cap=10000,
+    )
+    if not exec_result["ok"]:
+        return jsonify({
+            "error": exec_result["error"] or exec_result["summary"],
+            "error_class": exec_result.get("error_class", ""),
+            "normalized_sql": exec_result.get("normalized_sql", query),
+        }), 500
+    return jsonify({
+        "data": exec_result["rows"],
+        "normalized_sql": exec_result["normalized_sql"],
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -1547,6 +1785,7 @@ def chat():
             knowledge_context = "\n\n".join(
                 f"[{f['title']}]\n{f['content']}" for f in folders if f.get("content")
             ) or knowledge_base
+            knowledge_context = knowledge_context[:20000]
 
     # Build a map of technical name -> friendly mapping name
     all_mappings = {m["table_name"]: m["mapping_name"] for m in db.get("table_mappings", [])}
@@ -1571,6 +1810,12 @@ def chat():
         table_metadata = {t: v for t, v in table_metadata.items() if t in table_mapping_filter}
 
     formatted_messages = [{"role": m["role"], "content": m["content"]} for m in messages]
+    message_budget = int(_get_model_context_limit() * 0.18)
+    formatted_messages = _trim_messages_to_budget(
+        formatted_messages,
+        token_budget=message_budget,
+        keep_last=14,
+    )
 
     # ------------------------------------------------------------------
     # Special case: "list all tables" → generate SQL directly, no need
@@ -1648,10 +1893,10 @@ CLICKHOUSE INSTRUCTIONS:
 - Always write highly optimized SQL.
 
 DATE HANDLING — CRITICAL:
-- Do NOT use complex date functions such as toStartOfMonth(), toStartOfWeek(), toStartOfYear(), toStartOfQuarter(), year(), month(), day(), toDayOfMonth(), dateDiff(), addDays(), subtractDays() or any similar helper.
-- For date filtering, ALWAYS use simple BETWEEN syntax: column BETWEEN '2024-01-01' AND '2024-03-31'
-- For date grouping/truncation, use toYYYYMM() or formatDateTime() only if strictly necessary; prefer BETWEEN ranges.
-- Never wrap date columns in transformation functions inside WHERE clauses.
+- Prefer explicit date ranges with literals and BETWEEN when possible.
+- Avoid expensive transformations on date columns inside WHERE.
+- If a relative period is requested (last 7 days, this month), translate it into a clear and correct SQL date filter.
+- Do not hardcode fixed years unless the user explicitly asked for that period.
 
 When NOT ambiguous, return ONLY this JSON:
 {
@@ -1741,10 +1986,10 @@ CLICKHOUSE INSTRUCTIONS:
 - Always write highly optimized SQL.
 
 DATE HANDLING — CRITICAL:
-- Do NOT use complex date functions such as toStartOfMonth(), toStartOfWeek(), toStartOfYear(), toStartOfQuarter(), year(), month(), day(), toDayOfMonth(), dateDiff(), addDays(), subtractDays() or any similar helper.
-- For date filtering, ALWAYS use simple BETWEEN syntax: column BETWEEN '2024-01-01' AND '2024-03-31'
-- For date grouping/truncation, use toYYYYMM() or formatDateTime() only if strictly necessary; prefer BETWEEN ranges.
-- Never wrap date columns in transformation functions inside WHERE clauses.
+- Prefer explicit date ranges with literals and BETWEEN when possible.
+- Avoid expensive transformations on date columns inside WHERE.
+- If a relative period is requested (last 7 days, this month), translate it into a clear and correct SQL date filter.
+- Do not hardcode fixed years unless the user explicitly asked for that period.
 
 SQL QUERY — PRIORITY RULE:
 The SQL query is ALWAYS the primary deliverable. Even for descriptive or analytical questions,
@@ -1767,7 +2012,11 @@ Do not include markdown formatting. Just the raw JSON.
         print(f"Chat error: {exc}")
         return jsonify({"error": str(exc)}), 500
 
-    conversation_id = data.get("conversationId") or str(uuid.uuid4())
+    conversation_id = (
+        data.get("conversationId")
+        or data.get("conversation_id")
+        or str(uuid.uuid4())
+    )
     _log(f"Chat SQL generated for conversation {conversation_id[:8]}", source="chat")
     try:
         parsed = _parse_llm_json(content)
@@ -2009,10 +2258,15 @@ Réponds UNIQUEMENT avec du JSON valide (sans markdown) :
 def agent_analysis():
     """Orchestrated multi-step analysis: the LLM autonomously decides which
     ClickHouse queries to run (up to MAX_AGENT_STEPS), analyses each result,
-    and finally synthesises a detailed answer for the user."""
+    and finally synthesises a detailed answer for the user.
+
+    This endpoint is intentionally READ-ONLY.
+    """
 
     data = request.get_json()
     MAX_AGENT_STEPS = max(1, min(50, int(data.get("maxSteps", 10))))
+    MAX_FREE_RETRIES = max(2, min(10, MAX_AGENT_STEPS))
+
     user_question = data.get("question", "")
     schema = data.get("schema", {})
     table_metadata = data.get("tableMetadata", {})
@@ -2028,12 +2282,20 @@ def agent_analysis():
         schema = {t: cols for t, cols in schema.items() if t in table_mapping_filter}
         table_metadata = {t: v for t, v in table_metadata.items() if t in table_mapping_filter}
 
-    # Knowledge base context
+    # Knowledge base context (prefer semantic retrieval, keep fallback compact)
     db = read_db()
     folders = db.get("knowledge_folders", [])
-    knowledge_context = "\n\n".join(
-        f"[{f['title']}]\n{f['content']}" for f in folders if f.get("content")
-    ) or knowledge_base
+    knowledge_context = None
+    if user_question.strip() and folders:
+        knowledge_context = _get_knowledge_context_by_similarity(
+            user_question.strip(),
+            top_k=int(rag_config.get("topK", 5)),
+        )
+    if not knowledge_context:
+        knowledge_context = "\n\n".join(
+            f"[{f['title']}]\n{f['content']}" for f in folders if f.get("content")
+        ) or knowledge_base
+    knowledge_context = (knowledge_context or "")[:25000]
 
     # Build full mapping dict (used by table identification and mapping note)
     all_mappings = {m["table_name"]: m["mapping_name"] for m in db.get("table_mappings", [])}
@@ -2080,68 +2342,91 @@ def agent_analysis():
         + "\n".join(mapping_lines)
     ) if mapping_lines else ""
 
+    try:
+        agent_client = get_clickhouse_client()
+    except Exception as exc:
+        return jsonify({"error": f"Connexion ClickHouse impossible: {exc}"}), 500
+
     # Accumulate steps
     steps: list = []
+    seen_query_fingerprints: set[str] = set()
 
     def _search_knowledge_for_agent(query: str) -> str:
         """Search the knowledge base (ES RAG) for context relevant to the query.
 
-        Falls back to full folder dump if ES is unavailable or not configured.
+        Falls back to static knowledge text when semantic retrieval is unavailable.
         """
         try:
-            query_embedding = _get_embedding(query)
-            host = rag_config.get("esHost", "http://localhost:9200").rstrip("/")
-            index = rag_config.get("esIndex", "clicksense_rag")
-            auth = None
-            if rag_config.get("esUsername"):
-                auth = (rag_config["esUsername"], rag_config.get("esPassword", ""))
-            top_k = int(rag_config.get("topK", 5))
-            knn_query = {
-                "knn": {
-                    "field": "embedding",
-                    "query_vector": query_embedding,
-                    "k": top_k,
-                    "num_candidates": top_k * 10,
-                },
-                "_source": ["title", "content"],
-            }
-            es_resp = http_requests.post(
-                f"{host}/{index}/_search",
-                auth=auth,
-                json=knn_query,
-                verify=False,
-                timeout=15,
-            )
-            if es_resp.ok:
-                hits = es_resp.json().get("hits", {}).get("hits", [])
-                if hits:
-                    parts = [
-                        f"[Source: {h['_source'].get('title', 'Unknown')} | score={round(h.get('_score', 0), 3)}]\n{h['_source'].get('content', '')}"
-                        for h in hits
-                    ]
-                    return "\n\n---\n\n".join(parts)
+            if query.strip():
+                hit_context = _get_knowledge_context_by_similarity(
+                    query.strip(),
+                    top_k=int(rag_config.get("topK", 5)),
+                )
+                if hit_context:
+                    return hit_context[:3000]
         except Exception as exc:
             print(f"[Agent] Knowledge search failed: {exc}")
-        # Fallback: static folder text
-        return knowledge_context or "No knowledge base content available."
+        return (knowledge_context or "No knowledge base content available.")[:3000]
+
+    def _agent_self_evaluate(step_entry: dict, total_used_steps: int) -> dict:
+        """Score result quality and decide if a corrective retry is useful."""
+        if step_entry.get("type") != "query":
+            return {
+                "status": "good",
+                "score": 80,
+                "reason": "Non-SQL action completed.",
+                "should_retry": False,
+                "should_finish": False,
+            }
+        if not step_entry.get("ok"):
+            return {
+                "status": "bad",
+                "score": 0,
+                "reason": "SQL execution failed.",
+                "should_retry": True,
+                "should_finish": False,
+            }
+
+        row_count = int(step_entry.get("row_count", 0) or 0)
+        if row_count == 0:
+            return {
+                "status": "weak",
+                "score": 35,
+                "reason": "Query returned zero rows; broaden filters or verify dimensions.",
+                "should_retry": total_used_steps < MAX_AGENT_STEPS,
+                "should_finish": False,
+            }
+        if row_count < 3:
+            return {
+                "status": "weak",
+                "score": 55,
+                "reason": "Very few rows; confidence may be limited.",
+                "should_retry": total_used_steps < MAX_AGENT_STEPS - 1,
+                "should_finish": False,
+            }
+        if row_count > 4000:
+            return {
+                "status": "medium",
+                "score": 70,
+                "reason": "Large result set; could benefit from tighter aggregation.",
+                "should_retry": False,
+                "should_finish": False,
+            }
+        return {
+            "status": "good",
+            "score": 85,
+            "reason": "Result set is usable and supports analysis.",
+            "should_retry": False,
+            "should_finish": total_used_steps >= max(2, MAX_AGENT_STEPS - 1),
+        }
 
     def _run_agent_step(steps_so_far: list, used_steps: int = None) -> dict:
-        """Ask the LLM for its next action given the accumulated context.
-
-        Builds the system prompt dynamically: first computes the static parts
-        (without schema/metadata/knowledge), then uses _truncate_prompt_context
-        to fit the variable context within the model's token budget.  A final
-        safety check refuses to call the LLM if the prompt still overflows.
-        """
-        steps_context = ""
-        for i, s in enumerate(steps_so_far, 1):
-            action_label = "SQL executed" if s.get("type") == "query" else "Knowledge search"
-            steps_context += (
-                f"\n--- Step {i} ({s.get('type', 'query')}) ---\n"
-                f"Reasoning: {s['reasoning']}\n"
-                f"{action_label}:\n{s.get('sql') or s.get('search_query', '')}\n"
-                f"Result summary: {s['result_summary']}\n"
-            )
+        """Ask the LLM for its next action given accumulated context."""
+        steps_context = _summarize_agent_steps_for_prompt(
+            steps_so_far,
+            max_steps=8,
+            max_result_chars=220,
+        )
 
         effective_used = used_steps if used_steps is not None else len(steps_so_far)
 
@@ -2157,14 +2442,17 @@ DATABASE SCHEMA:
 
 CLICKHOUSE INSTRUCTIONS:
 - Use advanced ClickHouse functions when appropriate (windowFunnel, retention, argMax, topK, uniqHLL12, quantilesTiming, JSONExtract, sumIf, countIf …).
-- Always write highly optimised SQL with a LIMIT where appropriate.
+- SQL MUST remain read-only in this agent: SELECT/SHOW/DESCRIBE/EXPLAIN/WITH only.
+- Always write highly optimised SQL with LIMIT <= 5000.
 - Each query must explore a genuinely distinct angle (different aggregation, filter, dimension, or sub-question).
+- Do not repeat the same SQL logic twice.
+- Emit exactly one SQL statement (no semicolon-separated batch).
 
 DATE HANDLING — CRITICAL:
-- Do NOT use complex date functions such as toStartOfMonth(), toStartOfWeek(), toStartOfYear(), toStartOfQuarter(), year(), month(), day(), toDayOfMonth(), dateDiff(), addDays(), subtractDays() or any similar helper.
-- For date filtering, ALWAYS use simple BETWEEN syntax: column BETWEEN '2024-01-01' AND '2024-03-31'
-- For date grouping/truncation, use toYYYYMM() or formatDateTime() only if strictly necessary; prefer BETWEEN ranges.
-- Never wrap date columns in transformation functions inside WHERE clauses.
+- Prefer explicit date ranges with literals and BETWEEN when possible.
+- Avoid expensive transformations on date columns inside WHERE.
+- If a relative period is requested (last 7 days, this month), translate it into a clear and correct SQL date filter.
+- Never hardcode fixed years unless the user explicitly asked for that period.
 
 CURRENT ANALYSIS PROGRESS ({effective_used}/{MAX_AGENT_STEPS} steps used):
 {steps_context if steps_context else "None yet — this is the first step."}
@@ -2181,7 +2469,7 @@ You have FOUR possible actions:
 
 {"IMPORTANT: You have used all available steps — you MUST respond with action 'finish'." if effective_used >= MAX_AGENT_STEPS else ""}
 
-Respond ONLY with valid JSON in one of these three forms:
+Respond ONLY with valid JSON in one of these forms:
 
 For a SQL query:
 {{
@@ -2215,7 +2503,6 @@ For the final answer:
 No markdown fences. Only raw JSON."""
 
         # ── Token budget: fit schema/metadata/knowledge to what remains ───────
-        # Estimate tokens consumed by the static parts + user turn
         base_tokens = _estimate_tokens(static_header + static_footer + "Proceed with the next step.")
         pruned_schema, pruned_metadata, pruned_knowledge = _truncate_prompt_context(
             schema, table_metadata, knowledge_context, base_tokens
@@ -2259,126 +2546,160 @@ No markdown fences. Only raw JSON."""
                 ),
             }
 
-        content = _call_llm(system_prompt, [{"role": "user", "content": "Proceed with the next step."}], temperature=0.2)
+        content = _call_llm(
+            system_prompt,
+            [{"role": "user", "content": "Proceed with the next step."}],
+            temperature=0.2,
+        )
         return _parse_llm_json(content)
 
     def _run_agent_retry(steps_so_far: list, retry_info: dict) -> dict:
-        """Ask the LLM for a simpler alternative SQL after a technical ClickHouse rejection.
+        """Generate a corrective SQL after a technical or quality issue.
 
         This retry does NOT consume a step credit.
         """
+        retry_mode = retry_info.get("mode", "technical")
         failed_sql = retry_info.get("failed_sql", "")
         error_msg = retry_info.get("error", "")
+        error_class = retry_info.get("error_class", "")
 
-        steps_context = ""
-        for i, s in enumerate(steps_so_far, 1):
-            action_label = "SQL executed" if s.get("type") == "query" else "Knowledge search"
-            steps_context += (
-                f"\n--- Step {i} ({s.get('type', 'query')}) ---\n"
-                f"Reasoning: {s['reasoning']}\n"
-                f"{action_label}:\n{s.get('sql') or s.get('search_query', '')}\n"
-                f"Result: {'OK' if s.get('ok') else 'FAILED'} — {s['result_summary']}\n"
-            )
+        steps_context = _summarize_agent_steps_for_prompt(
+            steps_so_far,
+            max_steps=8,
+            max_result_chars=220,
+        )
 
-        # Use compact schema (column names only) for the retry prompt to save tokens
         retry_schema_compact = {
             tbl: [c["name"] if isinstance(c, dict) else str(c) for c in cols]
             for tbl, cols in schema.items()
         }
         retry_schema_str = json.dumps(retry_schema_compact, indent=2)
 
+        if retry_mode == "quality":
+            issue_block = (
+                "The previous SQL executed but produced weak analytical evidence. "
+                "Generate a BETTER follow-up query with a different angle."
+            )
+        else:
+            issue_block = (
+                "A previous SQL query was rejected by ClickHouse with a technical error. "
+                "Generate a SIMPLER alternative that achieves the same analytical goal."
+            )
+
         retry_prompt = f"""You are an autonomous ClickHouse data analyst agent.
-A previous SQL query was rejected by ClickHouse with a technical error. Generate a SIMPLER alternative that achieves the same analytical goal.
+{issue_block}
+
+RETRY MODE: {retry_mode}
+ERROR CLASS: {error_class or "n/a"}
 
 DATABASE SCHEMA (relevant tables only):
 {retry_schema_str}
 
-FAILED SQL:
+PREVIOUS SQL:
 {failed_sql}
 
-CLICKHOUSE ERROR:
+ISSUE DETAIL:
 {error_msg}
 
 PREVIOUS STEPS FOR CONTEXT:
 {steps_context if steps_context else "None yet."}
 
-SIMPLIFICATION RULES — follow ALL of these:
-- Use FEWER and SIMPLER functions; replace complex/advanced ones with basic COUNT, SUM, AVG, MIN, MAX
-- Avoid window functions, CTEs, nested subqueries — use a flat SELECT … GROUP BY instead
-- Avoid advanced ClickHouse-specific functions (windowFunnel, retention, argMax, topK, uniqHLL12, etc.)
-- Simplify date handling: use simple BETWEEN ranges only; never use toStartOfMonth(), toStartOfWeek(), year(), month(), day(), dateDiff(), addDays(), subtractDays()
-- Add LIMIT 100 if not already present
-- Fix any syntax error hinted at by the error message
+RULES:
+- Read-only SQL only: SELECT/SHOW/DESCRIBE/EXPLAIN/WITH.
+- Use FEWER and SIMPLER functions when fixing technical errors.
+- Produce a genuinely different angle when fixing low-signal results.
+- Avoid nested complexity unless strictly required.
+- Prefer clear date ranges and avoid expensive date transforms in WHERE.
+- Add LIMIT 200 if not present; never exceed LIMIT 5000.
+- Return exactly one SQL statement.
 
 Respond ONLY with valid JSON (no markdown):
 {{
   "action": "query",
-  "reasoning": "Simplified version avoiding: [brief explanation of what was fixed]",
-  "sql": "SELECT … (simpler query)"
+  "reasoning": "What was fixed and why this should work better",
+  "sql": "SELECT ..."
 }}"""
 
-        content = _call_llm(retry_prompt, [{"role": "user", "content": "Generate the simpler alternative query."}], temperature=0.2)
+        content = _call_llm(
+            retry_prompt,
+            [{"role": "user", "content": "Generate the corrective query."}],
+            temperature=0.2,
+        )
         result = _parse_llm_json(content)
         if not result or not result.get("sql"):
             return {"action": "finish", "reasoning": "Could not generate alternative", "final_answer": ""}
         return result
 
     def _execute_and_summarise(sql: str, max_rows: int = 20) -> dict:
-        """Execute a ClickHouse query and return a compact summary."""
-        try:
-            client = get_clickhouse_client()
-            result = client.query(sql)
-            rows = _rows_to_dicts(result)
-            total_rows = len(rows)
-            preview = rows[:max_rows]
-            col_names = list(preview[0].keys()) if preview else []
-            summary_lines = [", ".join(str(r.get(c, "")) for c in col_names) for r in preview[:10]]
-            summary = (
-                f"{total_rows} row(s) returned. Columns: {col_names}.\n"
-                f"Sample data:\n" + "\n".join(summary_lines)
-            )
-            return {"ok": True, "summary": summary, "rows": preview, "total_rows": total_rows}
-        except Exception as exc:
-            return {"ok": False, "summary": f"Query failed: {exc}", "rows": [], "total_rows": 0}
+        """Execute a read-only ClickHouse query and return structured result."""
+        return _execute_sql_guarded(
+            sql,
+            read_only=True,
+            max_preview_rows=max_rows,
+            max_execution_time=15,
+            default_limit=1000,
+            hard_limit_cap=5000,
+            client=agent_client,
+        )
 
     # ---- Agentic loop ----
     try:
         final_answer = None
-        used_steps = 0          # steps counting against the credit budget
-        technical_retries = 0   # free retry attempts (do not consume credits)
-        retry_pending = None    # set to {"failed_sql": ..., "error": ...} after a technical failure
+        used_steps = 0        # steps counting against the credit budget
+        free_retries = 0      # correction attempts not counting against credits
+        retry_pending = None  # {"mode": "...", "failed_sql": "...", "error": "..."}
         safety_limit = MAX_AGENT_STEPS * 4  # absolute ceiling to prevent infinite loops
         safety_counter = 0
 
         while used_steps < MAX_AGENT_STEPS and safety_counter < safety_limit:
             safety_counter += 1
 
-            # ── Handle a pending technical retry (free, no credit consumed) ──────
+            # ── Handle a pending corrective retry (free, no credit consumed) ────
             if retry_pending:
-                alt_decision = _run_agent_retry(steps, retry_pending)
-                technical_retries += 1
-                retry_pending = None
+                if free_retries >= MAX_FREE_RETRIES:
+                    retry_pending = None
+                else:
+                    alt_decision = _run_agent_retry(steps, retry_pending)
+                    free_retries += 1
+                    retry_mode = retry_pending.get("mode", "technical")
+                    retry_pending = None
 
-                alt_sql = (alt_decision.get("sql") or "").strip()
-                if alt_sql:
-                    alt_result = _execute_and_summarise(alt_sql)
-                    if alt_result["ok"]:
-                        # Patch the last (failed) step with the successful alternative
-                        steps[-1].update({
-                            "sql": alt_sql,
-                            "result_summary": alt_result["summary"],
-                            "row_count": alt_result["total_rows"],
-                            "ok": True,
-                            "retried": True,
-                        })
-                    else:
-                        # Both attempts failed — append note to last step's summary
-                        steps[-1]["result_summary"] += (
-                            f" | Alternative simplifiée aussi échouée: {alt_result['summary']}"
-                        )
-                continue  # never consumes a credit
+                    alt_sql = (alt_decision.get("sql") or "").strip()
+                    if alt_sql and steps:
+                        alt_result = _execute_and_summarise(alt_sql)
+                        alt_norm = (alt_result.get("normalized_sql") or alt_sql).strip()
+                        is_dup = alt_norm.lower() in seen_query_fingerprints
+                        if is_dup:
+                            alt_result = {
+                                "ok": False,
+                                "normalized_sql": alt_norm,
+                                "total_rows": 0,
+                                "summary": "Query failed: duplicate query pattern detected.",
+                                "error_class": "duplicate_query",
+                            }
+                        if alt_result["ok"]:
+                            seen_query_fingerprints.add(alt_norm.lower())
+                            steps[-1].update({
+                                "sql": alt_norm,
+                                "result_summary": alt_result["summary"],
+                                "row_count": alt_result["total_rows"],
+                                "ok": True,
+                                "retried": True,
+                                "retry_mode": retry_mode,
+                                "error_class": "",
+                            })
+                            steps[-1]["self_evaluation"] = _agent_self_evaluate(
+                                steps[-1],
+                                used_steps,
+                            )
+                        else:
+                            steps[-1]["result_summary"] += (
+                                f" | Corrective retry failed ({retry_mode}): {alt_result['summary']}"
+                            )
+                            steps[-1]["error_class"] = alt_result.get("error_class", "")
+                    continue
 
-            # ── Normal agent step ────────────────────────────────────────────────
+            # ── Normal agent step ────────────────────────────────────────────
             decision = _run_agent_step(steps, used_steps)
 
             action = decision.get("action", "finish")
@@ -2388,21 +2709,52 @@ Respond ONLY with valid JSON (no markdown):
                 used_steps += 1
                 sql = decision.get("sql", "").strip()
                 exec_result = _execute_and_summarise(sql)
-                steps.append({
+                normalized_sql = (exec_result.get("normalized_sql") or sql).strip()
+
+                # Prevent pointless loops on repeated queries.
+                if normalized_sql and normalized_sql.lower() in seen_query_fingerprints:
+                    exec_result = {
+                        "ok": False,
+                        "normalized_sql": normalized_sql,
+                        "total_rows": 0,
+                        "summary": "Query failed: duplicate query pattern detected.",
+                        "error_class": "duplicate_query",
+                    }
+                elif exec_result["ok"] and normalized_sql:
+                    seen_query_fingerprints.add(normalized_sql.lower())
+
+                step_entry = {
                     "step": used_steps,
                     "type": "query",
                     "reasoning": reasoning,
-                    "sql": sql,
+                    "sql": normalized_sql,
                     "result_summary": exec_result["summary"],
-                    "row_count": exec_result["total_rows"],
+                    "row_count": exec_result.get("total_rows", 0),
                     "ok": exec_result["ok"],
-                })
-                # Schedule a free technical retry on ClickHouse failure
+                    "error_class": exec_result.get("error_class", ""),
+                }
+                step_entry["self_evaluation"] = _agent_self_evaluate(step_entry, used_steps)
+                if step_entry["self_evaluation"]["reason"]:
+                    step_entry["result_summary"] += (
+                        f"\nSelf-evaluation: {step_entry['self_evaluation']['reason']}"
+                    )
+                steps.append(step_entry)
+
                 if not exec_result["ok"]:
                     retry_pending = {
-                        "failed_sql": sql,
+                        "mode": "technical",
+                        "failed_sql": normalized_sql or sql,
                         "error": exec_result["summary"],
+                        "error_class": exec_result.get("error_class", ""),
                     }
+                elif step_entry["self_evaluation"].get("should_retry"):
+                    retry_pending = {
+                        "mode": "quality",
+                        "failed_sql": normalized_sql or sql,
+                        "error": step_entry["self_evaluation"]["reason"],
+                        "error_class": "low_signal",
+                    }
+
             elif action == "search_knowledge":
                 used_steps += 1
                 search_query = decision.get("search_query", "").strip()
@@ -2417,7 +2769,15 @@ Respond ONLY with valid JSON (no markdown):
                     "result_summary": f"Knowledge base results:\n{kb_summary}",
                     "row_count": 0,
                     "ok": True,
+                    "self_evaluation": {
+                        "status": "good",
+                        "score": 80,
+                        "reason": "Knowledge lookup completed.",
+                        "should_retry": False,
+                        "should_finish": False,
+                    },
                 })
+
             elif action == "export_csv":
                 used_steps += 1
                 export_sql = decision.get("sql", "").strip()
@@ -2428,41 +2788,72 @@ Respond ONLY with valid JSON (no markdown):
                     "reasoning": reasoning,
                     "sql": export_sql,
                     "suggested_path": suggested_path,
-                    "result_summary": f"Export CSV demandé → {suggested_path}",
+                    "result_summary": f"Export CSV requested → {suggested_path}",
                     "row_count": 0,
                     "ok": True,
+                    "self_evaluation": {
+                        "status": "good",
+                        "score": 75,
+                        "reason": "Export instruction prepared.",
+                        "should_retry": False,
+                        "should_finish": False,
+                    },
                 })
             else:
                 # action == "finish"
                 final_answer = decision.get("final_answer", "")
                 break
 
-        # If the loop exhausted all steps without a finish, ask for synthesis
+        # If the loop exhausted all steps without finish, synthesize from evidence.
         if final_answer is None:
             step_lines = []
-            for s in steps:
+            for s in steps[-12:]:
+                eval_note = ""
+                if isinstance(s.get("self_evaluation"), dict):
+                    eval_note = (
+                        f"\nSelf-eval: status={s['self_evaluation'].get('status')} "
+                        f"score={s['self_evaluation'].get('score')} "
+                        f"reason={s['self_evaluation'].get('reason')}"
+                    )
                 if s.get("type") == "search_knowledge":
-                    step_lines.append(f"Step {s['step']} (knowledge search): {s['reasoning']}\nSearch: {s.get('search_query', '')}\nResult: {s['result_summary']}")
+                    step_lines.append(
+                        f"Step {s['step']} (knowledge search): {s['reasoning']}\n"
+                        f"Search: {s.get('search_query', '')}\n"
+                        f"Result: {s['result_summary']}{eval_note}"
+                    )
                 else:
-                    step_lines.append(f"Step {s['step']}: {s['reasoning']}\nSQL: {s.get('sql', '')}\nResult: {s['result_summary']}")
-            synth_prompt = f"""Based on the following analysis steps, write a detailed final answer for the user.
+                    step_lines.append(
+                        f"Step {s['step']}: {s['reasoning']}\n"
+                        f"SQL: {s.get('sql', '')}\n"
+                        f"Result: {s['result_summary']}{eval_note}"
+                    )
+            synth_prompt = f"""Based on the following evidence, write a final answer.
 
 USER QUESTION: {user_question}
 
 STEPS AND RESULTS:
-""" + "\n\n".join(step_lines) + "\n\nProvide a comprehensive, structured answer."
-            final_answer = _call_llm(synth_prompt, [{"role": "user", "content": "Synthesise the final answer."}], temperature=0.3)
+""" + "\n\n".join(step_lines) + """
+
+Requirements:
+- Be explicit about confidence level and evidence quality.
+- If data is missing or inconclusive, say it clearly.
+- Provide concise next best actions."""
+            final_answer = _call_llm(
+                synth_prompt,
+                [{"role": "user", "content": "Synthesise the final answer."}],
+                temperature=0.3,
+            )
 
         return jsonify({
             "steps": steps,
             "final_answer": final_answer,
             "total_steps": len(steps),
+            "free_retries_used": free_retries,
         })
 
     except Exception as exc:
         print(f"Agent error: {exc}")
         return jsonify({"error": str(exc)}), 500
-
 
 # ---------------------------------------------------------------------------
 # AI Query Analyzer
@@ -3566,16 +3957,22 @@ def _cw_get_schema_info(client, database: str, max_tables: int = 30) -> str:
     except Exception as exc:
         return f"Impossible de lister les tables: {exc}"
 
+    # Approximate row counts from system metadata (much cheaper than COUNT(*) per table).
+    row_count_map = {}
+    try:
+        counts_res = client.query(
+            f"SELECT name, total_rows FROM system.tables WHERE database = '{database}'"
+        )
+        row_count_map = {str(r[0]): r[1] for r in counts_res.result_rows}
+    except Exception:
+        row_count_map = {}
+
     parts = []
     for tbl in tables[:max_tables]:
         try:
             desc = client.query(f"DESCRIBE TABLE `{database}`.`{tbl}`")
             cols = ", ".join(f"{r[0]}:{r[1]}" for r in desc.result_rows[:15])
-            try:
-                cnt_res = client.query(f"SELECT count() FROM `{database}`.`{tbl}`")
-                cnt = cnt_res.result_rows[0][0] if cnt_res.result_rows else "?"
-            except Exception:
-                cnt = "?"
+            cnt = row_count_map.get(tbl, "?")
             parts.append(f"TABLE {tbl} ({cnt} rows): {cols}")
         except Exception as exc:
             parts.append(f"TABLE {tbl}: (erreur schema: {exc})")
@@ -3733,8 +4130,9 @@ def _cw_plan(user_request: str, database: str, schema_info: str) -> dict:
         "RÈGLE DE SÉCURITÉ ABSOLUE: tu n'as JAMAIS le droit de DROP, ALTER, TRUNCATE, DELETE, "
         "INSERT ou CREATE sur des tables existantes. Seules les tables préfixées BOT_ peuvent être "
         "créées ou modifiées. Tout écart sera bloqué côté serveur.\n"
-        "RÈGLE DATES: Dans ton plan, n'utilise JAMAIS de fonctions complexes sur les dates "
-        "(toStartOfMonth, year, month, day, etc.). Utilise systématiquement BETWEEN pour les filtres temporels.\n"
+        "RÈGLE DATES: privilégie des plages temporelles explicites avec BETWEEN. "
+        "Évite les transformations coûteuses sur les colonnes de date dans WHERE. "
+        "N'impose pas d'année fixe sauf demande explicite de l'utilisateur.\n"
         "RÈGLE DÉCOMPOSITION: Décompose les opérations complexes en sous-requêtes simples enchaînées. "
         "Pour les agrégations multi-niveaux: étape 1 = SELECT simple avec GROUP BY, "
         "étape 2 = INSERT dans table BOT_, étape 3 = vérification. "
@@ -3797,6 +4195,9 @@ def _cw_generate_sql(session: dict, step: dict, client, database: str) -> dict:
         all_tables = [row[0] for row in res.result_rows]
     except Exception:
         all_tables = []
+    tables_text = ", ".join(all_tables[:60])
+    if len(all_tables) > 60:
+        tables_text += f" ... (+{len(all_tables) - 60} autres)"
 
     system_prompt = (
         "Tu es un expert SQL ClickHouse en train d'exécuter une étape d'un plan d'analyse. "
@@ -3805,7 +4206,7 @@ def _cw_generate_sql(session: dict, step: dict, client, database: str) -> dict:
         "Tu réponds UNIQUEMENT avec du JSON valide, sans markdown ni texte supplémentaire."
     )
     user_content = (
-        f"Base: {database} | Tables disponibles: {', '.join(all_tables)}\n\n"
+        f"Base: {database} | Tables disponibles: {tables_text}\n\n"
         f"Objectif global: {plan.get('objective', '')}\n"
         f"Approche: {plan.get('approach', '')}\n\n"
         f"Étape actuelle {step['id']}/{len(plan.get('steps', []))}: {step['description']}\n"
@@ -3823,11 +4224,11 @@ def _cw_generate_sql(session: dict, step: dict, client, database: str) -> dict:
         "- Tables temporaires: TOUJOURS préfixées BOT_ (ex: BOT_aggreg_results)\n"
         "- Syntaxe ClickHouse valide uniquement\n"
         "- Pour grandes tables: utilise LIMIT ou SAMPLE pour les explorations\n"
-        "- DATES — CRITIQUE: N'utilise JAMAIS toStartOfMonth(), toStartOfWeek(), toStartOfYear(), "
-        "toStartOfQuarter(), year(), month(), day(), toDayOfMonth(), dateDiff(), addDays(), subtractDays() "
-        "ou fonctions similaires. Pour filtrer sur des dates, utilise TOUJOURS la syntaxe BETWEEN: "
-        "colonne BETWEEN '2024-01-01' AND '2024-03-31'. "
-        "Pour grouper par période, utilise toYYYYMM() ou formatDateTime() seulement si strictement nécessaire.\n"
+        "- DATES — CRITIQUE: privilégie des plages explicites avec BETWEEN et évite "
+        "les transformations coûteuses sur les colonnes de date dans WHERE. "
+        "Traduis correctement les périodes relatives demandées (ex: 30 derniers jours, mois en cours) "
+        "sans hardcoder d'année fixe. Pour le regroupement périodique, toYYYYMM() ou formatDateTime() "
+        "sont autorisés si nécessaire.\n"
         "- CREATE TABLE: utilise ENGINE = MergeTree() ORDER BY tuple() si pas d'ordre naturel. "
         "Crée la table et l'INSERT dans des SQL séparés — ne jamais combiner CREATE + INSERT.\n"
         "- Pour INSERT: INSERT INTO `db`.`BOT_table` SELECT ...\n"
@@ -4013,6 +4414,9 @@ def _cw_generate_simple_sql(session: dict, step: dict, client, database: str,
         all_tables = [row[0] for row in res.result_rows]
     except Exception:
         all_tables = []
+    tables_text = ", ".join(all_tables[:60])
+    if len(all_tables) > 60:
+        tables_text += f" ... (+{len(all_tables) - 60} autres)"
 
     system_prompt = (
         "Tu es un expert SQL ClickHouse. Une requête SQL a été rejetée par ClickHouse avec une erreur technique. "
@@ -4020,7 +4424,7 @@ def _cw_generate_simple_sql(session: dict, step: dict, client, database: str,
         "Tu réponds UNIQUEMENT avec du JSON valide, sans markdown ni texte supplémentaire."
     )
     user_content = (
-        f"Base: {database} | Tables disponibles: {', '.join(all_tables)}\n\n"
+        f"Base: {database} | Tables disponibles: {tables_text}\n\n"
         f"Objectif global: {plan.get('objective', '')}\n\n"
         f"Étape actuelle {step['id']}: {step['description']}\n\n"
         f"SQL qui a échoué:\n{failed_sql}\n\n"
@@ -4031,7 +4435,7 @@ def _cw_generate_simple_sql(session: dict, step: dict, client, database: str,
         "- Utilise MOINS de fonctions; remplace les fonctions complexes par COUNT, SUM, AVG, MIN, MAX simples\n"
         "- Évite les window functions, CTEs, sous-requêtes imbriquées — utilise un SELECT … GROUP BY plat\n"
         "- Évite les fonctions ClickHouse avancées (windowFunnel, retention, argMax, topK, uniqHLL12, etc.)\n"
-        "- DATES: utilise uniquement BETWEEN; jamais toStartOfMonth(), toStartOfWeek(), year(), month(), day(), dateDiff()\n"
+        "- DATES: privilégie BETWEEN avec bornes explicites; évite les transformations coûteuses dans WHERE; pas d'année fixe hardcodée sauf demande explicite\n"
         "- Ajoute LIMIT 100 si absent\n"
         "- Corrige tout problème de syntaxe indiqué par le message d'erreur\n\n"
         "Réponds UNIQUEMENT avec ce JSON:\n"
@@ -4071,6 +4475,9 @@ def _cw_rethink_strategy(session: dict, step: dict, client, database: str,
         all_tables = [row[0] for row in res.result_rows]
     except Exception:
         all_tables = []
+    tables_text = ", ".join(all_tables[:60])
+    if len(all_tables) > 60:
+        tables_text += f" ... (+{len(all_tables) - 60} autres)"
 
     system_prompt = (
         "Tu es un expert ClickHouse devant résoudre un problème persistant. "
@@ -4080,7 +4487,7 @@ def _cw_rethink_strategy(session: dict, step: dict, client, database: str,
         "Tu réponds UNIQUEMENT avec du JSON valide, sans markdown."
     )
     user_content = (
-        f"Base: {database} | Tables disponibles: {', '.join(all_tables)}\n\n"
+        f"Base: {database} | Tables disponibles: {tables_text}\n\n"
         f"Objectif global: {plan.get('objective', '')}\n\n"
         f"Étape {step['id']}: {step['description']}\n"
         f"Type: {step.get('type', 'compute')}\n\n"
@@ -4094,7 +4501,7 @@ def _cw_rethink_strategy(session: dict, step: dict, client, database: str,
         "puis un INSERT séparé dans un second SQL\n"
         "- Évite toute fonction complexe (window functions, CTEs imbriquées, argMax, topK, etc.)\n"
         "- Préfère plusieurs requêtes simples enchaînées plutôt qu'une seule requête complexe\n"
-        "- DATES: utilise UNIQUEMENT BETWEEN '2024-01-01' AND '2024-12-31'\n"
+        "- DATES: utilise des bornes explicites cohérentes avec la demande utilisateur (pas d'année hardcodée par défaut)\n"
         "- Ajoute LIMIT 1000 pour les explorations\n"
         "- Si l'objectif ne peut pas être atteint simplement, propose l'approximation la plus proche\n\n"
         "Réponds UNIQUEMENT avec:\n"
@@ -4208,67 +4615,81 @@ def _cw_execute_steps(session: dict, client, database: str, preview_rows: int = 
                 sql_upper = sql.lstrip().upper()
                 is_read = any(sql_upper.startswith(k) for k in
                               ("SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH"))
-                try:
+                exec_main = _execute_sql_guarded(
+                    sql,
+                    read_only=is_read,
+                    max_preview_rows=preview_rows,
+                    max_execution_time=20,
+                    default_limit=2000 if is_read else 1000,
+                    hard_limit_cap=10000,
+                    client=client,
+                )
+                if exec_main["ok"]:
+                    entry["ok"] = True
+                    entry["sql"] = exec_main.get("normalized_sql", sql)
                     if is_read:
-                        res = client.query(sql)
-                        rows = _rows_to_dicts(res)
-                        entry["ok"] = True
-                        entry["result_preview"] = rows[:preview_rows]
-                        entry["rows_affected"] = len(rows)
+                        entry["result_preview"] = exec_main["preview_rows"]
+                        entry["rows_affected"] = exec_main["total_rows"]
                     else:
-                        client.command(sql)
-                        entry["ok"] = True
                         entry["result_preview"] = "Commande exécutée avec succès."
                         entry["rows_affected"] = None
-                        # Track BOT_ table creation
                         bot_table = (sql_result.get("creates_table")
-                                     or _cw_detect_bot_table(sql))
+                                     or _cw_detect_bot_table(entry["sql"]))
                         if bot_table and bot_table not in session["created_tables"]:
                             session["created_tables"].append(bot_table)
-                except Exception as exc:
-                    original_error = str(exc)
+                else:
+                    original_error = exec_main.get("error", exec_main.get("summary", "Unknown error"))
+                    error_class = exec_main.get("error_class", _classify_clickhouse_error(original_error))
                     entry["ok"] = False
-                    entry["result_preview"] = f"Erreur: {original_error}"
+                    entry["error_class"] = error_class
+                    entry["result_preview"] = f"[{error_class}] {original_error}"
 
                     # ── Technical retry with simpler SQL (free — no credit consumed) ──
                     alt_sql = _cw_generate_simple_sql(
-                        session, step, client, database, sql, original_error
+                        session,
+                        step,
+                        client,
+                        database,
+                        sql,
+                        f"[{error_class}] {original_error}",
                     )
                     session["technical_retries"] = session.get("technical_retries", 0) + 1
                     if alt_sql:
                         alt_is_safe, alt_safety_reason = _cw_is_sql_safe(alt_sql)
                         if alt_is_safe:
-                            try:
-                                alt_sql_upper = alt_sql.lstrip().upper()
-                                alt_is_read = any(alt_sql_upper.startswith(k) for k in
-                                                  ("SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH"))
+                            alt_sql_upper = alt_sql.lstrip().upper()
+                            alt_is_read = any(alt_sql_upper.startswith(k) for k in
+                                              ("SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH"))
+                            alt_exec = _execute_sql_guarded(
+                                alt_sql,
+                                read_only=alt_is_read,
+                                max_preview_rows=preview_rows,
+                                max_execution_time=20,
+                                default_limit=2000 if alt_is_read else 1000,
+                                hard_limit_cap=10000,
+                                client=client,
+                            )
+                            if alt_exec["ok"]:
+                                entry["ok"] = True
+                                entry["sql"] = alt_exec.get("normalized_sql", alt_sql)
+                                entry["error_class"] = ""
                                 if alt_is_read:
-                                    res = client.query(alt_sql)
-                                    rows = _rows_to_dicts(res)
-                                    entry["ok"] = True
-                                    entry["sql"] = alt_sql
-                                    entry["result_preview"] = rows[:preview_rows]
-                                    entry["rows_affected"] = len(rows)
-                                    entry["explanation"] = (
-                                        entry.get("explanation", "") + " [alternative simplifiée]"
-                                    )
+                                    entry["result_preview"] = alt_exec["preview_rows"]
+                                    entry["rows_affected"] = alt_exec["total_rows"]
                                 else:
-                                    client.command(alt_sql)
-                                    entry["ok"] = True
-                                    entry["sql"] = alt_sql
                                     entry["result_preview"] = "Commande exécutée avec succès (alternative simplifiée)."
                                     entry["rows_affected"] = None
-                                    entry["explanation"] = (
-                                        entry.get("explanation", "") + " [alternative simplifiée]"
-                                    )
-                                    bot_table = _cw_detect_bot_table(alt_sql)
+                                    bot_table = _cw_detect_bot_table(entry["sql"])
                                     if bot_table and bot_table not in session["created_tables"]:
                                         session["created_tables"].append(bot_table)
-                            except Exception as alt_exc:
-                                # Both attempts failed — try a completely different strategy (uses 1 credit)
+                                entry["explanation"] = (
+                                    entry.get("explanation", "") + " [alternative simplifiée]"
+                                )
+                            else:
+                                alt_error = alt_exec.get("error", alt_exec.get("summary", "unknown"))
                                 entry["result_preview"] = (
-                                    f"Erreur: {original_error}"
-                                    f" | Alternative simplifiée aussi échouée: {str(alt_exc)}"
+                                    f"[{error_class}] {original_error}"
+                                    f" | Alternative simplifiée aussi échouée: {alt_error}"
                                 )
                                 remaining_after_current = max_actions - session["action_count"] - 1
                                 if remaining_after_current > 0:
@@ -4296,26 +4717,33 @@ def _cw_execute_steps(session: dict, client, database: str, preview_rows: int = 
                                                 "rows_affected": None,
                                                 "explanation": "Nouvelle stratégie après deux échecs consécutifs",
                                             }
-                                            try:
-                                                rt_upper = rethink_sql.lstrip().upper()
-                                                rt_is_read = any(rt_upper.startswith(k) for k in
-                                                                  ("SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH"))
+                                            rt_upper = rethink_sql.lstrip().upper()
+                                            rt_is_read = any(rt_upper.startswith(k) for k in
+                                                             ("SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH"))
+                                            rt_exec = _execute_sql_guarded(
+                                                rethink_sql,
+                                                read_only=rt_is_read,
+                                                max_preview_rows=preview_rows,
+                                                max_execution_time=20,
+                                                default_limit=2000 if rt_is_read else 1000,
+                                                hard_limit_cap=10000,
+                                                client=client,
+                                            )
+                                            if rt_exec["ok"]:
+                                                rethink_entry["ok"] = True
+                                                rethink_entry["sql"] = rt_exec.get("normalized_sql", rethink_sql)
                                                 if rt_is_read:
-                                                    rt_res = client.query(rethink_sql)
-                                                    rt_rows = _rows_to_dicts(rt_res)
-                                                    rethink_entry["ok"] = True
-                                                    rethink_entry["result_preview"] = rt_rows[:preview_rows]
-                                                    rethink_entry["rows_affected"] = len(rt_rows)
+                                                    rethink_entry["result_preview"] = rt_exec["preview_rows"]
+                                                    rethink_entry["rows_affected"] = rt_exec["total_rows"]
                                                 else:
-                                                    client.command(rethink_sql)
-                                                    rethink_entry["ok"] = True
                                                     rethink_entry["result_preview"] = "Commande exécutée (stratégie alternative)."
-                                                    bot_t = _cw_detect_bot_table(rethink_sql)
+                                                    bot_t = _cw_detect_bot_table(rethink_entry["sql"])
                                                     if bot_t and bot_t not in session["created_tables"]:
                                                         session["created_tables"].append(bot_t)
-                                            except Exception as rt_exc:
+                                            else:
+                                                rt_error = rt_exec.get("error", rt_exec.get("summary", "unknown"))
                                                 rethink_entry["result_preview"] = (
-                                                    f"Échec stratégie alternative: {str(rt_exc)}"
+                                                    f"Échec stratégie alternative: {rt_error}"
                                                 )
                                             session["action_log"].append(rethink_entry)
                                             session["action_index"] += 1
@@ -4339,18 +4767,38 @@ def _cw_execute_steps(session: dict, client, database: str, preview_rows: int = 
                                                     session["plan"] = plan
                                                     steps = plan["steps"]
                                             continue
+                        else:
+                            entry["result_preview"] += f" | Alternative rejetée (sécurité): {alt_safety_reason}"
+
+        # Lightweight quality flag to enable earlier replanning when needed.
+        if entry["ok"] and isinstance(entry.get("rows_affected"), int) and entry["rows_affected"] == 0:
+            entry["quality_flag"] = "empty_result"
+        elif not entry["ok"]:
+            entry["quality_flag"] = "failed"
+        else:
+            entry["quality_flag"] = "ok"
 
         session["action_log"].append(entry)
         session["action_index"] += 1
         session["action_count"] += 1
 
-        # ── Replan check every 3 actions ──────────────────────────────────
+        # ── Replan check every 3 actions (or earlier if quality degrades) ──
         remaining_credits = max_actions - session["action_count"]
-        if (session["action_count"] % 3 == 0
+        recent_flags = [e.get("quality_flag") for e in session["action_log"][-2:]]
+        force_early_replan = (
+            len(recent_flags) == 2
+            and all(flag in {"failed", "empty_result"} for flag in recent_flags)
+        )
+        if (((session["action_count"] % 3 == 0) or force_early_replan)
                 and session["action_index"] < len(steps)
                 and remaining_credits > 0):
             replan = _cw_replan(session, remaining_credits)
             replan["checked_after_step"] = session["action_count"]
+            if force_early_replan:
+                reason = replan.get("reason", "")
+                replan["reason"] = (
+                    ("Déclenchement anticipé (2 étapes faibles/échouées). " + reason).strip()
+                )
             session["replan_log"].append(replan)
 
             if replan.get("should_replan") and replan.get("new_remaining_steps"):
