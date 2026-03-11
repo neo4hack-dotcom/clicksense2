@@ -1797,6 +1797,88 @@ def summarize_executive():
 # ---------------------------------------------------------------------------
 # Agent Analysis — agentic loop (up to 10 distinct ClickHouse queries)
 # ---------------------------------------------------------------------------
+
+def _identify_relevant_tables(
+    question: str,
+    all_tables_schema: dict,
+    all_table_metadata: dict,
+    table_mappings: dict,
+) -> list:
+    """Lightweight LLM call to identify which tables are relevant to the user's question.
+
+    Returns a list of table names to include in the agent context.
+    Falls back to all tables on any failure.
+    """
+    if not all_tables_schema:
+        return []
+
+    # If only a few tables, skip the identification step (not worth an extra LLM call)
+    if len(all_tables_schema) <= 3:
+        return list(all_tables_schema.keys())
+
+    # Build a compact one-line summary per table (names + columns, no full schema)
+    table_summaries = []
+    for tbl, cols in all_tables_schema.items():
+        col_names = [c["name"] if isinstance(c, dict) else str(c) for c in cols]
+        friendly = table_mappings.get(tbl, "")
+        meta = all_table_metadata.get(tbl, {})
+        description = (meta.get("description", "") if isinstance(meta, dict) else str(meta))[:150]
+        line = f"- {tbl}"
+        if friendly:
+            line += f' ("{friendly}")'
+        if description:
+            line += f": {description}"
+        shown_cols = col_names[:25]
+        line += f"\n  Columns: {', '.join(shown_cols)}"
+        if len(col_names) > 25:
+            line += f" … (+{len(col_names) - 25} more)"
+        table_summaries.append(line)
+
+    tables_overview = "\n".join(table_summaries)
+
+    identification_prompt = f"""You are a data analyst assistant.
+Given the user's question and the list of available database tables, identify which tables are needed to answer the question.
+
+AVAILABLE TABLES:
+{tables_overview}
+
+USER QUESTION:
+{question}
+
+INSTRUCTIONS:
+- List ONLY table names that are directly needed (including tables required for JOINs).
+- Do NOT include irrelevant tables.
+- When in doubt, include the table.
+
+Respond ONLY with valid JSON (no markdown):
+{{
+  "relevant_tables": ["table_name_1", "table_name_2"],
+  "reasoning": "Brief explanation"
+}}"""
+
+    try:
+        content = _call_llm(
+            identification_prompt,
+            [{"role": "user", "content": "Identify the relevant tables."}],
+            temperature=0.0,
+        )
+        result = _parse_llm_json(content)
+        if result and isinstance(result.get("relevant_tables"), list):
+            valid = [t for t in result["relevant_tables"] if t in all_tables_schema]
+            if valid:
+                print(
+                    f"[Table ID] {len(valid)}/{len(all_tables_schema)} tables selected: {valid}"
+                    f" — {result.get('reasoning', '')}"
+                )
+                return valid
+    except Exception as exc:
+        print(f"[Table ID] Identification failed: {exc}")
+
+    # Fallback: use all tables
+    print("[Table ID] Falling back to all tables")
+    return list(all_tables_schema.keys())
+
+
 @app.route("/api/agent", methods=["POST"])
 def agent_analysis():
     """Orchestrated multi-step analysis: the LLM autonomously decides which
@@ -1825,8 +1907,19 @@ def agent_analysis():
         f"[{f['title']}]\n{f['content']}" for f in folders if f.get("content")
     ) or knowledge_base
 
-    # Build friendly-name mapping note
+    # Build full mapping dict (used by table identification and mapping note)
     all_mappings = {m["table_name"]: m["mapping_name"] for m in db.get("table_mappings", [])}
+
+    # ── Step 0: Table identification ──────────────────────────────────────────
+    # Ask the LLM to identify which tables are relevant BEFORE building the
+    # full schema string, so we never send unnecessary context to the model.
+    relevant_tables = _identify_relevant_tables(
+        user_question, schema, table_metadata, all_mappings
+    )
+    schema = {t: cols for t, cols in schema.items() if t in relevant_tables}
+    table_metadata = {t: v for t, v in table_metadata.items() if t in relevant_tables}
+
+    # Recompute mapping note after filtering
     mapping_lines = [
         f"  - {tbl}  →  \"{all_mappings[tbl]}\""
         for tbl in schema if tbl in all_mappings
@@ -1835,9 +1928,6 @@ def agent_analysis():
         "Friendly business names for tables (use technical name in SQL, friendly name when talking to the user):\n"
         + "\n".join(mapping_lines)
     ) if mapping_lines else ""
-
-    schema_str = json.dumps(schema, indent=2)
-    metadata_str = json.dumps(table_metadata, indent=2)
 
     # Accumulate steps
     steps: list = []
@@ -1885,7 +1975,13 @@ def agent_analysis():
         return knowledge_context or "No knowledge base content available."
 
     def _run_agent_step(steps_so_far: list, used_steps: int = None) -> dict:
-        """Ask the LLM for its next action given the accumulated context."""
+        """Ask the LLM for its next action given the accumulated context.
+
+        Builds the system prompt dynamically: first computes the static parts
+        (without schema/metadata/knowledge), then uses _truncate_prompt_context
+        to fit the variable context within the model's token budget.  A final
+        safety check refuses to call the LLM if the prompt still overflows.
+        """
         steps_context = ""
         for i, s in enumerate(steps_so_far, 1):
             action_label = "SQL executed" if s.get("type") == "query" else "Knowledge search"
@@ -1898,21 +1994,15 @@ def agent_analysis():
 
         effective_used = used_steps if used_steps is not None else len(steps_so_far)
 
-        system_prompt = f"""You are an autonomous ClickHouse data analyst agent.
+        # ── Static parts of the prompt (no schema/metadata/knowledge yet) ────
+        static_header = f"""You are an autonomous ClickHouse data analyst agent.
 Your goal is to answer the user's question by executing a sequence of targeted actions.
 You may run up to {MAX_AGENT_STEPS} distinct actions in total. Each action must bring NEW information.
 After gathering enough evidence you MUST produce a final answer.
 
 DATABASE SCHEMA:
-{schema_str}
-
-TABLE METADATA (functional descriptions):
-{metadata_str}
-
-{mapping_note}
-
-STATIC KNOWLEDGE BASE (always available):
-{knowledge_context}
+"""
+        static_footer = f"""
 
 CLICKHOUSE INSTRUCTIONS:
 - Use advanced ClickHouse functions when appropriate (windowFunnel, retention, argMax, topK, uniqHLL12, quantilesTiming, JSONExtract, sumIf, countIf …).
@@ -1973,6 +2063,51 @@ For the final answer:
 
 No markdown fences. Only raw JSON."""
 
+        # ── Token budget: fit schema/metadata/knowledge to what remains ───────
+        # Estimate tokens consumed by the static parts + user turn
+        base_tokens = _estimate_tokens(static_header + static_footer + "Proceed with the next step.")
+        pruned_schema, pruned_metadata, pruned_knowledge = _truncate_prompt_context(
+            schema, table_metadata, knowledge_context, base_tokens
+        )
+
+        pruned_schema_str = json.dumps(pruned_schema, indent=2)
+        pruned_metadata_str = json.dumps(pruned_metadata, indent=2)
+        pruned_mapping_note = (
+            "Friendly business names for tables (use technical name in SQL, friendly name when talking to the user):\n"
+            + "\n".join(
+                f"  - {tbl}  →  \"{all_mappings[tbl]}\""
+                for tbl in pruned_schema if tbl in all_mappings
+            )
+        ) if any(tbl in all_mappings for tbl in pruned_schema) else ""
+
+        system_prompt = (
+            static_header
+            + pruned_schema_str
+            + f"\n\nTABLE METADATA (functional descriptions):\n{pruned_metadata_str}"
+            + (f"\n\n{pruned_mapping_note}" if pruned_mapping_note else "")
+            + (f"\n\nSTATIC KNOWLEDGE BASE (always available):\n{pruned_knowledge}" if pruned_knowledge else "")
+            + static_footer
+        )
+
+        # ── Final safety check: abort if prompt still exceeds context window ──
+        context_limit = _get_model_context_limit()
+        total_tokens = _estimate_tokens(system_prompt + "Proceed with the next step.")
+        if total_tokens > context_limit:
+            print(
+                f"[Token safety] Prompt too large even after truncation: "
+                f"~{total_tokens} tokens > {context_limit} limit. Aborting step."
+            )
+            return {
+                "action": "finish",
+                "reasoning": "Context window exceeded",
+                "final_answer": (
+                    "Désolé, la demande dépasse la fenêtre contextuelle du modèle même après "
+                    "réduction du contexte. Veuillez reformuler votre question de façon plus "
+                    "ciblée (par exemple en précisant les tables ou métriques concernées) afin "
+                    "que l'analyse puisse fonctionner correctement."
+                ),
+            }
+
         content = _call_llm(system_prompt, [{"role": "user", "content": "Proceed with the next step."}], temperature=0.2)
         return _parse_llm_json(content)
 
@@ -1994,11 +2129,18 @@ No markdown fences. Only raw JSON."""
                 f"Result: {'OK' if s.get('ok') else 'FAILED'} — {s['result_summary']}\n"
             )
 
+        # Use compact schema (column names only) for the retry prompt to save tokens
+        retry_schema_compact = {
+            tbl: [c["name"] if isinstance(c, dict) else str(c) for c in cols]
+            for tbl, cols in schema.items()
+        }
+        retry_schema_str = json.dumps(retry_schema_compact, indent=2)
+
         retry_prompt = f"""You are an autonomous ClickHouse data analyst agent.
 A previous SQL query was rejected by ClickHouse with a technical error. Generate a SIMPLER alternative that achieves the same analytical goal.
 
-DATABASE SCHEMA:
-{schema_str}
+DATABASE SCHEMA (relevant tables only):
+{retry_schema_str}
 
 FAILED SQL:
 {failed_sql}
