@@ -2887,31 +2887,50 @@ def summarize_executive():
     data = request.get_json(silent=True) or {}
     text = (data.get("text") or "").strip()
     lang = data.get("lang", "fr")
+    count = max(5, min(10, _parse_int_like(data.get("count", 5), 5)))
+    functional_focus = _coerce_bool_any(
+        data.get("functional_focus", data.get("functionalFocus", False)),
+        False,
+    )
 
     if not text:
         return jsonify({"error": "No text provided."}), 400
 
     system_prompt = (
         "You are an expert executive analyst. Your task is to distill a detailed "
-        "analysis report into exactly 5 concise bullet points for a C-level audience. "
+        f"analysis report into exactly {count} concise bullet points for a C-level audience. "
         "For each point, identify if it contains a risk or warning flag. "
         "Reply ONLY with valid JSON — no markdown, no extra text."
     )
 
     if lang == "fr":
+        focus_note = (
+            "Priorise fortement la lecture FONCTIONNELLE: explique les implications métier, "
+            "les déductions opérationnelles et les conclusions fonctionnelles."
+            if functional_focus
+            else ""
+        )
         format_instruction = (
-            "Réponds en FRANÇAIS. Rédige exactement 5 points synthétiques en langage "
+            f"Réponds en FRANÇAIS. Rédige exactement {count} points synthétiques en langage "
             "de comité exécutif. Pour chaque point indique s'il constitue un risque/point "
             "d'attention (risk: true/false) et sa sévérité (severity: 'high', 'medium' ou 'info').\n"
+            f"{focus_note + chr(10) if focus_note else ''}"
             "Format JSON attendu:\n"
             '{"preamble": "Phrase introductive courte.", "bullets": ['
             '{"point": "Texte du bullet point", "risk": false, "severity": "info"}, ...]}'
         )
     else:
+        focus_note = (
+            "Strongly prioritize FUNCTIONAL/business interpretation: implications, operational deductions, "
+            "and business conclusions."
+            if functional_focus
+            else ""
+        )
         format_instruction = (
-            "Write in ENGLISH. Draft exactly 5 concise bullet points in executive committee "
+            f"Write in ENGLISH. Draft exactly {count} concise bullet points in executive committee "
             "language. For each point indicate if it is a risk/watch point (risk: true/false) "
             "and its severity (severity: 'high', 'medium' or 'info').\n"
+            f"{focus_note + chr(10) if focus_note else ''}"
             "Expected JSON format:\n"
             '{"preamble": "Short introductory sentence.", "bullets": ['
             '{"point": "Bullet point text", "risk": false, "severity": "info"}, ...]}'
@@ -2929,18 +2948,45 @@ def summarize_executive():
             result = json.loads(m.group(0)) if m else {}
 
         bullets = result.get("bullets", [])
-        # Ensure exactly 5 bullets and normalize fields
+        # Ensure requested bullet count and normalize fields
         normalized = []
-        for b in bullets[:5]:
+        for b in bullets[:count]:
             if isinstance(b, dict):
                 normalized.append({
                     "point": str(b.get("point", "")),
                     "risk": bool(b.get("risk", False)),
                     "severity": b.get("severity", "info") if b.get("severity") in ("high", "medium", "info") else "info",
                 })
+        if len(normalized) < count:
+            chunks = re.split(r"(?<=[\.\!\?])\s+", text)
+            for chunk in chunks:
+                c = str(chunk or "").strip()
+                if not c:
+                    continue
+                normalized.append({
+                    "point": c[:240],
+                    "risk": False,
+                    "severity": "info",
+                })
+                if len(normalized) >= count:
+                    break
+        while len(normalized) < count:
+            idx = len(normalized) + 1
+            normalized.append({
+                "point": (
+                    f"Point complémentaire {idx}: confirmer l'impact fonctionnel avec une vérification ciblée."
+                    if lang == "fr"
+                    else f"Additional point {idx}: validate functional impact with a targeted follow-up check."
+                ),
+                "risk": False,
+                "severity": "info",
+            })
+        normalized = normalized[:count]
         return jsonify({
             "preamble": str(result.get("preamble", "")),
             "bullets": normalized,
+            "requested_count": count,
+            "actual_count": len(normalized),
         })
     except Exception as exc:
         return jsonify({"error": f"LLM error: {exc}"}), 500
@@ -3510,17 +3556,38 @@ Return ONLY JSON:
             max_steps=12,
             max_result_chars=240,
         )
-        synth_prompt = f"""Based on the following evidence, write a final answer.
+        synth_prompt = f"""You are a senior business data analyst.
+Write a clear and professional final answer with strong FUNCTIONAL focus.
+Use the same language as the USER QUESTION.
 
 USER QUESTION: {user_question}
 
 STEPS AND RESULTS:
 {chr(10).join(detailed_lines)}
 
+Output structure (plain text section titles, no markdown markers):
+Résumé exécutif:
+Short executive summary for decision-makers.
+
+Explications fonctionnelles:
+Explain business meaning of observed patterns (process, product, revenue, risk, operations).
+
+Déductions et conclusions fonctionnelles:
+List key deductions and functional conclusions, each tied to evidence.
+
+Faits chiffrés et preuves:
+List quantified facts and references to step evidence.
+
+Recommandations actionnables:
+Pragmatic next actions ordered by priority.
+
+Niveau de confiance et limites:
+State confidence and important caveats.
+
 Requirements:
-- Be explicit about confidence level and evidence quality.
-- If data is missing or inconclusive, say it clearly.
-- Provide concise next best actions."""
+- Prioritize functional interpretation, not only numbers.
+- Connect conclusions to explicit evidence from the steps.
+- If data is missing or inconclusive, say it clearly."""
         context_limit = _get_effective_context_limit()
         if _estimate_tokens(synth_prompt) > context_limit:
             compact_lines = _build_synthesis_evidence_lines(
@@ -3529,12 +3596,14 @@ Requirements:
                 max_result_chars=120,
             )
             synth_prompt = f"""Write a concise final answer from this compact evidence.
+Use the same language as the USER QUESTION.
 
 USER QUESTION: {user_question}
 EVIDENCE:
 {chr(10).join(compact_lines)}
 
 Requirements:
+- Keep a clear functional/business focus.
 - Mention confidence level.
 - Mention gaps/limitations.
 - Give next best actions."""
@@ -3554,7 +3623,7 @@ Requirements:
                 max_result_chars=80,
             )
             emergency_prompt = (
-                "Write final answer in 5 short bullets from minimal evidence only.\n\n"
+                "Write final answer in 5 short bullets with functional focus from minimal evidence only.\n\n"
                 f"USER QUESTION: {user_question}\n"
                 "EVIDENCE:\n"
                 + "\n".join(compact_lines)
@@ -3774,6 +3843,10 @@ REACT DISCIPLINE:
 - For action "query", explicitly include a hypothesis and expected signal before SQL execution.
 - If the previous query failed or was weak, first explain how the next action corrects trajectory.
 
+FINAL ANSWER QUALITY:
+- The final answer must remain professional and detailed with a strong functional/business focus.
+- Include functional explanations, deductions, and business conclusions in addition to factual metrics.
+
 WORKING MEMORY (TRANSIENT, FOR MULTI-HOP RETRIEVAL):
 {working_memory_block}
 - You may reuse stored ID sets with SQL placeholders (best used inside IN (...)):
@@ -3823,7 +3896,7 @@ For the final answer:
 {{
   "action": "finish",
   "reasoning": "Why you have enough information to conclude",
-  "final_answer": "A detailed, structured answer for the user based on all gathered information"
+  "final_answer": "A detailed, structured answer with functional explanations, deductions, conclusions, quantified facts, actions and confidence"
 }}
 
 No markdown fences. Only raw JSON."""
@@ -3903,7 +3976,7 @@ For final answer:
 {{
   "action": "finish",
   "reasoning": "Why enough information is available",
-  "final_answer": "Structured answer based on gathered evidence"
+  "final_answer": "Structured answer with functional focus based on gathered evidence"
 }}"""
             compact_total = _estimate_tokens(system_prompt + "Proceed with the next step.")
             if compact_total > context_limit:
@@ -4367,7 +4440,8 @@ Respond ONLY with valid JSON (no markdown):
                 })
             else:
                 # action == "finish"
-                final_answer = decision.get("final_answer", "")
+                decision_final = str(decision.get("final_answer", "")).strip()
+                final_answer = decision_final if decision_final else None
                 break
 
         # If the loop exhausted all steps without finish, synthesize from evidence.

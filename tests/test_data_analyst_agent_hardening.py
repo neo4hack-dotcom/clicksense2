@@ -446,6 +446,66 @@ def test_execute_sql_guarded_condenses_large_result_sets():
     assert "Descriptive stats computed on a" in out["summary"]
 
 
+def test_summarize_executive_supports_custom_count(client, monkeypatch):
+    captured = {"prompt": ""}
+
+    def fake_call(system_prompt, messages, temperature=0.7, language=None):
+        _ = temperature
+        _ = language
+        captured["prompt"] = messages[-1]["content"]
+        bullets = [
+            {"point": f"Point {i+1}", "risk": i % 2 == 0, "severity": "medium" if i % 2 == 0 else "info"}
+            for i in range(10)
+        ]
+        return json.dumps({"preamble": "Synthèse", "bullets": bullets})
+
+    monkeypatch.setattr(server, "_call_llm", fake_call)
+    resp = client.post(
+        "/api/summarize_executive",
+        json={
+            "text": "Analyse longue avec éléments fonctionnels et quantitatifs.",
+            "lang": "fr",
+            "count": 10,
+            "functional_focus": True,
+        },
+    )
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["requested_count"] == 10
+    assert payload["actual_count"] == 10
+    assert len(payload["bullets"]) == 10
+    assert "Priorise fortement la lecture FONCTIONNELLE" in captured["prompt"]
+
+
+def test_summarize_executive_backfills_when_llm_returns_few_bullets(client, monkeypatch):
+    def fake_call(system_prompt, messages, temperature=0.7, language=None):
+        _ = system_prompt
+        _ = messages
+        _ = temperature
+        _ = language
+        return json.dumps({
+            "preamble": "Fallback",
+            "bullets": [{"point": "Unique point", "risk": False, "severity": "info"}],
+        })
+
+    monkeypatch.setattr(server, "_call_llm", fake_call)
+    text = (
+        "La marge chute sur le segment B2B. "
+        "Le coût d'acquisition augmente sur le canal paid. "
+        "Le churn reste stable malgré une hausse des tickets de support. "
+        "La qualité des leads se dégrade sur la période récente."
+    )
+    resp = client.post(
+        "/api/summarize_executive",
+        json={"text": text, "lang": "fr", "count": 7},
+    )
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["requested_count"] == 7
+    assert payload["actual_count"] == 7
+    assert len(payload["bullets"]) == 7
+
+
 def test_resolve_sql_memory_placeholders_supports_last_alias_and_unknown_refs():
     memory = {
         "artifacts": {
