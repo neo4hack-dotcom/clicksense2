@@ -6965,6 +6965,7 @@ def _da_session_payload(session: dict) -> dict:
         "response_seq": int(session.get("response_seq", 0)),
         "latest_assistant": session.get("latest_assistant"),
         "last_result": session.get("last_result"),
+        "pending_clarification": session.get("pending_clarification"),
         "params": session.get("params", {}),
         "created_at": session.get("created_at"),
         "updated_at": session.get("updated_at"),
@@ -7007,6 +7008,141 @@ def _da_extract_response_payload(resp_obj):
     return status_code, data
 
 
+def _da_build_preflight_messages(session: dict, user_question: str) -> list[dict]:
+    """Build a compact message list for the chat-style clarification preflight."""
+    question = str(user_question or "").strip()
+    pending = session.get("pending_clarification") or {}
+    pending_type = str(pending.get("type", "") or "").strip().lower()
+    if pending_type and pending_type != "table_selection":
+        original_question = str(
+            pending.get("pending_question")
+            or pending.get("original_question")
+            or ""
+        ).strip()
+        assistant_question = str(pending.get("question", "") or "").strip()
+        messages = []
+        if original_question:
+            messages.append({"role": "user", "content": original_question[:1200]})
+        if assistant_question:
+            messages.append({"role": "assistant", "content": assistant_question[:600]})
+        if question:
+            messages.append({"role": "user", "content": question[:1000]})
+        return messages or [{"role": "user", "content": question[:1000]}]
+
+    memory_summary = str(session.get("memory_summary", "") or "").strip()
+    if memory_summary:
+        memory_summary = _truncate_text_to_budget(memory_summary, token_budget=120)
+        return [
+            {"role": "assistant", "content": f"Conversation context summary: {memory_summary}"},
+            {"role": "user", "content": question[:1200]},
+        ]
+    return [{"role": "user", "content": question[:1200]}]
+
+
+def _da_run_clarification_preflight(
+    session: dict,
+    user_question: str,
+    schema: dict,
+    table_metadata: dict,
+    table_filter: list,
+) -> dict:
+    """Reuse /api/chat ambiguity handling before launching the heavier agent run."""
+    question = str(user_question or "").strip()
+    if not question:
+        return {}
+    messages = _da_build_preflight_messages(session, question)
+    payload = {
+        "messages": messages,
+        "schema": schema or {},
+        "tableMetadata": table_metadata or {},
+        "tableMappingFilter": table_filter or [],
+        "conversation_id": session.get("id"),
+        "use_knowledge_base": bool(session.get("params", {}).get("use_knowledge_base", True)),
+    }
+    try:
+        with app.app_context():
+            with app.test_request_context("/api/chat", method="POST", json=payload):
+                resp = chat()
+        status_code, data = _da_extract_response_payload(resp)
+        if status_code >= 400:
+            return {}
+        if bool(data.get("needs_clarification")):
+            return {
+                "needs_clarification": True,
+                "type": str(data.get("type", "") or "field_selection"),
+                "question": str(data.get("question", "") or "").strip(),
+                "options": list(data.get("options") or []),
+                "context": data.get("context") or {},
+            }
+    except Exception:
+        return {}
+    return {}
+
+
+def _da_select_tables_from_text(user_text: str, candidates: list[str]) -> list[str]:
+    """Best-effort extraction of chosen tables from free-text user replies."""
+    text = str(user_text or "").strip()
+    if not text:
+        return []
+    candidate_map = {
+        str(tbl).strip().lower(): str(tbl).strip()
+        for tbl in candidates or []
+        if str(tbl).strip()
+    }
+    if not candidate_map:
+        return []
+    parts = [p.strip() for p in re.split(r"[,\n;]+", text) if p.strip()]
+    selected = []
+    seen = set()
+    for part in parts:
+        low = part.lower()
+        if low in candidate_map and low not in seen:
+            seen.add(low)
+            selected.append(candidate_map[low])
+            continue
+        for cand_low, cand_raw in candidate_map.items():
+            if cand_low in low and cand_low not in seen:
+                seen.add(cand_low)
+                selected.append(cand_raw)
+    return selected
+
+
+def _da_prepare_effective_question(session: dict, user_question: str) -> tuple[str, list[str]]:
+    """Merge pending clarification state with the latest user input."""
+    raw_question = str(user_question or "").strip()
+    preconfirmed_tables = [
+        str(x).strip() for x in (session.pop("pending_confirmed_tables", []) or []) if str(x).strip()
+    ]
+    pending = session.get("pending_clarification") or {}
+    pending_type = str(pending.get("type", "") or "").strip().lower()
+    if not pending_type:
+        return raw_question, preconfirmed_tables
+
+    original_question = str(
+        pending.get("pending_question")
+        or pending.get("original_question")
+        or raw_question
+    ).strip()
+    if pending_type == "table_selection":
+        candidate_tables = [str(x).strip() for x in (pending.get("candidate_tables") or []) if str(x).strip()]
+        confirmed_tables = list(preconfirmed_tables)
+        if not confirmed_tables:
+            confirmed_tables = _da_select_tables_from_text(raw_question, candidate_tables)
+        if confirmed_tables:
+            session["pending_clarification"] = None
+            return original_question or raw_question, confirmed_tables
+        return raw_question, []
+
+    clarification_question = str(pending.get("question", "") or "").strip()
+    session["pending_clarification"] = None
+    effective_question = (
+        f"Original user question:\n{original_question}\n\n"
+        f"Assistant clarification request ({pending_type}):\n{clarification_question}\n\n"
+        f"User clarification answer:\n{raw_question}"
+    ).strip()
+    return effective_question, []
+
+
 def _da_worker_loop(session_id: str, run_seq: int) -> None:
     while True:
         with _data_analyst_sessions_lock:
@@ -7028,11 +7164,12 @@ def _da_worker_loop(session_id: str, run_seq: int) -> None:
                 return
             if not session.get("pending_user_inputs"):
                 session["running"] = False
-                if session.get("status") not in {"paused", "stopped", "error"}:
+                if session.get("status") not in {"paused", "stopped", "error", "awaiting_clarification", "awaiting_table_selection"}:
                     session["status"] = "idle"
                 session["updated_at"] = _da_now_iso()
                 return
-            user_question = str(session["pending_user_inputs"].pop(0)).strip()
+            raw_user_question = str(session["pending_user_inputs"].pop(0)).strip()
+            user_question, confirmed_tables = _da_prepare_effective_question(session, raw_user_question)
             params = dict(session.get("params", {}))
             _da_refresh_memory_summary(session, current_question=user_question)
             composed_question = _da_compose_question(session, user_question)
@@ -7058,6 +7195,53 @@ def _da_worker_loop(session_id: str, run_seq: int) -> None:
 
             table_filter = _da_parse_table_filter(params.get("table_filter", []))
 
+            preflight = {}
+            if not confirmed_tables:
+                preflight = _da_run_clarification_preflight(
+                    session,
+                    user_question,
+                    schema,
+                    table_metadata,
+                    table_filter,
+                )
+            if preflight.get("needs_clarification"):
+                assistant_payload = {
+                    "content": str(preflight.get("question") or "Clarification required.").strip(),
+                    "analyst_result": None,
+                    "error": "",
+                    "needs_clarification": True,
+                    "question": str(preflight.get("question") or "").strip(),
+                    "clarification_question": str(preflight.get("question") or "").strip(),
+                    "options": list(preflight.get("options") or []),
+                    "clarification_type": str(preflight.get("type") or "field_selection"),
+                    "clarification_context": preflight.get("context") or {},
+                }
+                session["pending_clarification"] = {
+                    "type": assistant_payload["clarification_type"],
+                    "question": assistant_payload["question"],
+                    "options": assistant_payload["options"],
+                    "context": assistant_payload["clarification_context"],
+                    "pending_question": user_question,
+                    "original_question": raw_user_question or user_question,
+                }
+                session["latest_assistant"] = assistant_payload
+                session["status"] = "awaiting_clarification"
+                session["running"] = False
+                session["response_seq"] = int(session.get("response_seq", 0)) + 1
+                session.setdefault("conversation", []).append({
+                    "role": "assistant",
+                    "content": assistant_payload["content"],
+                    "ts": _da_now_iso(),
+                })
+                _da_log_event(
+                    session,
+                    f"Clarification requested before execution ({assistant_payload['clarification_type']}).",
+                    "warn",
+                    "clarification",
+                )
+                _da_refresh_memory_summary(session)
+                return
+
         payload = {
             "question": composed_question or user_question,
             "schema": schema,
@@ -7069,6 +7253,8 @@ def _da_worker_loop(session_id: str, run_seq: int) -> None:
             "use_knowledge_agent": _da_coerce_bool(params.get("use_knowledge_agent", False), False),
             "control_session_id": session_id,
         }
+        if confirmed_tables:
+            payload["confirmedTables"] = confirmed_tables
 
         try:
             with app.app_context():
@@ -7097,6 +7283,29 @@ def _da_worker_loop(session_id: str, run_seq: int) -> None:
                 assistant_payload["content"] = f"Agent error: {err_txt}"
                 assistant_payload["error"] = err_txt
                 _da_log_event(session, f"Run failed: {err_txt}", "error", "run")
+            elif result.get("needs_table_selection"):
+                candidate_tables = [
+                    str(x).strip()
+                    for x in (result.get("candidate_tables") or [])
+                    if str(x).strip()
+                ]
+                assistant_payload.update({
+                    "content": str(result.get("question") or "Select the tables to analyze.").strip(),
+                    "needs_table_selection": True,
+                    "candidate_tables": candidate_tables,
+                    "pending_question": user_question,
+                })
+                session["pending_clarification"] = {
+                    "type": "table_selection",
+                    "question": assistant_payload["content"],
+                    "candidate_tables": candidate_tables,
+                    "pending_question": user_question,
+                    "original_question": raw_user_question or user_question,
+                }
+                session["pending_confirmed_tables"] = []
+                session["status"] = "awaiting_table_selection"
+                session["running"] = False
+                _da_log_event(session, "Table selection required before executing SQL.", "warn", "clarification")
             else:
                 interrupted = bool(result.get("interrupted", False))
                 interrupt_reason = str(result.get("interrupt_reason", "")).strip().lower()
@@ -7129,6 +7338,8 @@ def _da_worker_loop(session_id: str, run_seq: int) -> None:
                     session["status"] = "stopped"
                     _da_log_event(session, "Run stopped after interruption request.", "warn", "control")
                 else:
+                    session["pending_clarification"] = None
+                    session["pending_confirmed_tables"] = []
                     session["status"] = "completed"
                     _da_log_event(
                         session,
@@ -7175,7 +7386,7 @@ def _da_worker_loop(session_id: str, run_seq: int) -> None:
                 continue
 
             session["running"] = False
-            if session.get("status") not in {"paused", "stopped", "error"}:
+            if session.get("status") not in {"paused", "stopped", "error", "awaiting_clarification", "awaiting_table_selection"}:
                 session["status"] = "idle"
             session["updated_at"] = _da_now_iso()
             return
@@ -7187,6 +7398,8 @@ def _run_ai_data_analyst_session_agent():
     control = str(data.get("control", "")).strip().lower()
     session_id = str(data.get("session_id", "")).strip()
     messages = data.get("messages", []) or []
+    raw_confirmed_tables = data.get("confirmed_tables", data.get("confirmedTables", []))
+    confirmed_tables = _da_parse_table_filter(raw_confirmed_tables)
 
     last_user_text = ""
     if isinstance(messages, list):
@@ -7223,6 +7436,8 @@ def _run_ai_data_analyst_session_agent():
                 "last_completed_question": "",
                 "cached_schema": None,
                 "cached_schema_ts": 0,
+                "pending_clarification": None,
+                "pending_confirmed_tables": [],
                 "run_seq": 0,
                 "worker": None,
             }
@@ -7292,6 +7507,48 @@ def _run_ai_data_analyst_session_agent():
                 _da_log_event(session, "Session resumed without pending run.", "info", "control")
             payload = _da_session_payload(session)
             payload["content"] = content
+            return jsonify(payload)
+
+        if control == "resolve_table_selection":
+            pending = session.get("pending_clarification") or {}
+            candidate_tables = [
+                str(x).strip()
+                for x in (pending.get("candidate_tables") or [])
+                if str(x).strip()
+            ]
+            if not candidate_tables:
+                payload = _da_session_payload(session)
+                payload["content"] = "No table selection is currently pending."
+                return jsonify(payload), 400
+            selected_tables = confirmed_tables or _da_select_tables_from_text(last_user_text, candidate_tables)
+            if not selected_tables:
+                payload = _da_session_payload(session)
+                payload["content"] = "Select at least one candidate table before continuing."
+                return jsonify(payload), 400
+            original_question = str(
+                pending.get("pending_question")
+                or pending.get("original_question")
+                or ""
+            ).strip()
+            session["pending_confirmed_tables"] = selected_tables
+            session["pending_clarification"] = None
+            if original_question:
+                session["pending_user_inputs"].append(original_question)
+            display_value = ", ".join(selected_tables)
+            session["conversation"].append({
+                "role": "user",
+                "content": f"Confirmed tables: {display_value}",
+                "ts": _da_now_iso(),
+            })
+            _da_log_event(
+                session,
+                f"Confirmed table selection: {display_value}",
+                "info",
+                "clarification",
+            )
+            started = _da_start_worker_if_needed(session)
+            payload = _da_session_payload(session)
+            payload["content"] = "Table selection confirmed. Agent run started." if started else "Table selection saved."
             return jsonify(payload)
 
         if control == "run":

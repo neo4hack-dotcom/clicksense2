@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useMemo, KeyboardEvent, CSSProperties } from 'react';
+import { useState, useRef, useEffect, useMemo, KeyboardEvent, CSSProperties, ReactNode } from 'react';
 import {
   Cpu, Send, ChevronDown, ChevronRight, CheckCircle2, XCircle,
   Loader2, Database, FileText, Settings2, Table2, Columns3,
@@ -6,7 +6,7 @@ import {
   RotateCcw, Trash2, BookOpen, TrendingUp, Star, Code2, Download,
   GitFork, ArrowRight, ArrowLeftRight, ThumbsUp, ThumbsDown,
   FolderOpen, Upload, Layers, Calculator, ShieldCheck, PauseCircle,
-  Square, Activity, Sparkles, ShieldAlert,
+  Square, Activity, Sparkles, ShieldAlert, Search, Tag, Calendar, BarChart2,
 } from 'lucide-react';
 import clsx from 'clsx';
 import { useAppStore } from '../store';
@@ -260,8 +260,25 @@ interface AnalystRuntimeState {
     analyst_result?: AnalystResult | null;
     wrangling_result?: WranglingResult | null;
     error?: string;
+    question?: string;
+    needs_clarification?: boolean;
+    clarification_question?: string;
+    options?: string[];
+    clarification_type?: ClarificationType;
+    clarification_context?: { table?: string; field?: string };
+    needs_table_selection?: boolean;
+    candidate_tables?: string[];
+    pending_question?: string;
   } | null;
   last_result?: AnalystResult | WranglingResult | null;
+  pending_clarification?: {
+    type?: ClarificationType | string;
+    question?: string;
+    options?: string[];
+    context?: { table?: string; field?: string };
+    candidate_tables?: string[];
+    pending_question?: string;
+  } | null;
 }
 
 interface AnalystExecSummaryBullet {
@@ -352,7 +369,23 @@ interface ChatMessage {
   agent_kind?: 'analyst' | 'wrangling';
   analyst_runtime_status?: string;
   analyst_memory_summary?: string;
+  needs_clarification?: boolean;
+  clarification_question?: string;
+  options?: string[];
+  clarification_type?: ClarificationType;
+  clarification_context?: { table?: string; field?: string };
+  needs_table_selection?: boolean;
+  candidate_tables?: string[];
+  pending_question?: string;
 }
+
+type ClarificationType =
+  | 'field_selection'
+  | 'table_selection'
+  | 'value_selection'
+  | 'metric_selection'
+  | 'period_selection'
+  | 'dimension_selection';
 
 function isKnowledgeModeParam(paramName: string): boolean {
   return paramName === 'knowledge_mode';
@@ -3170,15 +3203,217 @@ function AnalystRuntimePanel({
   );
 }
 
+const runtimeClarificationConfig: Record<ClarificationType, {
+  label: string;
+  icon: ReactNode;
+  color: string;
+  pillColor: string;
+}> = {
+  table_selection: {
+    label: 'Choose a table',
+    icon: <Table2 size={12} />,
+    color: 'text-blue-700 bg-blue-50 border-blue-200',
+    pillColor: 'bg-blue-50 hover:bg-blue-100 text-blue-700 border-blue-200',
+  },
+  field_selection: {
+    label: 'Choose a field',
+    icon: <Layers size={12} />,
+    color: 'text-violet-700 bg-violet-50 border-violet-200',
+    pillColor: 'bg-violet-50 hover:bg-violet-100 text-violet-700 border-violet-200',
+  },
+  value_selection: {
+    label: 'Choose a value',
+    icon: <Tag size={12} />,
+    color: 'text-amber-700 bg-amber-50 border-amber-200',
+    pillColor: 'bg-amber-50 hover:bg-amber-100 text-amber-700 border-amber-200',
+  },
+  metric_selection: {
+    label: 'Choose a calculation',
+    icon: <Calculator size={12} />,
+    color: 'text-emerald-700 bg-emerald-50 border-emerald-200',
+    pillColor: 'bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border-emerald-200',
+  },
+  period_selection: {
+    label: 'Choose a period',
+    icon: <Calendar size={12} />,
+    color: 'text-sky-700 bg-sky-50 border-sky-200',
+    pillColor: 'bg-sky-50 hover:bg-sky-100 text-sky-700 border-sky-200',
+  },
+  dimension_selection: {
+    label: 'Choose a grouping',
+    icon: <BarChart2 size={12} />,
+    color: 'text-indigo-700 bg-indigo-50 border-indigo-200',
+    pillColor: 'bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border-indigo-200',
+  },
+};
+
+function RuntimeClarificationPanel({
+  type,
+  options,
+  context,
+  onSelect,
+}: {
+  type: ClarificationType;
+  options: string[];
+  context?: { table?: string; field?: string };
+  onSelect: (value: string) => void;
+}) {
+  const [search, setSearch] = useState('');
+  const cfg = runtimeClarificationConfig[type] ?? runtimeClarificationConfig.field_selection;
+  const filtered = search.trim()
+    ? options.filter((opt) => opt.toLowerCase().includes(search.toLowerCase()))
+    : options;
+  const showSearch = options.length > 8;
+
+  if (options.length === 0 && type === 'value_selection') {
+    return (
+      <div className="mt-3 space-y-2">
+        <div className={clsx('inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-semibold', cfg.color)}>
+          {cfg.icon}
+          <span>{cfg.label}</span>
+          {context?.field && <span className="font-mono text-[10px] opacity-70">· {context.field}</span>}
+        </div>
+        <p className="text-xs text-slate-400 italic">Type the value directly in the chat input below.</p>
+      </div>
+    );
+  }
+
+  if (options.length === 0) return null;
+
+  return (
+    <div className="mt-3 space-y-2">
+      <div className={clsx('inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-semibold', cfg.color)}>
+        {cfg.icon}
+        <span>{cfg.label}</span>
+        {context?.table && <span className="font-mono text-[10px] opacity-70">· {context.table}</span>}
+        {context?.field && <span className="font-mono text-[10px] opacity-70">· {context.field}</span>}
+      </div>
+
+      {showSearch && (
+        <div className="relative">
+          <Search size={11} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Filter options…"
+            className="w-full pl-7 pr-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-sky-400"
+          />
+        </div>
+      )}
+
+      <div className={clsx(
+        'flex gap-1.5',
+        type === 'value_selection' && options.length > 6
+          ? 'flex-wrap max-h-48 overflow-y-auto pr-1'
+          : 'flex-wrap',
+      )}>
+        {filtered.map((opt) => (
+          <button
+            key={opt}
+            onClick={() => onSelect(opt)}
+            className={clsx(
+              'px-3 py-1.5 text-xs border rounded-full transition-colors text-left',
+              cfg.pillColor,
+            )}
+          >
+            {opt}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function AnalystTableSelectionPanel({
+  candidateTables,
+  onConfirm,
+}: {
+  candidateTables: string[];
+  onConfirm: (tables: string[]) => void;
+}) {
+  const [selected, setSelected] = useState<string[]>([]);
+  const [search, setSearch] = useState('');
+  const filtered = search.trim()
+    ? candidateTables.filter((tbl) => tbl.toLowerCase().includes(search.toLowerCase()))
+    : candidateTables;
+
+  function toggleTable(tableName: string) {
+    setSelected((prev) => (
+      prev.includes(tableName)
+        ? prev.filter((item) => item !== tableName)
+        : [...prev, tableName]
+    ));
+  }
+
+  return (
+    <div className="mt-3 border border-amber-300 rounded-xl overflow-hidden bg-amber-50">
+      <div className="px-3 py-2 bg-amber-100 border-b border-amber-200 flex items-center gap-2">
+        <AlertTriangle size={13} className="text-amber-600 shrink-0" />
+        <span className="text-xs font-semibold text-amber-700">
+          Select the table(s) to analyze
+        </span>
+      </div>
+      <div className="p-3 space-y-3">
+        {candidateTables.length > 8 && (
+          <div className="relative">
+            <Search size={11} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-amber-500" />
+            <input
+              type="text"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Filter tables…"
+              className="w-full pl-7 pr-3 py-1.5 text-xs bg-white border border-amber-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-amber-400"
+            />
+          </div>
+        )}
+        <div className="flex flex-wrap gap-2">
+          {filtered.map((tbl) => {
+            const active = selected.includes(tbl);
+            return (
+              <button
+                key={tbl}
+                onClick={() => toggleTable(tbl)}
+                className={clsx(
+                  'px-3 py-1.5 rounded-full border text-xs transition-colors font-mono',
+                  active
+                    ? 'bg-amber-600 text-white border-amber-700'
+                    : 'bg-white text-amber-800 border-amber-300 hover:bg-amber-100',
+                )}
+              >
+                {tbl}
+              </button>
+            );
+          })}
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => onConfirm(selected)}
+            disabled={selected.length === 0}
+            className="px-3 py-1.5 text-xs rounded-lg bg-amber-600 text-white hover:bg-amber-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          >
+            Confirm selection
+          </button>
+          <span className="text-[11px] text-amber-700">
+            {selected.length > 0 ? `${selected.length} table(s) selected` : 'Select at least one table'}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Generic AssistantMessage ────────────────────────────────────────────────
 
 function AssistantMessage({
   msg,
   onChoice,
+  onResolveTableSelection,
   isLast,
 }: {
   msg: ChatMessage;
   onChoice: (value: string) => void;
+  onResolveTableSelection?: (tables: string[], pendingQuestion?: string) => void;
   isLast: boolean;
 }) {
   if (msg.error) {
@@ -3274,6 +3509,22 @@ function AssistantMessage({
             </div>
           )}
         </div>
+
+        {msg.needs_clarification && (
+          <RuntimeClarificationPanel
+            type={msg.clarification_type ?? 'field_selection'}
+            options={msg.options ?? []}
+            context={msg.clarification_context}
+            onSelect={onChoice}
+          />
+        )}
+
+        {msg.needs_table_selection && (msg.candidate_tables?.length || 0) > 0 && onResolveTableSelection && (
+          <AnalystTableSelectionPanel
+            candidateTables={msg.candidate_tables ?? []}
+            onConfirm={(tables) => onResolveTableSelection(tables, msg.pending_question)}
+          />
+        )}
 
         {/* Data dictionary views */}
         {msg.steps && msg.steps.length > 0 && <StepsPanel steps={msg.steps} />}
@@ -3397,6 +3648,7 @@ export function AgentsPane() {
       response_seq: Number(data.response_seq || 0),
       latest_assistant: data.latest_assistant || null,
       last_result: data.last_result || null,
+      pending_clarification: data.pending_clarification || null,
     };
     setAnalystRuntime(runtime);
     setLoading(runtime.running);
@@ -3420,6 +3672,14 @@ export function AgentsPane() {
         agent_kind: runtimeAgentKind,
         analyst_runtime_status: runtime.status,
         error: runtime.latest_assistant?.error || undefined,
+        needs_clarification: !!runtime.latest_assistant?.needs_clarification,
+        clarification_question: runtime.latest_assistant?.clarification_question || runtime.latest_assistant?.question,
+        options: runtime.latest_assistant?.options || [],
+        clarification_type: runtime.latest_assistant?.clarification_type,
+        clarification_context: runtime.latest_assistant?.clarification_context,
+        needs_table_selection: !!runtime.latest_assistant?.needs_table_selection,
+        candidate_tables: runtime.latest_assistant?.candidate_tables || [],
+        pending_question: runtime.latest_assistant?.pending_question,
       }]);
       analystSeenResponseSeqRef.current = runtime.response_seq;
     }
@@ -3464,6 +3724,40 @@ export function AgentsPane() {
         setMessages(prev => [...prev, { role: 'assistant', content: data.error, error: data.error }]);
       } else {
         applyAnalystRuntimeResponse(data, { injectStatusMessage: control !== 'status' });
+      }
+    } catch {
+      setMessages(prev => [...prev, {
+        role: 'assistant',
+        content: 'Server connection error.',
+        error: 'Connection error',
+      }]);
+    } finally {
+      setAnalystControlBusy(false);
+    }
+  }
+
+  async function resolveAnalystTableSelection(tables: string[], pendingQuestion?: string) {
+    if (!selectedAgent || !isRuntimeAgentId(selectedAgent.id) || !sessionId || tables.length === 0) return;
+    setAnalystControlBusy(true);
+    const display = `Confirmed tables: ${tables.join(', ')}`;
+    setMessages(prev => [...prev, { role: 'user', content: display }]);
+    try {
+      const res = await fetch(`/api/agents/${selectedAgent.id}/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          control: 'resolve_table_selection',
+          session_id: sessionId,
+          params,
+          confirmed_tables: tables,
+          pending_question: pendingQuestion || undefined,
+        }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        setMessages(prev => [...prev, { role: 'assistant', content: data.error, error: data.error }]);
+      } else {
+        applyAnalystRuntimeResponse(data, { injectStatusMessage: true });
       }
     } catch {
       setMessages(prev => [...prev, {
@@ -4119,6 +4413,7 @@ export function AgentsPane() {
                       <AssistantMessage
                         msg={msg}
                         onChoice={handleChoice}
+                        onResolveTableSelection={resolveAnalystTableSelection}
                         isLast={i === messages.length - 1}
                       />
                     )}

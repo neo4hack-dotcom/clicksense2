@@ -633,6 +633,190 @@ def test_data_analyst_session_pause_note_then_resume(client, monkeypatch):
     assert "Session resumed. Agent run started." in resume_payload["content"]
 
 
+def test_data_analyst_session_worker_requests_clarification_before_running_agent(monkeypatch):
+    session_id = "clarif-session"
+    with server._data_analyst_sessions_lock:
+        server._data_analyst_sessions[session_id] = {
+            "id": session_id,
+            "created_at": "",
+            "updated_at": "",
+            "status": "running",
+            "running": True,
+            "pause_requested": False,
+            "stop_requested": False,
+            "params": {"auto_run": True, "use_knowledge_base": True, "max_steps": 6},
+            "conversation": [],
+            "recent_user_goals": [],
+            "pending_user_inputs": ["Show sales"],
+            "paused_notes": [],
+            "memory_summary": "",
+            "event_log": [],
+            "event_seq": 0,
+            "response_seq": 0,
+            "latest_assistant": None,
+            "last_result": None,
+            "last_completed_question": "",
+            "cached_schema": None,
+            "cached_schema_ts": 0,
+            "pending_clarification": None,
+            "pending_confirmed_tables": [],
+            "run_seq": 1,
+            "worker": None,
+        }
+
+    monkeypatch.setattr(server, "_da_get_schema_with_cache", lambda session: {"orders": [{"name": "amount", "type": "Float64"}]})
+    monkeypatch.setattr(server, "_da_build_table_metadata_map", lambda: {"orders": {"description": "Orders"}})
+    monkeypatch.setattr(
+        server,
+        "_da_run_clarification_preflight",
+        lambda *args, **kwargs: {
+            "needs_clarification": True,
+            "type": "metric_selection",
+            "question": "How do you want to measure sales?",
+            "options": ["COUNT", "SUM", "AVG"],
+            "context": {},
+        },
+    )
+
+    def _unexpected_agent_call():
+        raise AssertionError("agent_analysis should not be called when clarification is required first")
+
+    monkeypatch.setattr(server, "agent_analysis", _unexpected_agent_call)
+    server._da_worker_loop(session_id, 1)
+
+    with server._data_analyst_sessions_lock:
+        session = server._data_analyst_sessions[session_id]
+        assert session["status"] == "awaiting_clarification"
+        assert session["running"] is False
+        assert session["last_result"] is None
+        assert session["latest_assistant"]["needs_clarification"] is True
+        assert session["latest_assistant"]["clarification_type"] == "metric_selection"
+        assert session["latest_assistant"]["options"] == ["COUNT", "SUM", "AVG"]
+        assert session["last_completed_question"] == ""
+
+
+def test_data_analyst_session_worker_handles_table_selection_without_fake_empty_completion(monkeypatch):
+    session_id = "table-select-session"
+    with server._data_analyst_sessions_lock:
+        server._data_analyst_sessions[session_id] = {
+            "id": session_id,
+            "created_at": "",
+            "updated_at": "",
+            "status": "running",
+            "running": True,
+            "pause_requested": False,
+            "stop_requested": False,
+            "params": {"auto_run": True, "use_knowledge_base": True, "max_steps": 6},
+            "conversation": [],
+            "recent_user_goals": [],
+            "pending_user_inputs": ["Analyze revenue trend"],
+            "paused_notes": [],
+            "memory_summary": "",
+            "event_log": [],
+            "event_seq": 0,
+            "response_seq": 0,
+            "latest_assistant": None,
+            "last_result": None,
+            "last_completed_question": "",
+            "cached_schema": None,
+            "cached_schema_ts": 0,
+            "pending_clarification": None,
+            "pending_confirmed_tables": [],
+            "run_seq": 1,
+            "worker": None,
+        }
+
+    monkeypatch.setattr(server, "_da_get_schema_with_cache", lambda session: {"orders": [{"name": "amount", "type": "Float64"}]})
+    monkeypatch.setattr(server, "_da_build_table_metadata_map", lambda: {"orders": {"description": "Orders"}})
+    monkeypatch.setattr(server, "_da_run_clarification_preflight", lambda *args, **kwargs: {})
+
+    def _fake_agent_analysis():
+        return server.jsonify({
+            "needs_table_selection": True,
+            "candidate_tables": ["orders", "order_lines"],
+            "question": "Select the table(s) to analyze.",
+            "steps": [],
+            "final_answer": "",
+        })
+
+    monkeypatch.setattr(server, "agent_analysis", _fake_agent_analysis)
+    server._da_worker_loop(session_id, 1)
+
+    with server._data_analyst_sessions_lock:
+        session = server._data_analyst_sessions[session_id]
+        assert session["status"] == "awaiting_table_selection"
+        assert session["running"] is False
+        assert session["last_result"] is None
+        assert session["latest_assistant"]["needs_table_selection"] is True
+        assert session["latest_assistant"]["candidate_tables"] == ["orders", "order_lines"]
+        assert session["latest_assistant"]["content"] == "Select the table(s) to analyze."
+
+
+def test_data_analyst_session_resolve_table_selection_requeues_original_question(client, monkeypatch):
+    session_id = "resolve-table-session"
+    with server._data_analyst_sessions_lock:
+        server._data_analyst_sessions[session_id] = {
+            "id": session_id,
+            "created_at": "",
+            "updated_at": "",
+            "status": "awaiting_table_selection",
+            "running": False,
+            "pause_requested": False,
+            "stop_requested": False,
+            "params": {"auto_run": True},
+            "conversation": [],
+            "recent_user_goals": [],
+            "pending_user_inputs": [],
+            "paused_notes": [],
+            "memory_summary": "",
+            "event_log": [],
+            "event_seq": 0,
+            "response_seq": 0,
+            "latest_assistant": None,
+            "last_result": None,
+            "last_completed_question": "",
+            "cached_schema": None,
+            "cached_schema_ts": 0,
+            "pending_clarification": {
+                "type": "table_selection",
+                "question": "Select table(s)",
+                "candidate_tables": ["orders", "order_lines"],
+                "pending_question": "Analyze revenue trend",
+                "original_question": "Analyze revenue trend",
+            },
+            "pending_confirmed_tables": [],
+            "run_seq": 0,
+            "worker": None,
+        }
+
+    started = {"count": 0}
+
+    def _fake_start_worker(session):
+        started["count"] += 1
+        assert session["pending_confirmed_tables"] == ["orders"]
+        assert session["pending_user_inputs"] == ["Analyze revenue trend"]
+        session["running"] = True
+        session["status"] = "running"
+        return True
+
+    monkeypatch.setattr(server, "_da_start_worker_if_needed", _fake_start_worker)
+
+    resp = client.post(
+        "/api/agents/ai-data-analyst/chat",
+        json={
+            "control": "resolve_table_selection",
+            "session_id": session_id,
+            "confirmed_tables": ["orders"],
+            "params": {"auto_run": "yes"},
+        },
+    )
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert started["count"] == 1
+    assert payload["status"] == "running"
+    assert "Table selection confirmed" in payload["content"]
+
+
 def test_data_analyst_compose_question_trims_memory_and_notes():
     session = {
         "params": {"memory_token_budget": 260, "memory_turn_limit": 8},
