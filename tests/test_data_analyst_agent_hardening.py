@@ -109,6 +109,24 @@ class _DQClient:
         return None
 
 
+class _CorrelatedSubqueryRetryClient:
+    def __init__(self):
+        self.calls = []
+
+    def query(self, sql, settings=None):
+        self.calls.append({"sql": sql, "settings": dict(settings or {})})
+        if (settings or {}).get("allow_experimental_analyzer") == 1:
+            return _FakeResult(rows=[(7,)], cols=["metric"])
+        raise Exception(
+            "Code: 48. DB::Exception: Resolve identifier 'u.user_id' from parent scope "
+            "only supported for constants and CTE."
+        )
+
+    def command(self, sql):
+        _ = sql
+        return None
+
+
 class _FakeHttpResponse:
     def __init__(self, *, ok=True, status_code=200, payload=None, text=""):
         self.ok = ok
@@ -320,6 +338,10 @@ def test_agent_context_injection_once_and_disabled_mode(client, monkeypatch):
     assert "DATABASE SCHEMA:" not in prompts_standard[1]
     assert "date_col BETWEEN '2024-01-01' AND '2149-06-06'" in prompts_standard[0]
     assert "NEVER emit `date_col > 'YYYY-MM-DD'`" in prompts_standard[0]
+    assert "Avoid correlated subqueries whenever possible." in prompts_standard[0]
+    assert "`LEFT JOIN` or `ANY LEFT JOIN`" in prompts_standard[0]
+    assert "ClickHouse is strictly typed" in prompts_standard[0]
+    assert "toTypeName(col) AS col_type" in prompts_standard[0]
 
     prompts_knowledge_agent = []
 
@@ -370,6 +392,8 @@ def test_agent_context_injection_once_and_disabled_mode(client, monkeypatch):
     assert len(prompts_knowledge_agent) >= 1
     assert "Static schema/metadata/knowledge injection is disabled for this run." in prompts_knowledge_agent[0]
     assert "DATABASE SCHEMA:" not in prompts_knowledge_agent[0]
+    assert "Avoid correlated subqueries whenever possible." in prompts_knowledge_agent[0]
+    assert "ClickHouse is strictly typed" in prompts_knowledge_agent[0]
     assert "date_col BETWEEN '2024-01-01' AND '2149-06-06'" in prompts_knowledge_agent[0]
 
 
@@ -1055,6 +1079,79 @@ def test_retry_playbook_rewrites_date_comparators_semantically_for_simple_compat
     assert "<=" not in retried
 
 
+def test_classify_clickhouse_error_detects_correlated_subquery():
+    err = (
+        "Code: 48. DB::Exception: Resolve identifier 'u.user_id' from parent scope "
+        "only supported for constants and CTE."
+    )
+    assert server._classify_clickhouse_error(err) == "correlated_subquery"
+
+
+def test_classify_clickhouse_error_detects_code_43_type_mismatch():
+    err = (
+        "Code: 43. DB::Exception: Illegal type String of 2nd argument of function in. "
+        "There is no supertype for types String, UInt64."
+    )
+    assert server._classify_clickhouse_error(err) == "type_mismatch"
+
+
+def test_retry_playbook_does_not_guess_type_mismatch_rewrite():
+    retried = server._apply_sql_retry_playbook(
+        "SELECT if(status = 1, 'Active', 0) FROM events",
+        error_class="type_mismatch",
+        error_text="Code: 43. DB::Exception: Illegal type Int64 of 3rd argument",
+    )
+    assert retried == ""
+
+
+def test_execute_sql_guarded_retries_correlated_subquery_with_experimental_analyzer():
+    client = _CorrelatedSubqueryRetryClient()
+    result = server._execute_sql_guarded(
+        "SELECT 1 AS metric",
+        read_only=True,
+        enforce_simple_compat=False,
+        client=client,
+    )
+    assert result["ok"] is True
+    assert result["total_rows"] == 1
+    assert "Experimental analyzer retry succeeded." in result["summary"]
+    assert len(client.calls) == 2
+    assert client.calls[0]["settings"].get("readonly") == 1
+    assert client.calls[1]["settings"].get("allow_experimental_analyzer") == 1
+
+
+def test_chat_prompt_includes_subquery_best_practices(client, monkeypatch):
+    captured = {"prompt": ""}
+
+    def fake_call(system_prompt, messages, temperature=0.7, language=None):
+        _ = messages
+        _ = temperature
+        _ = language
+        captured["prompt"] = system_prompt
+        return json.dumps({
+            "sql": "SELECT count() AS metric FROM events",
+            "explanation": "Baseline count.",
+            "suggestedVisual": "table",
+        })
+
+    monkeypatch.setattr(server, "_call_llm", fake_call)
+
+    resp = client.post(
+        "/api/chat",
+        json={
+            "messages": [{"role": "user", "content": "Count events by user"}],
+            "schema": {"events": [{"name": "user_id", "type": "UInt64"}]},
+            "tableMetadata": {"events": {"description": "Event facts"}},
+            "use_knowledge_base": False,
+        },
+    )
+    assert resp.status_code == 200
+    assert "Avoid correlated subqueries whenever possible." in captured["prompt"]
+    assert "prefer `IN (SELECT key ...)` or `GLOBAL IN`" in captured["prompt"]
+    assert "ClickHouse is strictly typed" in captured["prompt"]
+    assert "toTypeName(col) AS col_type" in captured["prompt"]
+
+
 def test_summarize_executive_supports_custom_count(client, monkeypatch):
     captured = {"prompt": ""}
 
@@ -1642,3 +1739,44 @@ def test_test_embedding_accepts_unsaved_llm_and_rag_overrides(client, monkeypatc
     assert payload["model"] == "bge-small"
     assert captured["model"] == "bge-small"
     assert captured["url"] == "http://localhost:9000/v1/embeddings"
+
+
+def test_readonly_sql_allows_create_in_comment():
+    normalized = server._normalize_sql_for_execution(
+        "SELECT 1 AS metric\n-- create table bot_tmp as select 1",
+        read_only=True,
+        default_limit=25,
+        hard_limit_cap=100,
+    )
+    assert normalized.startswith("SELECT 1 AS metric")
+    assert normalized.endswith("LIMIT 25")
+
+
+def test_readonly_sql_allows_system_tables():
+    normalized = server._normalize_sql_for_execution(
+        "SELECT name FROM system.columns WHERE table = 'events' LIMIT 5",
+        read_only=True,
+        default_limit=25,
+        hard_limit_cap=100,
+    )
+    assert "FROM system.columns" in normalized
+
+
+def test_readonly_sql_allows_create_in_string_literal():
+    normalized = server._normalize_sql_for_execution(
+        "SELECT 'create table BOT_TMP' AS note LIMIT 1",
+        read_only=True,
+        default_limit=25,
+        hard_limit_cap=100,
+    )
+    assert "AS note" in normalized
+
+
+def test_readonly_sql_still_blocks_insert_after_with():
+    with pytest.raises(ValueError, match="Forbidden SQL keyword for read-only mode: INSERT"):
+        server._normalize_sql_for_execution(
+            "WITH 1 AS metric INSERT INTO bot_tmp SELECT metric",
+            read_only=True,
+            default_limit=25,
+            hard_limit_cap=100,
+        )
