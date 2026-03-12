@@ -120,6 +120,11 @@ class _FakeHttpResponse:
         return self._payload
 
 
+class _RawTextHttpResponse(_FakeHttpResponse):
+    def json(self):
+        raise json.JSONDecodeError("Expecting value", self.text, 0)
+
+
 @pytest.fixture()
 def _preserve_llm_config():
     original = dict(server.llm_config)
@@ -793,6 +798,30 @@ def test_call_llm_n8n_accepts_list_payload(monkeypatch, _preserve_llm_config):
     assert content == "{\"quality\": \"ok\"}"
 
 
+def test_call_llm_local_http_accepts_plain_text_body(monkeypatch, _preserve_llm_config):
+    monkeypatch.setitem(server.llm_config, "provider", "local_http")
+    monkeypatch.setitem(server.llm_config, "model", "test-model")
+    monkeypatch.setitem(server.llm_config, "baseUrl", "http://localhost:8000/v1/chat/completions")
+    monkeypatch.setitem(server.llm_config, "maxOutputTokens", 256)
+
+    def fake_post(url, **kwargs):
+        _ = url
+        _ = kwargs
+        return _RawTextHttpResponse(
+            ok=True,
+            status_code=200,
+            text='{"action":"query","sql":"SELECT 1"}',
+        )
+
+    monkeypatch.setattr(server, "_http_post", fake_post)
+    content = server._call_llm(
+        "System prompt",
+        [{"role": "user", "content": "hello"}],
+        temperature=0.1,
+    )
+    assert '"action":"query"' in content
+
+
 def test_parse_llm_json_repairs_common_malformed_prefix_and_trailing_comma():
     malformed = '{n "action": "query",\n"reasoning": "ok",\n}'
     parsed = server._parse_llm_json(malformed)
@@ -840,6 +869,53 @@ def test_parse_llm_json_supports_single_quoted_python_dict():
     assert isinstance(parsed, dict)
     assert parsed.get("action") == "query"
     assert parsed.get("reasoning") == "ok"
+
+
+def test_parse_llm_json_unwraps_stringified_json_object():
+    payload = '"{\\"action\\": \\"query\\", \\"sql\\": \\"SELECT 1\\"}"'
+    parsed = server._parse_llm_json(payload)
+    assert parsed["action"] == "query"
+    assert parsed["sql"] == "SELECT 1"
+
+
+def test_parse_llm_json_supports_yaml_block_scalar_sql():
+    payload = (
+        "action: query\n"
+        "reasoning: Check a simple metric\n"
+        "sql: |\n"
+        "  SELECT count()\n"
+        "  FROM events\n"
+        "  WHERE event_date BETWEEN '2024-01-01' AND '2024-01-31'\n"
+    )
+    parsed = server._parse_llm_json(payload)
+    assert parsed["action"] == "query"
+    assert "SELECT count()" in parsed["sql"]
+    assert "BETWEEN '2024-01-01' AND '2024-01-31'" in parsed["sql"]
+
+
+def test_call_llm_json_repairs_non_json_first_pass(monkeypatch):
+    calls = {"count": 0}
+
+    def fake_call(system_prompt, messages, temperature=0.7, language=None):
+        _ = system_prompt
+        _ = messages
+        _ = temperature
+        _ = language
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return "I think the next action is a query. Use SELECT 1."
+        return '{"action":"query","sql":"SELECT 1"}'
+
+    monkeypatch.setattr(server, "_call_llm", fake_call)
+    parsed = server._call_llm_json(
+        "Return JSON only",
+        [{"role": "user", "content": "Do it"}],
+        temperature=0.1,
+        expected_root="object",
+    )
+    assert parsed["action"] == "query"
+    assert parsed["sql"] == "SELECT 1"
+    assert calls["count"] == 2
 
 
 def test_resolve_sql_memory_placeholders_supports_last_alias_and_unknown_refs():

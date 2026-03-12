@@ -501,7 +501,7 @@ def _ensure_es_index(cfg: dict, dims: int):
 # ---------------------------------------------------------------------------
 def _strip_llm_markdown(text: str) -> str:
     """Remove markdown code fences that LLMs sometimes wrap around JSON."""
-    text = text.strip()
+    text = str(text or "").strip()
     # Remove ```json ... ``` or ``` ... ``` blocks
     for fence in ("```json", "```JSON", "```"):
         if text.startswith(fence):
@@ -518,6 +518,15 @@ def _clean_llm_output(text: str) -> str:
     text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
     text = re.sub(r'<[^>]+>', '', text)
     return text.strip()
+
+
+def _sanitize_llm_text(text: str) -> str:
+    """Normalize raw LLM text before downstream parsing."""
+    out = str(text or "").replace("\ufeff", "").replace("\u200b", "").replace("\u2060", "")
+    out = out.replace("\r\n", "\n").replace("\r", "\n")
+    out = _clean_llm_output(_strip_llm_markdown(out))
+    out = re.sub(r"^\s*(assistant|response|output|result)\s*:\s*", "", out, flags=re.IGNORECASE)
+    return out.strip()
 
 
 def _describe_payload_shape(payload, depth: int = 0) -> str:
@@ -562,7 +571,7 @@ def _extract_llm_content(payload) -> str:
 
         if isinstance(value, dict):
             # Common structured text chunk shape: {"type":"text","text":"..."}
-            if str(value.get("type", "")).lower() == "text":
+            if str(value.get("type", "")).lower() in {"text", "output_text", "input_text"}:
                 txt = _extract(value.get("text"), depth + 1)
                 if txt:
                     return txt
@@ -579,6 +588,10 @@ def _extract_llm_content(payload) -> str:
                 "reasoning_content",
                 "reasoning",
                 "assistant_response",
+                "body",
+                "payload",
+                "result",
+                "message_text",
             ):
                 if key in value:
                     txt = _extract(value.get(key), depth + 1)
@@ -599,6 +612,11 @@ def _extract_llm_content(payload) -> str:
                     if txt:
                         return txt
 
+            for child in value.values():
+                txt = _extract(child, depth + 1)
+                if txt:
+                    return txt
+
             return ""
 
         return ""
@@ -612,7 +630,8 @@ def _parse_response_json(resp, label: str = "LLM") -> dict:
     Also handles SSE (Server-Sent Events) streaming responses by extracting
     the last complete data chunk that contains the assistant message.
     """
-    if not resp.text or not resp.text.strip():
+    raw_text = str(getattr(resp, "text", "") or "")
+    if not raw_text or not raw_text.strip():
         raise Exception(
             f"{label} returned an empty response body (HTTP {resp.status_code}). "
             "Check that the server is running and the model is loaded."
@@ -623,7 +642,7 @@ def _parse_response_json(resp, label: str = "LLM") -> dict:
         pass
 
     # Fallback: try to parse as an SSE stream (lines starting with "data: ")
-    text = resp.text.strip()
+    text = raw_text.strip()
     if "data:" in text:
         import re
         chunks = re.findall(r"^data:\s*(.+)$", text, re.MULTILINE)
@@ -657,13 +676,17 @@ def _parse_response_json(resp, label: str = "LLM") -> dict:
             except json.JSONDecodeError:
                 continue
 
+    sanitized = _sanitize_llm_text(text)
+    if sanitized and not sanitized.lower().startswith(("<!doctype", "<html")):
+        return {"content": sanitized}
+
     raise Exception(
         f"{label} response is not valid JSON (HTTP {resp.status_code}): "
-        f"{resp.text[:300]!r}"
+        f"{raw_text[:300]!r}"
     )
 
 
-def _parse_llm_json(content: str) -> dict:
+def _parse_llm_json(content: str, expected_root: str = "object", _depth: int = 0):
     """Parse JSON from LLM output, handling markdown fences and extra surrounding text."""
     import ast
 
@@ -671,10 +694,8 @@ def _parse_llm_json(content: str) -> dict:
         raise ValueError("LLM returned an empty response")
 
     def _normalize_candidate(txt: str) -> str:
-        out = str(txt or "").strip().replace("\ufeff", "")
-        out = out.replace("\r\n", "\n").replace("\r", "\n")
+        out = _sanitize_llm_text(txt)
         out = out.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
-        # Common malformed prefix from local outputs: "{n ..." instead of "{\n ..."
         out = re.sub(r"^(\{|\[)\s*n(?=\s*[\"{\[])", r"\1\n", out)
         out = re.sub(r"^(json|JSON)\s*", "", out)
         return out.strip()
@@ -699,7 +720,6 @@ def _parse_llm_json(content: str) -> dict:
                     elif ch == '"':
                         in_str = False
                     continue
-
                 if ch == '"':
                     in_str = True
                     continue
@@ -742,16 +762,14 @@ def _parse_llm_json(content: str) -> dict:
                     continue
                 out.append(ch)
                 continue
-
             if ch == '"':
                 in_str = True
             out.append(ch)
         return "".join(out)
 
     def _iter_candidates(txt: str):
-        base = _normalize_candidate(_strip_llm_markdown(txt))
+        base = _normalize_candidate(txt)
         candidates = [base]
-
         extracted = _extract_first_json_block(base)
         if extracted:
             candidates.append(_normalize_candidate(extracted))
@@ -761,21 +779,20 @@ def _parse_llm_json(content: str) -> dict:
             if not cand:
                 continue
             expanded.append(cand)
-            # Wrap JSON-like key-value payloads missing outer braces.
+            if cand.startswith('"') and cand.endswith('"'):
+                try:
+                    expanded.append(json.loads(cand))
+                except Exception:
+                    pass
             if not cand.lstrip().startswith(("{", "[")) and ":" in cand:
                 expanded.append("{" + cand.strip().strip(",") + "}")
-            # Remove trailing commas before closing braces/brackets.
             expanded.append(re.sub(r",(\s*[}\]])", r"\1", cand))
-            # Quote unquoted keys: {action: "x"} -> {"action":"x"}.
             expanded.append(re.sub(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)', r'\1"\2"\3', cand))
-            # Convert single-quoted keys/values to JSON-compatible double quotes.
             expanded.append(re.sub(r"'([^'\\]*(?:\\.[^'\\]*)*)'", r'"\1"', cand))
-            # Normalize Python literals.
             py_norm = re.sub(r"\bTrue\b", "true", cand)
             py_norm = re.sub(r"\bFalse\b", "false", py_norm)
             py_norm = re.sub(r"\bNone\b", "null", py_norm)
             expanded.append(py_norm)
-            # Escape raw newlines/tabs inside JSON strings.
             expanded.append(_escape_newlines_in_strings(cand))
 
         seen = set()
@@ -787,58 +804,112 @@ def _parse_llm_json(content: str) -> dict:
             yield norm
 
     def _parse_kv_lines(txt: str) -> dict:
-        """Best-effort parser for non-JSON key:value / key=value formats."""
-        lines = [ln.strip() for ln in str(txt or "").splitlines() if ln.strip()]
-        if not lines:
+        """Best-effort parser for non-JSON key:value / YAML-like formats."""
+        lines = [ln.rstrip() for ln in str(txt or "").replace("\r\n", "\n").splitlines()]
+        if not any(ln.strip() for ln in lines):
             return {}
 
-        parsed: dict = {}
-        for ln in lines:
-            m = re.match(r'^"?([A-Za-z_][A-Za-z0-9_]*)"?\s*[:=]\s*(.+)$', ln)
-            if not m:
-                continue
-            key = m.group(1)
-            raw_val = m.group(2).strip().rstrip(",")
+        def _coerce_plaintext_value(raw_val: str):
+            raw_val = str(raw_val or "").strip().rstrip(",")
             if not raw_val:
-                parsed[key] = ""
-                continue
-
+                return ""
             if (raw_val.startswith('"') and raw_val.endswith('"')) or (
                 raw_val.startswith("'") and raw_val.endswith("'")
             ):
-                parsed[key] = raw_val[1:-1]
-                continue
-
+                return raw_val[1:-1]
             low = raw_val.lower()
             if low in {"true", "false"}:
-                parsed[key] = low == "true"
-                continue
+                return low == "true"
             if low in {"null", "none"}:
-                parsed[key] = None
-                continue
+                return None
             if re.match(r"^-?\d+$", raw_val):
-                parsed[key] = int(raw_val)
-                continue
+                return int(raw_val)
             if re.match(r"^-?\d+\.\d+$", raw_val):
-                parsed[key] = float(raw_val)
+                return float(raw_val)
+            if raw_val.startswith(("{", "[")):
+                for parser in (json.loads, ast.literal_eval):
+                    try:
+                        return parser(raw_val)
+                    except Exception:
+                        continue
+            raw_lines = [ln.strip() for ln in raw_val.splitlines() if ln.strip()]
+            if raw_lines and all(ln.startswith("- ") for ln in raw_lines):
+                return [ln[2:].strip() for ln in raw_lines if ln[2:].strip()]
+            return raw_val
+
+        parsed: dict = {}
+        current_key = None
+        current_parts: list[str] = []
+        current_block_mode = False
+
+        def _flush_current():
+            nonlocal current_key, current_parts, current_block_mode
+            if current_key:
+                parsed[current_key] = _coerce_plaintext_value("\n".join(current_parts).strip())
+            current_key = None
+            current_parts = []
+            current_block_mode = False
+
+        for raw_line in lines:
+            stripped = raw_line.strip()
+            if not stripped:
+                if current_key and current_parts:
+                    current_parts.append("")
                 continue
 
-            # Attempt nested JSON value.
-            if raw_val.startswith(("{", "[")):
-                try:
-                    parsed[key] = json.loads(raw_val)
-                    continue
-                except Exception:
-                    pass
+            candidate = stripped[2:].strip() if stripped.startswith("- ") else stripped
+            match = re.match(r'^"?([A-Za-z_][A-Za-z0-9_]*)"?\s*[:=]\s*(.*)$', candidate)
+            is_top_level = bool(match) and not raw_line.startswith((" ", "\t"))
+            if match and (is_top_level or current_key is None):
+                _flush_current()
+                current_key = match.group(1)
+                raw_val = match.group(2).strip()
+                current_block_mode = raw_val in {"|", ">"}
+                current_parts = [] if current_block_mode or not raw_val else [raw_val]
+                continue
 
-            parsed[key] = raw_val
+            if current_key and (current_block_mode or raw_line.startswith((" ", "\t")) or stripped):
+                current_parts.append(stripped)
 
+        _flush_current()
         return parsed
 
     def _normalize_parsed_root(parsed):
+        if isinstance(parsed, str) and _depth < 2:
+            nested = _normalize_candidate(parsed)
+            if nested and nested != _normalize_candidate(content):
+                try:
+                    return _parse_llm_json(nested, expected_root=expected_root, _depth=_depth + 1)
+                except Exception:
+                    pass
+
+        if expected_root == "array":
+            if isinstance(parsed, list):
+                return parsed
+            if isinstance(parsed, dict):
+                for key in ("items", "results", "data", "bullets", "columns", "suggestions"):
+                    value = parsed.get(key)
+                    if isinstance(value, list):
+                        return value
+                if len(parsed) == 1:
+                    only_value = next(iter(parsed.values()))
+                    if isinstance(only_value, list):
+                        return only_value
+            raise ValueError(
+                "LLM JSON root must be an array. "
+                f"Got {type(parsed).__name__} instead."
+            )
+
+        if expected_root == "any":
+            if isinstance(parsed, (dict, list)):
+                return parsed
+            raise ValueError(
+                "LLM JSON root must be an object or array. "
+                f"Got {type(parsed).__name__} instead."
+            )
+
         if isinstance(parsed, dict):
             return parsed
-        # Some transports wrap a single JSON object into an array.
         if isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], dict):
             return parsed[0]
         raise ValueError(
@@ -853,7 +924,6 @@ def _parse_llm_json(content: str) -> dict:
             return _normalize_parsed_root(parsed)
         except (json.JSONDecodeError, ValueError) as exc:
             last_json_error = exc
-            # Python-literal style fallback: {'action': 'query', ...}
             try:
                 parsed_py = ast.literal_eval(candidate)
                 return _normalize_parsed_root(parsed_py)
@@ -861,9 +931,10 @@ def _parse_llm_json(content: str) -> dict:
                 pass
             continue
 
-    # Last deterministic fallback for key/value plaintext outputs.
     kv = _parse_kv_lines(content)
     if kv:
+        if expected_root == "array":
+            raise ValueError("LLM response looked like key/value text but an array was expected.")
         return kv
 
     raise ValueError(
@@ -1898,12 +1969,153 @@ def _messages_to_prompt(system_prompt: str, messages: list) -> str:
     return "\n\n".join(parts)
 
 
+def _clone_llm_messages(messages: list | None) -> list:
+    safe_messages = []
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        safe_messages.append({
+            "role": str(msg.get("role", "user") or "user"),
+            "content": str(msg.get("content", "") or ""),
+        })
+    return safe_messages
+
+
+def _estimate_llm_message_tokens(messages: list) -> int:
+    total = 0
+    for msg in messages or []:
+        total += _estimate_tokens(str(msg.get("content", "") or "")) + 8
+    return total
+
+
+def _fit_llm_inputs_to_budget(
+    system_prompt: str,
+    messages: list,
+    completion_budget: int,
+    provider: str,
+) -> tuple[str, list]:
+    """Pre-compact prompts before hitting transport/provider context limits."""
+    safe_system = str(system_prompt or "")
+    safe_messages = _clone_llm_messages(messages)
+    effective_limit = _get_effective_context_limit()
+    reserved_output = min(completion_budget, max(96, int(effective_limit * 0.28)))
+    input_budget = max(220, effective_limit - reserved_output - 48)
+    current_total = _estimate_tokens(safe_system) + _estimate_llm_message_tokens(safe_messages)
+    if current_total <= input_budget:
+        return safe_system, safe_messages
+
+    system_budget = max(120, min(int(input_budget * 0.38), input_budget - 120))
+    message_budget = max(120, input_budget - system_budget)
+    keep_last = 5 if provider in {"local_http", "n8n"} else 7
+    compact_system, compact_messages = _compact_llm_inputs(
+        safe_system,
+        safe_messages,
+        system_token_budget=system_budget,
+        message_token_budget=message_budget,
+        keep_last=keep_last,
+    )
+    compact_total = _estimate_tokens(compact_system) + _estimate_llm_message_tokens(compact_messages)
+    print(
+        f"[LLM] Preflight compaction for {provider}: "
+        f"{current_total} -> {compact_total} est. input tokens"
+    )
+    return compact_system, compact_messages
+
+
+def _build_llm_transport_request(
+    provider: str,
+    system_prompt: str,
+    messages: list,
+    temperature: float,
+    max_tokens: int,
+) -> tuple[str, str, dict, dict, int]:
+    provider = (provider or "ollama").lower()
+    base_url = (llm_config.get("baseUrl") or "").rstrip("/")
+    model = llm_config.get("model") or "local-model"
+
+    if provider == "local_http":
+        endpoint = base_url or "http://localhost:8000"
+        if "/v1/chat" not in endpoint:
+            endpoint = endpoint.rstrip("/") + "/v1/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if llm_config.get("apiKey"):
+            headers["Authorization"] = f"Bearer {llm_config['apiKey']}"
+        body = {
+            "model": model,
+            "messages": [{"role": "system", "content": system_prompt}] + _clone_llm_messages(messages),
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
+        return "local_http LLM", endpoint, headers, body, 120
+
+    if provider == "ollama":
+        ollama_url = base_url or "http://localhost:11434"
+        body = {
+            "model": llm_config.get("model", "llama3"),
+            "prompt": _messages_to_prompt(system_prompt, messages),
+            "stream": False,
+            "options": {"temperature": temperature},
+        }
+        return "Ollama LLM", f"{ollama_url}/api/generate", {}, body, 120
+
+    if provider == "n8n":
+        endpoint = base_url or ""
+        if not endpoint:
+            raise Exception("n8n provider requires a baseUrl (webhook URL)")
+        headers = {"Content-Type": "application/json"}
+        if llm_config.get("apiKey"):
+            headers["Authorization"] = llm_config["apiKey"]
+        prompt = _messages_to_prompt(system_prompt, messages)
+        body = {
+            "prompt": prompt,
+            "system_prompt": system_prompt,
+            "messages": [{"role": "system", "content": system_prompt}] + _clone_llm_messages(messages),
+            "model": llm_config.get("model", ""),
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        return "n8n LLM", endpoint, headers, body, 120
+
+    raise Exception(f"Invalid LLM provider: {provider!r}")
+
+
+def _extract_llm_response_content(resp, label: str) -> str:
+    resp_data = _parse_response_json(resp, label)
+    content = _extract_llm_content(resp_data)
+    if not content:
+        raw_txt = _sanitize_llm_text(str(getattr(resp, "text", "") or ""))
+        if raw_txt and not raw_txt.lower().startswith(("<!doctype", "<html")):
+            content = raw_txt
+    content = _sanitize_llm_text(content)
+    if not content:
+        raise Exception(
+            f"{label} returned empty content. "
+            f"Payload shape: {_describe_payload_shape(resp_data)}"
+        )
+    return content
+
+
+def _is_retryable_llm_transport_error(error_text: str) -> bool:
+    txt = str(error_text or "").lower()
+    return (
+        _is_context_overflow_error(txt)
+        or "returned empty content" in txt
+        or "response is not valid json" in txt
+        or "empty response body" in txt
+    )
+
+
 def _call_llm(system_prompt: str, messages: list, temperature: float = 0.7,
               language: str = None) -> str:
     """Call the configured LLM and return the content string.
 
     Supports providers: ollama, local_http, n8n.
     """
+    system_prompt = str(system_prompt or "")
+    messages = _clone_llm_messages(messages)
+
     # Append language instruction to the last user message if requested
     if language:
         lang_instruction = (
@@ -1920,173 +2132,110 @@ def _call_llm(system_prompt: str, messages: list, temperature: float = 0.7,
         else:
             system_prompt = system_prompt + f"\n\n{lang_instruction}"
 
-    provider = llm_config.get("provider", "ollama")
-    base_url = (llm_config.get("baseUrl") or "").rstrip("/")
+    provider = (llm_config.get("provider") or "ollama").lower()
+    completion_budget = (
+        _get_http_completion_budget()
+        if provider in {"local_http", "n8n"}
+        else max(128, min(2048, int(_get_effective_context_limit() * 0.22)))
+    )
+    base_system, base_messages = _fit_llm_inputs_to_budget(
+        system_prompt,
+        messages,
+        completion_budget,
+        provider,
+    )
 
-    if provider == "local_http":
-        endpoint = base_url or "http://localhost:8000"
-        if "/v1/chat" not in endpoint:
-            endpoint = endpoint.rstrip("/") + "/v1/chat/completions"
-        headers = {"Content-Type": "application/json"}
-        if llm_config.get("apiKey"):
-            headers["Authorization"] = f"Bearer {llm_config['apiKey']}"
-
-        def _post_local_http(sys_prompt: str, msg_list: list, max_tokens: int):
-            return _http_post(
-                endpoint,
-                json={
-                    "model": llm_config.get("model") or "local-model",
-                    "messages": [{"role": "system", "content": sys_prompt}] + msg_list,
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
-                    "stream": False,
-                },
-                headers=headers,
-                timeout=120,
-            )
-
-        completion_budget = _get_http_completion_budget()
-        resp = _post_local_http(system_prompt, messages, completion_budget)
-        if not resp.ok:
-            if _is_context_overflow_error(resp.text):
-                compact_system, compact_messages = _compact_llm_inputs(
-                    system_prompt,
-                    messages,
-                    system_token_budget=200,
-                    message_token_budget=420,
-                    keep_last=4,
-                )
-                compact_budget = max(96, min(512, completion_budget // 2))
-                resp = _post_local_http(compact_system, compact_messages, compact_budget)
-            if not resp.ok:
-                raise Exception(f"local_http LLM Error: {resp.status_code} - {resp.text}")
-
-        try:
-            resp_data = _parse_response_json(resp, "local_http LLM")
-        except Exception as exc:
-            if _is_context_overflow_error(str(exc)):
-                compact_system, compact_messages = _compact_llm_inputs(
-                    system_prompt,
-                    messages,
-                    system_token_budget=180,
-                    message_token_budget=360,
-                    keep_last=3,
-                )
-                compact_budget = max(96, min(384, completion_budget // 2))
-                retry_resp = _post_local_http(compact_system, compact_messages, compact_budget)
-                if not retry_resp.ok:
-                    raise Exception(f"local_http LLM Error: {retry_resp.status_code} - {retry_resp.text}")
-                resp_data = _parse_response_json(retry_resp, "local_http LLM")
-            else:
-                raise
-
-        content = _extract_llm_content(resp_data)
-        if not content:
-            raw_txt = str(getattr(resp, "text", "") or "").strip()
-            if raw_txt and not raw_txt.startswith("{") and not raw_txt.startswith("["):
-                content = raw_txt
-        if not content:
-            raise Exception(
-                "local_http LLM returned empty content. "
-                f"Payload shape: {_describe_payload_shape(resp_data)}"
-            )
-        return _clean_llm_output(_strip_llm_markdown(content))
-
+    attempts = [(base_system, base_messages, completion_budget)]
+    compact_profiles = []
+    if provider in {"local_http", "n8n"}:
+        compact_profiles = [
+            (200, 420, 4, max(96, min(512, completion_budget // 2))),
+            (160, 320, 3, max(96, min(384, completion_budget // 2))),
+        ]
     elif provider == "ollama":
-        ollama_url = base_url or "http://localhost:11434"
-        prompt = _messages_to_prompt(system_prompt, messages)
-        body = {
-            "model": llm_config.get("model", "llama3"),
-            "prompt": prompt,
-            "stream": False,
-        }
-        resp = _http_post(
-            f"{ollama_url}/api/generate",
-            json=body,
-            timeout=120,
+        compact_profiles = [
+            (220, 520, 5, max(128, min(1024, completion_budget))),
+            (180, 360, 4, max(128, min(768, completion_budget))),
+        ]
+
+    for sys_budget, msg_budget, keep_last, max_tokens in compact_profiles:
+        compact_system, compact_messages = _compact_llm_inputs(
+            base_system,
+            base_messages,
+            system_token_budget=sys_budget,
+            message_token_budget=msg_budget,
+            keep_last=keep_last,
         )
-        if not resp.ok:
-            raise Exception(f"Ollama LLM Error: {resp.status_code} - {resp.text}")
-        resp_data = _parse_response_json(resp, "Ollama LLM")
-        content = _extract_llm_content(resp_data)
-        if not content:
-            raise Exception(
-                "Ollama LLM returned empty content. "
-                f"Payload shape: {_describe_payload_shape(resp_data)}"
-            )
-        return _clean_llm_output(_strip_llm_markdown(content))
+        attempt = (compact_system, compact_messages, max_tokens)
+        if attempt not in attempts:
+            attempts.append(attempt)
 
-    elif provider == "n8n":
-        endpoint = base_url or ""
-        if not endpoint:
-            raise Exception("n8n provider requires a baseUrl (webhook URL)")
-        headers = {"Content-Type": "application/json"}
-        if llm_config.get("apiKey"):
-            headers["Authorization"] = llm_config["apiKey"]  # raw value, no Bearer
-
-        def _post_n8n(sys_prompt: str, msg_list: list, max_tokens: int):
-            prompt = _messages_to_prompt(sys_prompt, msg_list)
-            return _http_post(
-                endpoint,
-                json={
-                    "prompt": prompt,
-                    "model": llm_config.get("model", ""),
-                    "max_tokens": max_tokens,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                },
-                headers=headers,
-                timeout=120,
-            )
-
-        completion_budget = _get_http_completion_budget()
-        resp = _post_n8n(system_prompt, messages, completion_budget)
-        if not resp.ok:
-            if _is_context_overflow_error(resp.text):
-                compact_system, compact_messages = _compact_llm_inputs(
-                    system_prompt,
-                    messages,
-                    system_token_budget=180,
-                    message_token_budget=380,
-                    keep_last=4,
-                )
-                compact_budget = max(96, min(512, completion_budget // 2))
-                resp = _post_n8n(compact_system, compact_messages, compact_budget)
-            if not resp.ok:
-                raise Exception(f"n8n LLM Error: {resp.status_code} - {resp.text}")
-
+    last_exc = None
+    for attempt_idx, (attempt_system, attempt_messages, max_tokens) in enumerate(attempts):
         try:
-            resp_data = _parse_response_json(resp, "n8n LLM")
-        except Exception as exc:
-            if _is_context_overflow_error(str(exc)):
-                compact_system, compact_messages = _compact_llm_inputs(
-                    system_prompt,
-                    messages,
-                    system_token_budget=160,
-                    message_token_budget=320,
-                    keep_last=3,
-                )
-                compact_budget = max(96, min(384, completion_budget // 2))
-                retry_resp = _post_n8n(compact_system, compact_messages, compact_budget)
-                if not retry_resp.ok:
-                    raise Exception(f"n8n LLM Error: {retry_resp.status_code} - {retry_resp.text}")
-                resp_data = _parse_response_json(retry_resp, "n8n LLM")
-            else:
-                raise
-
-        content = _extract_llm_content(resp_data)
-        if not content:
-            raw_txt = str(getattr(resp, "text", "") or "").strip()
-            if raw_txt and not raw_txt.startswith("{") and not raw_txt.startswith("["):
-                content = raw_txt
-        if not content:
-            raise Exception(
-                "n8n LLM returned empty content. "
-                f"Payload shape: {_describe_payload_shape(resp_data)}"
+            label, endpoint, headers, body, timeout = _build_llm_transport_request(
+                provider,
+                attempt_system,
+                attempt_messages,
+                temperature,
+                max_tokens,
             )
-        return _clean_llm_output(_strip_llm_markdown(content))
+            resp = _http_post(
+                endpoint,
+                json=body,
+                headers=headers if headers else None,
+                timeout=timeout,
+            )
+            if not resp.ok:
+                err = f"{label} Error: {resp.status_code} - {getattr(resp, 'text', '')}"
+                if attempt_idx + 1 < len(attempts) and _is_retryable_llm_transport_error(err):
+                    continue
+                raise Exception(err)
+            return _extract_llm_response_content(resp, label)
+        except Exception as exc:
+            last_exc = exc
+            if attempt_idx + 1 < len(attempts) and _is_retryable_llm_transport_error(str(exc)):
+                continue
+            raise
 
-    else:
-        raise Exception(f"Invalid LLM provider: {provider!r}")
+    raise last_exc or Exception("LLM call failed without a specific error")
+
+
+def _call_llm_json(
+    system_prompt: str,
+    messages: list,
+    temperature: float = 0.7,
+    language: str = None,
+    expected_root: str = "object",
+):
+    """Call the LLM and return parsed JSON, with one lightweight repair pass if needed."""
+    raw = _call_llm(system_prompt, messages, temperature=temperature, language=language)
+    try:
+        return _parse_llm_json(raw, expected_root=expected_root)
+    except Exception as first_exc:
+        repair_budget = max(180, min(900, int(_get_effective_context_limit() * 0.18)))
+        clipped_raw = _truncate_text_to_budget(raw, repair_budget)
+        repair_target = "JSON array" if expected_root == "array" else "JSON object"
+        repair_prompt = (
+            "You repair malformed LLM outputs into strict JSON.\n"
+            f"Return ONLY a valid {repair_target}.\n"
+            "Do not add commentary. Preserve the original meaning. "
+            "If a field is missing, use a safe empty value."
+        )
+        repair_messages = [{
+            "role": "user",
+            "content": (
+                f"Convert this text into a valid {repair_target}.\n\n"
+                f"TEXT TO REPAIR:\n{clipped_raw}"
+            ),
+        }]
+        repaired = _call_llm(repair_prompt, repair_messages, temperature=0.0, language=language)
+        try:
+            return _parse_llm_json(repaired, expected_root=expected_root)
+        except Exception as repair_exc:
+            raise ValueError(
+                f"{first_exc} | repair attempt failed: {repair_exc}"
+            ) from repair_exc
 
 
 # ---------------------------------------------------------------------------
@@ -3226,12 +3375,12 @@ Return JSON only:
   "suggestedVisual": "table" | "bar" | "line" | "pie"
 }}"""
             try:
-                fixed_content = _call_llm(
+                fixed = _call_llm_json(
                     rewrite_prompt,
                     [{"role": "user", "content": "Rewrite now."}],
                     temperature=0.1,
+                    expected_root="object",
                 )
-                fixed = _parse_llm_json(fixed_content)
                 fixed_sql = str(fixed.get("sql", "")).strip()
                 if not fixed_sql:
                     raise ValueError("No rewritten SQL returned.")
@@ -3334,13 +3483,12 @@ def summarize_executive():
     messages = [{"role": "user", "content": f"Analysis to summarize:\n\n{text}\n\n{format_instruction}"}]
 
     try:
-        raw = _call_llm(system_prompt, messages, temperature=0.3)
-        try:
-            result = json.loads(raw)
-        except json.JSONDecodeError:
-            import re as _re
-            m = _re.search(r"\{.*\}", raw, _re.DOTALL)
-            result = json.loads(m.group(0)) if m else {}
+        result = _call_llm_json(
+            system_prompt,
+            messages,
+            temperature=0.3,
+            expected_root="object",
+        )
 
         bullets = result.get("bullets", [])
         # Ensure requested bullet count and normalize fields
@@ -3460,12 +3608,12 @@ Réponds UNIQUEMENT avec du JSON valide (sans markdown) :
     normalized_lookup = {t.lower().strip(): t for t in all_table_names}
 
     try:
-        content = _call_llm(
+        result = _call_llm_json(
             identification_prompt,
             [{"role": "user", "content": "Identifie les tables pertinentes."}],
             temperature=0.0,
+            expected_root="object",
         )
-        result = _parse_llm_json(content)
         if result and isinstance(result.get("relevant_tables"), list):
             confidence = result.get("confidence", "medium")
 
@@ -3770,12 +3918,12 @@ Return ONLY JSON:
         try:
             max_plan_tokens = int(_get_effective_context_limit() * 0.55)
             plan_prompt = _truncate_text_to_budget(plan_prompt, max_plan_tokens)
-            content = _call_llm(
+            parsed = _call_llm_json(
                 plan_prompt,
                 [{"role": "user", "content": "Build the plan."}],
                 temperature=0.1,
+                expected_root="object",
             )
-            parsed = _parse_llm_json(content)
             plan_steps = _sanitize_plan_steps(
                 parsed.get("plan_steps"),
                 max_items=max(1, min(MAX_AGENT_STEPS, 6)),
@@ -3829,12 +3977,12 @@ Return ONLY JSON:
         try:
             max_review_tokens = int(_get_effective_context_limit() * 0.5)
             review_prompt = _truncate_text_to_budget(review_prompt, max_review_tokens)
-            content = _call_llm(
+            parsed = _call_llm_json(
                 review_prompt,
                 [{"role": "user", "content": "Review and revise now."}],
                 temperature=0.1,
+                expected_root="object",
             )
-            parsed = _parse_llm_json(content)
             updated_steps = _sanitize_plan_steps(
                 parsed.get("updated_plan_steps"),
                 max_items=max(1, min(remaining, 5)),
@@ -4433,10 +4581,11 @@ For final answer:
                 }
 
         try:
-            content = _call_llm(
+            return _call_llm_json(
                 system_prompt,
                 [{"role": "user", "content": "Proceed with the next step."}],
                 temperature=0.2,
+                expected_root="object",
             )
         except Exception as exc:
             if _is_context_overflow_error(str(exc)):
@@ -4456,10 +4605,11 @@ Allowed JSON:
 {{"action":"query","reasoning":"...","sql":"SELECT ..."}}
 {{"action":"finish","reasoning":"...","final_answer":"..."}}"""
                 try:
-                    content = _call_llm(
+                    return _call_llm_json(
                         emergency_prompt,
                         [{"role": "user", "content": "Proceed with the next step."}],
                         temperature=0.1,
+                        expected_root="object",
                     )
                 except Exception:
                     return {
@@ -4470,9 +4620,7 @@ Allowed JSON:
                             "Essayez de filtrer les tables (Table Mapping Filter) ou de désactiver la knowledge base."
                         ),
                     }
-                return _parse_llm_json(content)
             raise
-        return _parse_llm_json(content)
 
     def _run_agent_retry(steps_so_far: list, retry_info: dict) -> dict:
         """Generate a corrective SQL after a technical SQL failure.
@@ -4551,12 +4699,12 @@ Respond ONLY with valid JSON (no markdown):
             int(_get_effective_context_limit() * 0.62),
         )
 
-        content = _call_llm(
+        result = _call_llm_json(
             retry_prompt,
             [{"role": "user", "content": "Generate the corrective query."}],
             temperature=0.2,
+            expected_root="object",
         )
-        result = _parse_llm_json(content)
         if not result or not result.get("sql"):
             return {"action": "finish", "reasoning": "Could not generate alternative", "final_answer": ""}
         return result
@@ -4969,8 +5117,14 @@ Return ONLY a JSON object (no markdown) with:
 """
 
     try:
-        content = _call_llm(system_prompt, [{"role": "user", "content": user_message}], temperature=0.3)
-        return jsonify(_parse_llm_json(content))
+        return jsonify(
+            _call_llm_json(
+                system_prompt,
+                [{"role": "user", "content": user_message}],
+                temperature=0.3,
+                expected_root="object",
+            )
+        )
     except Exception as exc:
         print(f"Analyze error: {exc}")
         return jsonify({"error": str(exc)}), 500
@@ -5138,8 +5292,14 @@ Return ONLY a JSON object:
 
     user_msg = f"Profile data:\n{json.dumps(compact)}"
     try:
-        content = _call_llm(system_prompt, [{"role": "user", "content": user_msg}], temperature=0.4)
-        return jsonify(_parse_llm_json(content))
+        return jsonify(
+            _call_llm_json(
+                system_prompt,
+                [{"role": "user", "content": user_msg}],
+                temperature=0.4,
+                expected_root="object",
+            )
+        )
     except Exception as exc:
         print(f"Profile insights error: {exc}")
         return jsonify({"error": str(exc)}), 500
@@ -5651,11 +5811,16 @@ def _dq_call_batch_llm(
         "Provide a thorough analysis identifying all data quality issues with specific numbers."
     )
     safe_user_msg = _truncate_text_to_budget(user_msg, int(_get_effective_context_limit() * 0.68))
-    raw = _call_llm(_DQ_SYSTEM_PROMPT, [{"role": "user", "content": safe_user_msg}], temperature=0.1)
-
     try:
-        parsed = _parse_llm_json(raw)
+        parsed = _call_llm_json(
+            _DQ_SYSTEM_PROMPT,
+            [{"role": "user", "content": safe_user_msg}],
+            temperature=0.1,
+            expected_root="object",
+        )
+        raw = json.dumps(parsed, ensure_ascii=False)
     except Exception:
+        raw = _call_llm(_DQ_SYSTEM_PROMPT, [{"role": "user", "content": safe_user_msg}], temperature=0.1)
         parsed = None
 
     if not isinstance(parsed, dict):
@@ -7142,12 +7307,12 @@ Return ONLY JSON:
   "reasoning": "short rationale"
 }}"""
     safe_prompt = _truncate_text_to_budget(prompt, int(_get_effective_context_limit() * 0.58))
-    content = _call_llm(
+    parsed = _call_llm_json(
         safe_prompt,
         [{"role": "user", "content": "Build wrangling plan."}],
         temperature=0.1,
+        expected_root="object",
     )
-    parsed = _parse_llm_json(content)
     return parsed if isinstance(parsed, dict) else {}
 
 
@@ -7644,12 +7809,12 @@ Return JSON only:
   "reasoning": "short fix rationale"
 }}"""
     safe_prompt = _truncate_text_to_budget(prompt, int(_get_effective_context_limit() * 0.45))
-    content = _call_llm(
+    parsed = _call_llm_json(
         safe_prompt,
         [{"role": "user", "content": "Fix failed check SQL."}],
         temperature=0.1,
+        expected_root="object",
     )
-    parsed = _parse_llm_json(content)
     return str((parsed or {}).get("sql", "")).strip()
 
 
@@ -11582,20 +11747,12 @@ def _run_key_identifier_agent():
     )
 
     try:
-        llm_raw = _call_llm(
+        suggestions = _call_llm_json(
             system_prompt,
             [{"role": "user", "content": user_content}],
             temperature=0.1,
+            expected_root="array",
         )
-        try:
-            suggestions = json.loads(llm_raw)
-            if not isinstance(suggestions, list):
-                suggestions = []
-        except json.JSONDecodeError:
-            # Try to extract JSON array from response
-            import re as _re
-            m = _re.search(r"\[.*\]", llm_raw, _re.DOTALL)
-            suggestions = json.loads(m.group(0)) if m else []
     except Exception as exc:
         return jsonify({"error": f"LLM error: {exc}", "steps": steps}), 500
 
@@ -11746,15 +11903,22 @@ def _run_data_dictionary_agent():
         )
 
         try:
-            llm_raw = _call_llm(
+            doc = _call_llm_json(
                 system_prompt,
                 [{"role": "user", "content": user_content}],
                 temperature=0.2,
+                expected_root="object",
             )
+            doc["table"] = f"{database}.{table_name}"
+            dict_entries.append(doc)
+            steps.append({"table": table_name, "ok": True, "columns_count": len(columns)})
+        except Exception as exc:
             try:
-                doc = json.loads(llm_raw)
-            except json.JSONDecodeError:
-                # Fallback: wrap raw text
+                llm_raw = _call_llm(
+                    system_prompt,
+                    [{"role": "user", "content": user_content}],
+                    temperature=0.2,
+                )
                 doc = {
                     "table_description": llm_raw,
                     "columns": [
@@ -11763,12 +11927,17 @@ def _run_data_dictionary_agent():
                          "format": "", "possible_values": ""}
                         for c in columns
                     ],
+                    "table": f"{database}.{table_name}",
                 }
-            doc["table"] = f"{database}.{table_name}"
-            dict_entries.append(doc)
-            steps.append({"table": table_name, "ok": True, "columns_count": len(columns)})
-        except Exception as exc:
-            steps.append({"table": table_name, "ok": False, "error": str(exc)})
+                dict_entries.append(doc)
+                steps.append({
+                    "table": table_name,
+                    "ok": True,
+                    "columns_count": len(columns),
+                    "fallback_text": True,
+                })
+            except Exception:
+                steps.append({"table": table_name, "ok": False, "error": str(exc)})
 
     tables_processed = sum(1 for s in steps if s.get("ok"))
 
