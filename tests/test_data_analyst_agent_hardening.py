@@ -65,6 +65,19 @@ class _CommandRecorderClient:
         return None
 
 
+class _WriterCleanupClient(_CommandRecorderClient):
+    def __init__(self, tables):
+        super().__init__()
+        self.tables = list(tables)
+
+    def query(self, sql, settings=None):
+        _ = settings
+        q = " ".join(str(sql).split()).upper()
+        if q.startswith("SHOW TABLES FROM"):
+            return _FakeResult(rows=[(t,) for t in self.tables], cols=["name"])
+        return _FakeResult(rows=[], cols=[])
+
+
 class _DQClient:
     def __init__(self, columns):
         self.columns = columns
@@ -644,6 +657,65 @@ def test_clickhouse_writer_cleanup_drops_only_bot_tables(client, monkeypatch):
     assert payload["skipped_non_bot"] == ["users"]
     assert len(recorder.commands) == 2
     assert all("BOT_" in cmd for cmd in recorder.commands)
+
+
+def test_clickhouse_writer_cleanup_also_drops_preexisting_bot_tables(client, monkeypatch):
+    recorder = _WriterCleanupClient(["BOT_preexisting_a", "users", "BOT_preexisting_b"])
+    monkeypatch.setattr(server, "get_clickhouse_client", lambda: recorder)
+
+    session_id = "writer-cleanup-2"
+    server._writer_sessions[session_id] = {
+        "created_tables": ["BOT_tmp_sales"],
+        "database": "default",
+    }
+
+    resp = client.post(
+        "/api/agents/clickhouse-writer/cleanup",
+        json={"session_id": session_id},
+    )
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert sorted(payload["dropped"]) == ["BOT_preexisting_a", "BOT_preexisting_b", "BOT_tmp_sales"]
+    assert payload["not_found"] == []
+    assert payload["skipped_non_bot"] == []
+    assert len(recorder.commands) == 3
+    assert all("BOT_" in cmd for cmd in recorder.commands)
+
+
+def test_clickhouse_writer_done_status_can_drop_specific_preexisting_bot_table(client, monkeypatch):
+    recorder = _WriterCleanupClient(["BOT_old_one", "BOT_keep_me"])
+    monkeypatch.setattr(server, "get_clickhouse_client", lambda: recorder)
+
+    session_id = "writer-done-cleanup-1"
+    server._writer_sessions[session_id] = {
+        "status": "done",
+        "database": "default",
+        "max_actions": 12,
+        "action_log": [],
+        "technical_retries": 0,
+        "max_technical_retries": 3,
+        "created_tables": [],
+        "replan_log": [],
+        "synthesis": {"conclusion": "ok"},
+        "plan": {"steps": []},
+    }
+
+    resp = client.post(
+        "/api/agents/clickhouse-writer/chat",
+        json={
+            "session_id": session_id,
+            "params": {"database": "default"},
+            "messages": [{"role": "user", "content": "drop BOT_old_one"}],
+        },
+    )
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["status"] == "done"
+    assert payload["cleanup_done"] is True
+    assert payload["tables_dropped"] == ["BOT_old_one"]
+    assert "BOT_keep_me" in payload["remaining_bot_tables"]
+    assert len(recorder.commands) == 1
+    assert "BOT_old_one" in recorder.commands[0]
 
 
 def test_resolve_sql_memory_placeholders_supports_last_alias_and_unknown_refs():
