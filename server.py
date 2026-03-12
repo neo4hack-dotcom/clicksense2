@@ -1430,8 +1430,8 @@ def _build_agent_transition_summary(steps: list, current_plan_steps: list | None
 
 _READONLY_ALLOWED_PREFIXES = ("SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH")
 _READONLY_FORBIDDEN_KEYWORDS = (
-    "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE", "CREATE",
-    "RENAME", "ATTACH", "DETACH", "OPTIMIZE", "SYSTEM", "GRANT", "REVOKE",
+    "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE",
+    "RENAME", "ATTACH", "DETACH", "OPTIMIZE", "GRANT", "REVOKE",
     "KILL", "SET ROLE", "USE",
 )
 _SIMPLE_COMPAT_FORBIDDEN_FUNCTION_PATTERNS = (
@@ -1479,6 +1479,29 @@ _SIMPLE_COMPAT_DATE_PROMPT_GUIDANCE = f"""- When filtering by date, ALWAYS emit 
 - If the user asks a relative period, resolve it to explicit literal dates before writing SQL.
 - Before returning SQL, self-check every date predicate and rewrite any remaining comparator into BETWEEN/equality.
 - NEVER use date extraction/transformation functions for filtering: no year(), month(), toYear(), toMonth(), date_trunc(), toStartOf*()."""
+_CLICKHOUSE_SUBQUERY_PROMPT_GUIDANCE = """- Avoid correlated subqueries whenever possible.
+- If an inner query depends on a column from the outer query, rewrite it as a `LEFT JOIN` or `ANY LEFT JOIN` on a pre-aggregated subquery keyed by the join column.
+- For filtering use cases, prefer `IN (SELECT key ...)` or `GLOBAL IN` over correlated `EXISTS`/scalar subqueries.
+- If you need a per-entity latest/max/min metric, first aggregate in a derived subquery with `GROUP BY entity_key`, then join that result back.
+- Keep derived subqueries simple, bounded, and focused on join/filter keys.
+- Never emit `SET allow_experimental_analyzer = 1`; the execution layer may retry that automatically if needed.
+- Before returning SQL, self-check that no subquery references an outer alias/outer column directly."""
+_CLICKHOUSE_SUBQUERY_COMPACT_GUIDANCE = (
+    "- Avoid correlated subqueries; prefer `LEFT JOIN`/`ANY LEFT JOIN` or `IN`/`GLOBAL IN`.\n"
+    "- If a subquery needs outer-row values, pre-aggregate by key then join the result."
+)
+_CLICKHOUSE_TYPE_SAFETY_PROMPT_GUIDANCE = """- ClickHouse is strictly typed: make sure both sides of `IN`, `JOIN`, comparisons, and function arguments use compatible types.
+- For `IN (...)` or `IN (subquery)`, align the right-hand values with the left column type. Example: if the column is `String`, use `'123'`, not `123`.
+- For `if()` / `multiIf()`, all return branches must have the same type. Do not mix `String` with numeric values.
+- For `dictGet(...)`, ensure the lookup key has the exact dictionary key type; cast explicitly if needed.
+- If the exact type is uncertain, first inspect it with a tiny diagnostic query such as `SELECT toTypeName(col) AS col_type FROM table LIMIT 1`.
+- Use explicit `CAST(...)`, `toString(...)`, `toUInt64(...)`, `toInt64(...)`, or `toFloat64(...)` only when needed to align types cleanly.
+- For percentile/quantile levels, use Float64 literals like `0.95`, not integer percentages like `95`.
+- Before returning SQL, self-check that no `IN`, `if`, `multiIf`, `dictGet`, or comparison mixes incompatible types."""
+_CLICKHOUSE_TYPE_SAFETY_COMPACT_GUIDANCE = (
+    "- Keep `IN`, `JOIN`, `if/multiIf`, and `dictGet` type-safe; cast explicitly when types differ.\n"
+    "- If uncertain, run a tiny `toTypeName(...)` diagnostic query first."
+)
 _SIMPLE_COMPAT_DATE_LEFT_COMPARATOR_RE = re.compile(
     rf"(?P<column>\b[\w`.]+\b)\s*(?P<op>>=|<=|>|<)\s*(?P<literal>{_DATE_LITERAL_PATTERN})",
     flags=re.IGNORECASE,
@@ -1550,6 +1573,24 @@ def _classify_clickhouse_error(error_text: str) -> str:
     text = (error_text or "").lower()
     if not text:
         return "unknown"
+    if (
+        "correlated subquery" in text
+        or "resolve identifier from parent scope" in text
+        or "parent scope only supported for constants and cte" in text
+        or "parent scope" in text
+        or ("code: 48" in text and "outer query" in text)
+    ):
+        return "correlated_subquery"
+    if (
+        "code: 43" in text
+        or "2nd argument" in text
+        or "3rd argument" in text
+        or "there is no supertype" in text
+        or "type mismatch for in" in text
+        or "types of then and else" in text
+        or "dictget" in text and "type" in text
+    ):
+        return "type_mismatch"
     if "syntax" in text or "parse" in text:
         return "syntax_error"
     if "unknown table" in text or "doesn't exist" in text:
@@ -1638,6 +1679,19 @@ def _normalize_sql_fingerprint(sql: str) -> str:
     raw = re.sub(r"\b\d+(?:\.\d+)?\b", "?", raw)
     # Normalize spacing/punctuation
     raw = re.sub(r"\s+", " ", raw).strip().rstrip(";")
+    return raw
+
+
+def _strip_sql_comments_and_literals(sql: str) -> str:
+    """Remove comments and quoted literals before read-only keyword inspection."""
+    raw = (sql or "").strip()
+    if not raw:
+        return ""
+    raw = re.sub(r"/\*[\s\S]*?\*/", " ", raw)
+    raw = re.sub(r"--.*?$", " ", raw, flags=re.MULTILINE)
+    raw = re.sub(r"'(?:''|[^'])*'", " '?' ", raw)
+    raw = re.sub(r'"(?:""|[^"])*"', ' "?" ', raw)
+    raw = re.sub(r"`(?:``|[^`])*`", " `?` ", raw)
     return raw
 
 
@@ -1899,6 +1953,12 @@ def _apply_sql_retry_playbook(
     elif err == "aggregation_error":
         # Keep query shape but reduce volume to improve stability.
         candidate = _force_limit_for_retry(statement, preferred_limit=300, hard_cap=5000)
+    elif err == "correlated_subquery":
+        # No safe deterministic rewrite here: let the retry prompt rebuild with JOIN/IN semantics.
+        candidate = ""
+    elif err == "type_mismatch":
+        # No safe deterministic rewrite here: let the retry prompt inspect/cast explicitly.
+        candidate = ""
 
     if not candidate:
         return ""
@@ -1944,8 +2004,9 @@ def _normalize_sql_for_execution(
             raise ValueError(
                 "Read-only agent accepts only SELECT/SHOW/DESCRIBE/EXPLAIN/WITH queries."
             )
+        readonly_scan = _strip_sql_comments_and_literals(statement).upper()
         for keyword in _READONLY_FORBIDDEN_KEYWORDS:
-            if re.search(rf"\b{re.escape(keyword)}\b", upper):
+            if re.search(rf"\b{re.escape(keyword)}\b", readonly_scan):
                 raise ValueError(f"Forbidden SQL keyword for read-only mode: {keyword}")
 
         # Ensure bounded result sets for better reliability with local LLM loops.
@@ -2046,6 +2107,36 @@ def _execute_sql_guarded(
         }
     except Exception as exc:
         err = str(exc)
+        err_class = _classify_clickhouse_error(err)
+        if read_only and err_class == "correlated_subquery":
+            try:
+                retry_settings = dict(settings)
+                retry_settings["allow_experimental_analyzer"] = 1
+                result = db_client.query(normalized_sql, settings=retry_settings)
+                rows = _rows_to_dicts(result)
+                preview = rows[:max_preview_rows]
+                columns = list(preview[0].keys()) if preview else list(result.column_names or [])
+                summary = _build_query_result_summary(rows, columns, preview)
+                if summary:
+                    summary = f"{summary} | Experimental analyzer retry succeeded."
+                else:
+                    summary = "Experimental analyzer retry succeeded."
+                return {
+                    "ok": True,
+                    "sql": sql,
+                    "normalized_sql": normalized_sql,
+                    "rows": rows,
+                    "preview_rows": preview,
+                    "columns": columns,
+                    "total_rows": len(rows),
+                    "summary": summary,
+                    "error": "",
+                    "error_class": "",
+                    "analyzer_retry": True,
+                }
+            except Exception as retry_exc:
+                err = f"{err} | experimental analyzer retry failed: {retry_exc}"
+                err_class = _classify_clickhouse_error(err)
         return {
             "ok": False,
             "sql": sql,
@@ -2056,7 +2147,7 @@ def _execute_sql_guarded(
             "total_rows": 0,
             "summary": f"Query failed: {err}",
             "error": err,
-            "error_class": _classify_clickhouse_error(err),
+            "error_class": err_class,
         }
 
 
@@ -3273,6 +3364,16 @@ DATE HANDLING — CRITICAL:
         + _SIMPLE_COMPAT_DATE_PROMPT_GUIDANCE
         + """
 
+SUBQUERY HANDLING — CRITICAL:
+"""
+        + _CLICKHOUSE_SUBQUERY_PROMPT_GUIDANCE
+        + """
+
+TYPE SAFETY — CRITICAL:
+"""
+        + _CLICKHOUSE_TYPE_SAFETY_PROMPT_GUIDANCE
+        + """
+
 When NOT ambiguous, return ONLY this JSON:
 {
   "sql": "SELECT ...",
@@ -3363,6 +3464,12 @@ CLICKHOUSE INSTRUCTIONS:
 DATE HANDLING — CRITICAL:
 {_SIMPLE_COMPAT_DATE_PROMPT_GUIDANCE}
 
+SUBQUERY HANDLING — CRITICAL:
+{_CLICKHOUSE_SUBQUERY_PROMPT_GUIDANCE}
+
+TYPE SAFETY — CRITICAL:
+{_CLICKHOUSE_TYPE_SAFETY_PROMPT_GUIDANCE}
+
 SQL QUERY — PRIORITY RULE:
 The SQL query is ALWAYS the primary deliverable. Even for descriptive or analytical questions,
 generate a SQL query that retrieves the relevant data. Never respond with text only when a SQL query
@@ -3400,6 +3507,11 @@ If critical ambiguity remains, return:
 
 Database schema hint (truncated):
 {json.dumps(compact_schema, indent=2)}
+
+Subquery rules:
+{_CLICKHOUSE_SUBQUERY_COMPACT_GUIDANCE}
+Type rules:
+{_CLICKHOUSE_TYPE_SAFETY_COMPACT_GUIDANCE}
 """
             tiny_messages = _trim_messages_to_budget(
                 formatted_messages,
@@ -3479,6 +3591,10 @@ RULES:
 - No advanced functions (windowFunnel, retention, sequenceMatch, argMax, topK, uniqHLL12, quantiles*, JSONExtract*, sumIf, countIf).
 - Keep every date predicate compatible:
 {_SIMPLE_COMPAT_DATE_PROMPT_GUIDANCE}
+- Handle subqueries the ClickHouse-friendly way:
+{_CLICKHOUSE_SUBQUERY_PROMPT_GUIDANCE}
+- Keep types aligned across `IN`, `JOIN`, `if/multiIf`, and `dictGet`:
+{_CLICKHOUSE_TYPE_SAFETY_PROMPT_GUIDANCE}
 - Keep LIMIT <= 5000.
 
 Return JSON only:
@@ -4041,6 +4157,8 @@ CONSTRAINTS:
 - Use only simple SQL functions (COUNT, SUM, AVG, MIN, MAX, COUNT DISTINCT, ROUND, COALESCE).
 - Keep every planned date predicate compatible:
 {_SIMPLE_COMPAT_DATE_PROMPT_GUIDANCE}
+- If a step might require a subquery, plan a `JOIN`/`ANY LEFT JOIN` or `IN`/`GLOBAL IN` strategy instead of a correlated subquery.
+- Plan with strict type safety in mind for `IN`, `JOIN`, `if/multiIf`, and `dictGet`; if types are unclear, spend one action on a tiny `toTypeName(...)` diagnostic.
 - Avoid advanced ClickHouse functions.
 
 Return ONLY JSON:
@@ -4661,6 +4779,12 @@ CLICKHOUSE INSTRUCTIONS:
 DATE HANDLING — CRITICAL:
 {_SIMPLE_COMPAT_DATE_PROMPT_GUIDANCE}
 
+SUBQUERY HANDLING — CRITICAL:
+{_CLICKHOUSE_SUBQUERY_PROMPT_GUIDANCE}
+
+TYPE SAFETY — CRITICAL:
+{_CLICKHOUSE_TYPE_SAFETY_PROMPT_GUIDANCE}
+
 REACT DISCIPLINE:
 - Think before acting: each step MUST contain a clear reasoning thought before the action.
 - For action "query", explicitly include a hypothesis and expected signal before SQL execution.
@@ -4794,6 +4918,11 @@ Return one immediate executable action as raw JSON only.
 DATE RULES:
 {_SIMPLE_COMPAT_DATE_PROMPT_GUIDANCE}
 
+SUBQUERY RULES:
+{_CLICKHOUSE_SUBQUERY_COMPACT_GUIDANCE}
+TYPE RULES:
+{_CLICKHOUSE_TYPE_SAFETY_COMPACT_GUIDANCE}
+
 For SQL:
 {{
   "action": "query",
@@ -4835,6 +4964,10 @@ Pick ONLY the next action in raw JSON.
 {actions_block}
 Date rules:
 {_SIMPLE_COMPAT_DATE_PROMPT_GUIDANCE}
+Subquery rules:
+{_CLICKHOUSE_SUBQUERY_COMPACT_GUIDANCE}
+Type rules:
+{_CLICKHOUSE_TYPE_SAFETY_COMPACT_GUIDANCE}
 Step transition brief:
 {compact_steps_context}
 User question:
@@ -4887,6 +5020,29 @@ Allowed JSON:
             "A previous SQL query was rejected by ClickHouse with a technical error. "
             "Generate a SIMPLER alternative that achieves the same analytical goal."
         )
+        subquery_retry_block = ""
+        if str(error_class or "").strip().lower() == "correlated_subquery":
+            subquery_retry_block = f"""
+
+CORRELATED SUBQUERY FIX STRATEGY:
+- Do NOT retry another correlated subquery.
+- Rewrite the failed logic with a `LEFT JOIN` or `ANY LEFT JOIN` on a pre-aggregated subquery whenever the inner query depends on an outer key.
+- If the failed subquery was only filtering outer rows, prefer `IN (SELECT key ...)` or `GLOBAL IN`.
+- If you need latest/max/min per entity, compute it in a grouped subquery first, then join back.
+- Never emit `SET allow_experimental_analyzer = 1`; the runtime already retries that automatically.
+"""
+        type_retry_block = ""
+        if str(error_class or "").strip().lower() == "type_mismatch":
+            type_retry_block = """
+
+TYPE MISMATCH FIX STRATEGY:
+- Do NOT repeat the same expression shape if ClickHouse says the 2nd/3rd argument has the wrong type.
+- For `IN`, make sure the right-hand literals/subquery keys match the left column type exactly.
+- For `if()` / `multiIf()`, make all return branches the same type.
+- For `dictGet(...)`, cast the lookup key to the dictionary key type.
+- If the exact type is uncertain, return a tiny diagnostic query using `toTypeName(...)` on the relevant columns first.
+- Use explicit casts only where needed to align types cleanly.
+"""
 
         retry_prompt = f"""You are an autonomous ClickHouse data analyst agent.
 {issue_block}
@@ -4902,6 +5058,8 @@ PREVIOUS SQL:
 
 ISSUE DETAIL:
 {error_msg}
+{subquery_retry_block}
+{type_retry_block}
 
 PREVIOUS STEPS FOR CONTEXT:
 {steps_context if steps_context else "None yet."}
@@ -4918,6 +5076,10 @@ RULES:
 - Avoid nested complexity unless strictly required.
 - Keep every date predicate compatible:
 {_SIMPLE_COMPAT_DATE_PROMPT_GUIDANCE}
+- Handle subqueries the ClickHouse-friendly way:
+{_CLICKHOUSE_SUBQUERY_PROMPT_GUIDANCE}
+- Keep types aligned across `IN`, `JOIN`, `if/multiIf`, and `dictGet`:
+{_CLICKHOUSE_TYPE_SAFETY_PROMPT_GUIDANCE}
 - Add LIMIT 200 if not present; never exceed LIMIT 5000.
 - Return exactly one SQL statement.
 
@@ -8095,6 +8257,10 @@ RULES:
 - Keep every date predicate compatible:
 {_SIMPLE_COMPAT_DATE_PROMPT_GUIDANCE}
 - No advanced ClickHouse functions.
+- Handle subqueries the ClickHouse-friendly way:
+{_CLICKHOUSE_SUBQUERY_PROMPT_GUIDANCE}
+- Keep types aligned across `IN`, `JOIN`, `if/multiIf`, and `dictGet`:
+{_CLICKHOUSE_TYPE_SAFETY_PROMPT_GUIDANCE}
 
 Return ONLY JSON:
 {{
@@ -8602,6 +8768,10 @@ Rules:
 - LIMIT <= 5000.
 - Keep every date predicate compatible:
 {_SIMPLE_COMPAT_DATE_PROMPT_GUIDANCE}
+- Handle subqueries the ClickHouse-friendly way:
+{_CLICKHOUSE_SUBQUERY_PROMPT_GUIDANCE}
+- Keep types aligned across `IN`, `JOIN`, `if/multiIf`, and `dictGet`:
+{_CLICKHOUSE_TYPE_SAFETY_PROMPT_GUIDANCE}
 
 Return JSON only:
 {{
