@@ -391,9 +391,32 @@ function isKnowledgeModeParam(paramName: string): boolean {
   return paramName === 'knowledge_mode';
 }
 
+function isClarificationModeParam(paramName: string): boolean {
+  return paramName === 'clarification_mode';
+}
+
+function clarificationModeLabel(value: string): string {
+  if (value === 'always') return 'Always preflight';
+  if (value === 'off') return 'Direct agent loop';
+  return 'Smart low-confidence';
+}
+
+function clarificationModeDescription(value: string): string {
+  if (value === 'always') {
+    return 'Run a clarification-first pass before every session execution. Highest guidance, highest LLM overhead.';
+  }
+  if (value === 'off') {
+    return 'Skip the clarification-first pass and go directly to the agent loop. Lowest overhead, less interactive guidance.';
+  }
+  return 'Run clarification-first only when local heuristics detect low confidence or high ambiguity. Best default balance.';
+}
+
 function getParamOptionLabel(paramName: string, optionValue: string): string {
   if (isKnowledgeModeParam(paramName)) {
     return knowledgeModeLabel(optionValue);
+  }
+  if (isClarificationModeParam(paramName)) {
+    return clarificationModeLabel(optionValue);
   }
   return optionValue;
 }
@@ -4213,6 +4236,11 @@ export function AgentsPane() {
                           {isKnowledgeModeParam(p.name) && (
                             <p className="text-[10px] text-indigo-500 mt-1">
                               {knowledgeModeDescription(selectValue)}
+                            </p>
+                          )}
+                          {isClarificationModeParam(p.name) && (
+                            <p className="text-[10px] text-sky-500 mt-1">
+                              {clarificationModeDescription(selectValue)}
                             </p>
                           )}
                         </div>

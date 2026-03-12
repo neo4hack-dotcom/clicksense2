@@ -644,7 +644,12 @@ def test_data_analyst_session_worker_requests_clarification_before_running_agent
             "running": True,
             "pause_requested": False,
             "stop_requested": False,
-            "params": {"auto_run": True, "use_knowledge_base": True, "max_steps": 6},
+            "params": {
+                "auto_run": True,
+                "use_knowledge_base": True,
+                "max_steps": 6,
+                "clarification_mode": "always",
+            },
             "conversation": [],
             "recent_user_goals": [],
             "pending_user_inputs": ["Show sales"],
@@ -815,6 +820,134 @@ def test_data_analyst_session_resolve_table_selection_requeues_original_question
     assert started["count"] == 1
     assert payload["status"] == "running"
     assert "Table selection confirmed" in payload["content"]
+
+
+def test_data_analyst_normalize_params_defaults_clarification_mode_to_smart():
+    params = server._da_normalize_params({})
+    assert params["clarification_mode"] == "smart_low_confidence"
+
+
+def test_data_analyst_should_run_clarification_preflight_only_on_low_confidence():
+    session = {"params": {"clarification_mode": "smart_low_confidence"}, "last_result": None}
+    schema = {
+        "orders": [{"name": "amount", "type": "Float64"}],
+        "customers": [{"name": "country", "type": "String"}],
+        "payments": [{"name": "payment_date", "type": "Date"}],
+        "products": [{"name": "category", "type": "String"}],
+        "returns": [{"name": "return_date", "type": "Date"}],
+    }
+
+    should_skip, reason_skip = server._da_should_run_clarification_preflight(
+        session,
+        "Show total revenue for orders between 2025-01-01 and 2025-01-31",
+        schema,
+        {},
+        [],
+    )
+    assert should_skip is False
+    assert reason_skip in {"explicit_table_and_explicit_date", "explicit_table_and_measure"}
+
+    should_run, reason_run = server._da_should_run_clarification_preflight(
+        session,
+        "Show sales recently",
+        schema,
+        {},
+        [],
+    )
+    assert should_run is True
+    assert reason_run in {
+        "ambiguous_period_large_schema",
+        "ambiguous_metric_large_schema",
+        "low_specificity_large_schema",
+        "short_question_without_table",
+    }
+
+
+def test_data_analyst_should_run_clarification_preflight_honors_always_mode():
+    should_run, reason = server._da_should_run_clarification_preflight(
+        {"params": {"clarification_mode": "always"}},
+        "orders revenue",
+        {
+            "orders": [{"name": "amount", "type": "Float64"}],
+            "payments": [{"name": "payment_date", "type": "Date"}],
+        },
+        {},
+        [],
+    )
+    assert should_run is True
+    assert reason == "clarification_mode=always"
+
+
+def test_data_analyst_session_worker_skips_preflight_when_confidence_is_high(monkeypatch):
+    session_id = "skip-preflight-session"
+    with server._data_analyst_sessions_lock:
+        server._data_analyst_sessions[session_id] = {
+            "id": session_id,
+            "created_at": "",
+            "updated_at": "",
+            "status": "running",
+            "running": True,
+            "pause_requested": False,
+            "stop_requested": False,
+            "params": {
+                "auto_run": True,
+                "use_knowledge_base": True,
+                "max_steps": 6,
+                "clarification_mode": "smart_low_confidence",
+            },
+            "conversation": [],
+            "recent_user_goals": [],
+            "pending_user_inputs": ["Show total revenue for orders between 2025-01-01 and 2025-01-31"],
+            "paused_notes": [],
+            "memory_summary": "",
+            "event_log": [],
+            "event_seq": 0,
+            "response_seq": 0,
+            "latest_assistant": None,
+            "last_result": None,
+            "last_completed_question": "",
+            "cached_schema": None,
+            "cached_schema_ts": 0,
+            "pending_clarification": None,
+            "pending_confirmed_tables": [],
+            "run_seq": 1,
+            "worker": None,
+        }
+
+    monkeypatch.setattr(server, "_da_get_schema_with_cache", lambda session: {
+        "orders": [{"name": "amount", "type": "Float64"}],
+        "payments": [{"name": "payment_date", "type": "Date"}],
+        "products": [{"name": "category", "type": "String"}],
+        "returns": [{"name": "return_date", "type": "Date"}],
+        "customers": [{"name": "country", "type": "String"}],
+    })
+    monkeypatch.setattr(server, "_da_build_table_metadata_map", lambda: {"orders": {"description": "Orders"}})
+
+    def _unexpected_preflight(*args, **kwargs):
+        raise AssertionError("clarification preflight should be skipped for high-confidence questions")
+
+    monkeypatch.setattr(server, "_da_run_clarification_preflight", _unexpected_preflight)
+
+    def _fake_agent_analysis():
+        return server.jsonify({
+            "steps": [{"step": 1, "type": "query", "ok": True, "sql": "SELECT 1", "result_summary": "ok"}],
+            "final_answer": "Done.",
+            "total_steps": 1,
+            "technical_retries_used": 0,
+            "query_attempts_used": 1,
+            "max_total_query_attempts": 9,
+            "initial_plan": ["Run baseline"],
+            "current_plan": ["Run baseline"],
+            "midcourse_review": {},
+        })
+
+    monkeypatch.setattr(server, "agent_analysis", _fake_agent_analysis)
+    server._da_worker_loop(session_id, 1)
+
+    with server._data_analyst_sessions_lock:
+        session = server._data_analyst_sessions[session_id]
+        assert session["status"] == "idle"
+        assert session["last_result"]["query_attempts_used"] == 1
 
 
 def test_data_analyst_compose_question_trims_memory_and_notes():

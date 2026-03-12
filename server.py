@@ -6717,6 +6717,29 @@ _data_analyst_sessions: dict = {}
 _data_analyst_sessions_lock = _threading.Lock()
 _DATA_ANALYST_MAX_EVENTS = 500
 _DATA_ANALYST_SCHEMA_CACHE_TTL_SEC = 180
+_DA_CLARIFICATION_MODE_SMART = "smart_low_confidence"
+_DA_CLARIFICATION_MODE_ALWAYS = "always"
+_DA_CLARIFICATION_MODE_OFF = "off"
+_DA_AMBIGUOUS_PERIOD_TERMS = (
+    "recently", "lately", "latest", "current period", "last period",
+    "this period", "this year", "this month", "current month", "current year",
+    "récemment", "dernier période", "dernière période", "période récente",
+    "ce mois", "cette année", "période actuelle",
+)
+_DA_METRIC_AMBIGUOUS_TERMS = (
+    "sales", "revenue", "orders", "customers", "margin", "volume", "activity",
+    "ventes", "revenu", "ca", "chiffre d'affaires", "commandes", "clients",
+    "marge", "volume", "activité",
+)
+_DA_MEASURE_HINT_TERMS = (
+    "count", "sum", "avg", "average", "min", "max", "total", "distinct",
+    "nombre", "somme", "moyenne", "total", "minimum", "maximum", "distinct",
+)
+_DA_FOLLOW_UP_TERMS = (
+    "continue", "continue from", "based on previous", "from previous",
+    "now explain", "maintenant", "continue", "reprends", "poursuis",
+    "sur la base du résultat précédent", "à partir du résultat précédent",
+)
 
 
 def _da_now_iso() -> str:
@@ -6740,6 +6763,21 @@ def _da_coerce_int(value, default: int, min_value: int, max_value: int) -> int:
     return max(min_value, min(max_value, parsed))
 
 
+def _da_normalize_clarification_mode(value) -> str:
+    raw = str(value or "").strip().lower()
+    mapping = {
+        "smart": _DA_CLARIFICATION_MODE_SMART,
+        "smart_low_confidence": _DA_CLARIFICATION_MODE_SMART,
+        "low_confidence": _DA_CLARIFICATION_MODE_SMART,
+        "always": _DA_CLARIFICATION_MODE_ALWAYS,
+        "always_preflight": _DA_CLARIFICATION_MODE_ALWAYS,
+        "off": _DA_CLARIFICATION_MODE_OFF,
+        "disabled": _DA_CLARIFICATION_MODE_OFF,
+        "none": _DA_CLARIFICATION_MODE_OFF,
+    }
+    return mapping.get(raw, _DA_CLARIFICATION_MODE_SMART)
+
+
 def _da_parse_table_filter(raw_value) -> list:
     if isinstance(raw_value, list):
         values = [str(v).strip() for v in raw_value if str(v).strip()]
@@ -6761,6 +6799,7 @@ def _da_normalize_params(raw_params: dict | None) -> dict:
         "knowledge_mode": knowledge_mode,
         "use_knowledge_base": use_knowledge_base,
         "use_knowledge_agent": use_knowledge_agent,
+        "clarification_mode": _da_normalize_clarification_mode(params.get("clarification_mode", _DA_CLARIFICATION_MODE_SMART)),
         "memory_turn_limit": _da_coerce_int(params.get("memory_turn_limit", 8), 8, 2, 24),
         "memory_token_budget": _da_coerce_int(params.get("memory_token_budget", 700), 700, 120, 2400),
         "auto_run": _da_coerce_bool(params.get("auto_run", "yes"), True),
@@ -7039,6 +7078,86 @@ def _da_build_preflight_messages(session: dict, user_question: str) -> list[dict
     return [{"role": "user", "content": question[:1200]}]
 
 
+def _da_find_explicit_table_mentions(question: str, schema: dict) -> list[str]:
+    """Detect whether the user explicitly named one or more technical tables."""
+    q_low = str(question or "").strip().lower()
+    if not q_low:
+        return []
+    matches = []
+    seen = set()
+    for table_name in schema.keys():
+        raw = str(table_name or "").strip()
+        if not raw:
+            continue
+        variants = {raw.lower()}
+        if "." in raw:
+            variants.add(raw.split(".")[-1].lower())
+        for variant in variants:
+            if len(variant) < 2:
+                continue
+            if re.search(rf"\b{re.escape(variant)}\b", q_low):
+                if raw not in seen:
+                    seen.add(raw)
+                    matches.append(raw)
+                break
+    return matches
+
+
+def _da_should_run_clarification_preflight(
+    session: dict,
+    user_question: str,
+    schema: dict,
+    table_metadata: dict,
+    table_filter: list,
+) -> tuple[bool, str]:
+    """Decide whether a clarification-first pass is worth the extra LLM call."""
+    _ = table_metadata
+    params = session.get("params", {}) or {}
+    mode = _da_normalize_clarification_mode(params.get("clarification_mode", _DA_CLARIFICATION_MODE_SMART))
+    if mode == _DA_CLARIFICATION_MODE_OFF:
+        return False, "clarification_mode=off"
+    if mode == _DA_CLARIFICATION_MODE_ALWAYS:
+        return True, "clarification_mode=always"
+
+    question = " ".join(str(user_question or "").split())
+    if not question:
+        return False, "empty_question"
+    if session.get("pending_clarification"):
+        return False, "clarification_already_pending"
+    if len(table_filter or []) == 1:
+        return False, "single_table_filter"
+    if len(schema or {}) <= 1:
+        return False, "single_table_scope"
+
+    q_low = question.lower()
+    explicit_tables = _da_find_explicit_table_mentions(question, schema or {})
+    if len(explicit_tables) == 1 and re.search(r"\b\d{4}-\d{2}-\d{2}\b", q_low):
+        return False, "explicit_table_and_explicit_date"
+    if explicit_tables and any(term in q_low for term in _DA_MEASURE_HINT_TERMS):
+        return False, "explicit_table_and_measure"
+
+    if session.get("last_result") and any(term in q_low for term in _DA_FOLLOW_UP_TERMS):
+        return False, "follow_up_to_previous_run"
+
+    token_count = len(re.findall(r"\w+", q_low))
+    ambiguous_period = any(term in q_low for term in _DA_AMBIGUOUS_PERIOD_TERMS) and not re.search(r"\b\d{4}-\d{2}-\d{2}\b", q_low)
+    ambiguous_metric = any(term in q_low for term in _DA_METRIC_AMBIGUOUS_TERMS) and not any(term in q_low for term in _DA_MEASURE_HINT_TERMS)
+    no_table_signal = not explicit_tables and not table_filter
+    large_schema = len(schema or {}) >= 5
+
+    if len(explicit_tables) > 1:
+        return True, "multiple_explicit_tables"
+    if token_count <= 4 and no_table_signal:
+        return True, "short_question_without_table"
+    if no_table_signal and large_schema and ambiguous_period:
+        return True, "ambiguous_period_large_schema"
+    if no_table_signal and large_schema and ambiguous_metric:
+        return True, "ambiguous_metric_large_schema"
+    if no_table_signal and token_count <= 7 and large_schema:
+        return True, "low_specificity_large_schema"
+    return False, "confidence_high_enough"
+
+
 def _da_run_clarification_preflight(
     session: dict,
     user_question: str,
@@ -7196,13 +7315,33 @@ def _da_worker_loop(session_id: str, run_seq: int) -> None:
             table_filter = _da_parse_table_filter(params.get("table_filter", []))
 
             preflight = {}
-            if not confirmed_tables:
+            should_preflight, preflight_reason = _da_should_run_clarification_preflight(
+                session,
+                user_question,
+                schema,
+                table_metadata,
+                table_filter,
+            )
+            if should_preflight and not confirmed_tables:
+                _da_log_event(
+                    session,
+                    f"Clarification preflight enabled ({preflight_reason}).",
+                    "info",
+                    "clarification",
+                )
                 preflight = _da_run_clarification_preflight(
                     session,
                     user_question,
                     schema,
                     table_metadata,
                     table_filter,
+                )
+            else:
+                _da_log_event(
+                    session,
+                    f"Clarification preflight skipped ({preflight_reason}).",
+                    "info",
+                    "clarification",
                 )
             if preflight.get("needs_clarification"):
                 assistant_payload = {
@@ -9172,6 +9311,14 @@ AGENTS_CATALOG = [
                 "options": ["kb_context_once", "kb_agentic", "schema_only", "minimal"],
                 "default": "kb_context_once",
                 "description": "Choix unique (4 modes) pour contrôler l'usage KB et l'injection de contexte.",
+            },
+            {
+                "name": "clarification_mode",
+                "label": "Clarification strategy",
+                "type": "select",
+                "options": [_DA_CLARIFICATION_MODE_SMART, _DA_CLARIFICATION_MODE_ALWAYS, _DA_CLARIFICATION_MODE_OFF],
+                "default": _DA_CLARIFICATION_MODE_SMART,
+                "description": "smart_low_confidence: clarification only when ambiguity risk is high; always: preflight every run; off: never preflight before the agent loop.",
             },
             {
                 "name": "memory_turn_limit",
