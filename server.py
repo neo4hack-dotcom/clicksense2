@@ -779,11 +779,23 @@ def _parse_llm_json(content: str) -> dict:
             seen.add(norm)
             yield norm
 
+    def _normalize_parsed_root(parsed):
+        if isinstance(parsed, dict):
+            return parsed
+        # Some transports wrap a single JSON object into an array.
+        if isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], dict):
+            return parsed[0]
+        raise ValueError(
+            "LLM JSON root must be an object. "
+            f"Got {type(parsed).__name__} instead."
+        )
+
     last_json_error = None
     for candidate in _iter_candidates(content):
         try:
-            return json.loads(candidate)
-        except json.JSONDecodeError as exc:
+            parsed = json.loads(candidate)
+            return _normalize_parsed_root(parsed)
+        except (json.JSONDecodeError, ValueError) as exc:
             last_json_error = exc
             continue
 

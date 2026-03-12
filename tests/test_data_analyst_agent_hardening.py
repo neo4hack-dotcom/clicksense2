@@ -810,6 +810,18 @@ def test_parse_llm_json_repairs_unescaped_newline_in_string():
     assert "line2" in str(parsed.get("reasoning", ""))
 
 
+def test_parse_llm_json_accepts_single_object_wrapped_in_list():
+    wrapped = '[{"action":"query","reasoning":"ok"}]'
+    parsed = server._parse_llm_json(wrapped)
+    assert isinstance(parsed, dict)
+    assert parsed.get("action") == "query"
+
+
+def test_parse_llm_json_rejects_non_object_root_arrays():
+    with pytest.raises(ValueError):
+        server._parse_llm_json('["a", "b", "c"]')
+
+
 def test_resolve_sql_memory_placeholders_supports_last_alias_and_unknown_refs():
     memory = {
         "artifacts": {
