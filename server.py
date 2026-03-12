@@ -665,6 +665,8 @@ def _parse_response_json(resp, label: str = "LLM") -> dict:
 
 def _parse_llm_json(content: str) -> dict:
     """Parse JSON from LLM output, handling markdown fences and extra surrounding text."""
+    import ast
+
     if not content or not content.strip():
         raise ValueError("LLM returned an empty response")
 
@@ -759,10 +761,15 @@ def _parse_llm_json(content: str) -> dict:
             if not cand:
                 continue
             expanded.append(cand)
+            # Wrap JSON-like key-value payloads missing outer braces.
+            if not cand.lstrip().startswith(("{", "[")) and ":" in cand:
+                expanded.append("{" + cand.strip().strip(",") + "}")
             # Remove trailing commas before closing braces/brackets.
             expanded.append(re.sub(r",(\s*[}\]])", r"\1", cand))
             # Quote unquoted keys: {action: "x"} -> {"action":"x"}.
             expanded.append(re.sub(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)', r'\1"\2"\3', cand))
+            # Convert single-quoted keys/values to JSON-compatible double quotes.
+            expanded.append(re.sub(r"'([^'\\]*(?:\\.[^'\\]*)*)'", r'"\1"', cand))
             # Normalize Python literals.
             py_norm = re.sub(r"\bTrue\b", "true", cand)
             py_norm = re.sub(r"\bFalse\b", "false", py_norm)
@@ -778,6 +785,55 @@ def _parse_llm_json(content: str) -> dict:
                 continue
             seen.add(norm)
             yield norm
+
+    def _parse_kv_lines(txt: str) -> dict:
+        """Best-effort parser for non-JSON key:value / key=value formats."""
+        lines = [ln.strip() for ln in str(txt or "").splitlines() if ln.strip()]
+        if not lines:
+            return {}
+
+        parsed: dict = {}
+        for ln in lines:
+            m = re.match(r'^"?([A-Za-z_][A-Za-z0-9_]*)"?\s*[:=]\s*(.+)$', ln)
+            if not m:
+                continue
+            key = m.group(1)
+            raw_val = m.group(2).strip().rstrip(",")
+            if not raw_val:
+                parsed[key] = ""
+                continue
+
+            if (raw_val.startswith('"') and raw_val.endswith('"')) or (
+                raw_val.startswith("'") and raw_val.endswith("'")
+            ):
+                parsed[key] = raw_val[1:-1]
+                continue
+
+            low = raw_val.lower()
+            if low in {"true", "false"}:
+                parsed[key] = low == "true"
+                continue
+            if low in {"null", "none"}:
+                parsed[key] = None
+                continue
+            if re.match(r"^-?\d+$", raw_val):
+                parsed[key] = int(raw_val)
+                continue
+            if re.match(r"^-?\d+\.\d+$", raw_val):
+                parsed[key] = float(raw_val)
+                continue
+
+            # Attempt nested JSON value.
+            if raw_val.startswith(("{", "[")):
+                try:
+                    parsed[key] = json.loads(raw_val)
+                    continue
+                except Exception:
+                    pass
+
+            parsed[key] = raw_val
+
+        return parsed
 
     def _normalize_parsed_root(parsed):
         if isinstance(parsed, dict):
@@ -797,7 +853,18 @@ def _parse_llm_json(content: str) -> dict:
             return _normalize_parsed_root(parsed)
         except (json.JSONDecodeError, ValueError) as exc:
             last_json_error = exc
+            # Python-literal style fallback: {'action': 'query', ...}
+            try:
+                parsed_py = ast.literal_eval(candidate)
+                return _normalize_parsed_root(parsed_py)
+            except Exception:
+                pass
             continue
+
+    # Last deterministic fallback for key/value plaintext outputs.
+    kv = _parse_kv_lines(content)
+    if kv:
+        return kv
 
     raise ValueError(
         "LLM response is not valid JSON. "

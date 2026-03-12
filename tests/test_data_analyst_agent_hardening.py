@@ -822,6 +822,26 @@ def test_parse_llm_json_rejects_non_object_root_arrays():
         server._parse_llm_json('["a", "b", "c"]')
 
 
+def test_parse_llm_json_supports_key_value_plaintext_format():
+    payload = (
+        "action: query\n"
+        "reasoning: Base check\n"
+        "sql: SELECT count() FROM events"
+    )
+    parsed = server._parse_llm_json(payload)
+    assert isinstance(parsed, dict)
+    assert parsed.get("action") == "query"
+    assert "SELECT count()" in str(parsed.get("sql", ""))
+
+
+def test_parse_llm_json_supports_single_quoted_python_dict():
+    payload = "{'action': 'query', 'reasoning': 'ok', 'sql': 'SELECT 1'}"
+    parsed = server._parse_llm_json(payload)
+    assert isinstance(parsed, dict)
+    assert parsed.get("action") == "query"
+    assert parsed.get("reasoning") == "ok"
+
+
 def test_resolve_sql_memory_placeholders_supports_last_alias_and_unknown_refs():
     memory = {
         "artifacts": {
