@@ -520,6 +520,92 @@ def _clean_llm_output(text: str) -> str:
     return text.strip()
 
 
+def _describe_payload_shape(payload, depth: int = 0) -> str:
+    """Return a compact structural description for debugging unknown LLM payloads."""
+    if depth > 2:
+        return "..."
+    if isinstance(payload, dict):
+        keys = list(payload.keys())
+        preview = keys[:8]
+        suffix = "..." if len(keys) > 8 else ""
+        if preview:
+            first_key = preview[0]
+            child = _describe_payload_shape(payload.get(first_key), depth + 1)
+            return f"dict(keys={preview}{suffix}, first[{first_key}]={child})"
+        return "dict(keys=[])"
+    if isinstance(payload, list):
+        if not payload:
+            return "list(len=0)"
+        return f"list(len={len(payload)}, first={_describe_payload_shape(payload[0], depth + 1)})"
+    return type(payload).__name__
+
+
+def _extract_llm_content(payload) -> str:
+    """Extract assistant text from heterogeneous provider payload schemas."""
+
+    def _extract(value, depth: int = 0) -> str:
+        if depth > 7 or value is None:
+            return ""
+
+        if isinstance(value, str):
+            return value.strip()
+
+        if isinstance(value, list):
+            if not value:
+                return ""
+            parts = []
+            for item in value:
+                txt = _extract(item, depth + 1)
+                if txt:
+                    parts.append(txt)
+            return "\n".join(parts).strip() if parts else ""
+
+        if isinstance(value, dict):
+            # Common structured text chunk shape: {"type":"text","text":"..."}
+            if str(value.get("type", "")).lower() == "text":
+                txt = _extract(value.get("text"), depth + 1)
+                if txt:
+                    return txt
+
+            # Most likely text-carrying keys first.
+            for key in (
+                "content",
+                "text",
+                "response",
+                "output",
+                "answer",
+                "completion",
+                "generated_text",
+                "reasoning_content",
+                "reasoning",
+                "assistant_response",
+            ):
+                if key in value:
+                    txt = _extract(value.get(key), depth + 1)
+                    if txt:
+                        return txt
+
+            # OpenAI-compatible / streamed chunk variants.
+            for key in ("message", "delta"):
+                if key in value:
+                    txt = _extract(value.get(key), depth + 1)
+                    if txt:
+                        return txt
+
+            # Common container keys used by gateways/proxies/webhooks.
+            for key in ("choices", "data", "results", "messages", "items"):
+                if key in value:
+                    txt = _extract(value.get(key), depth + 1)
+                    if txt:
+                        return txt
+
+            return ""
+
+        return ""
+
+    return _extract(payload, 0)
+
+
 def _parse_response_json(resp, label: str = "LLM") -> dict:
     """Safely parse JSON from an HTTP response with descriptive errors.
 
@@ -579,29 +665,132 @@ def _parse_response_json(resp, label: str = "LLM") -> dict:
 
 def _parse_llm_json(content: str) -> dict:
     """Parse JSON from LLM output, handling markdown fences and extra surrounding text."""
-    import re
-
     if not content or not content.strip():
         raise ValueError("LLM returned an empty response")
 
-    cleaned = _strip_llm_markdown(content)
+    def _normalize_candidate(txt: str) -> str:
+        out = str(txt or "").strip().replace("\ufeff", "")
+        out = out.replace("\r\n", "\n").replace("\r", "\n")
+        out = out.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
+        # Common malformed prefix from local outputs: "{n ..." instead of "{\n ..."
+        out = re.sub(r"^(\{|\[)\s*n(?=\s*[\"{\[])", r"\1\n", out)
+        out = re.sub(r"^(json|JSON)\s*", "", out)
+        return out.strip()
 
-    # Fast path: try the cleaned content directly
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        pass
+    def _extract_first_json_block(txt: str) -> str:
+        if not txt:
+            return ""
+        starts = [i for i, ch in enumerate(txt) if ch in "{["]
+        closers = {"{": "}", "[": "]"}
+        for start in starts[:12]:
+            open_ch = txt[start]
+            stack = [closers[open_ch]]
+            in_str = False
+            escaped = False
+            for idx in range(start + 1, len(txt)):
+                ch = txt[idx]
+                if in_str:
+                    if escaped:
+                        escaped = False
+                    elif ch == "\\":
+                        escaped = True
+                    elif ch == '"':
+                        in_str = False
+                    continue
 
-    # Fallback: find the first JSON object or array in the text
-    match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", cleaned)
-    if match:
+                if ch == '"':
+                    in_str = True
+                    continue
+                if ch in "{[":
+                    stack.append(closers[ch])
+                    continue
+                if ch in "}]":
+                    if not stack or ch != stack[-1]:
+                        break
+                    stack.pop()
+                    if not stack:
+                        return txt[start: idx + 1]
+        return ""
+
+    def _escape_newlines_in_strings(txt: str) -> str:
+        if not txt:
+            return txt
+        out = []
+        in_str = False
+        escaped = False
+        for ch in txt:
+            if in_str:
+                if escaped:
+                    out.append(ch)
+                    escaped = False
+                    continue
+                if ch == "\\":
+                    out.append(ch)
+                    escaped = True
+                    continue
+                if ch == '"':
+                    out.append(ch)
+                    in_str = False
+                    continue
+                if ch == "\n":
+                    out.append("\\n")
+                    continue
+                if ch == "\t":
+                    out.append("\\t")
+                    continue
+                out.append(ch)
+                continue
+
+            if ch == '"':
+                in_str = True
+            out.append(ch)
+        return "".join(out)
+
+    def _iter_candidates(txt: str):
+        base = _normalize_candidate(_strip_llm_markdown(txt))
+        candidates = [base]
+
+        extracted = _extract_first_json_block(base)
+        if extracted:
+            candidates.append(_normalize_candidate(extracted))
+
+        expanded = []
+        for cand in candidates:
+            if not cand:
+                continue
+            expanded.append(cand)
+            # Remove trailing commas before closing braces/brackets.
+            expanded.append(re.sub(r",(\s*[}\]])", r"\1", cand))
+            # Quote unquoted keys: {action: "x"} -> {"action":"x"}.
+            expanded.append(re.sub(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)', r'\1"\2"\3', cand))
+            # Normalize Python literals.
+            py_norm = re.sub(r"\bTrue\b", "true", cand)
+            py_norm = re.sub(r"\bFalse\b", "false", py_norm)
+            py_norm = re.sub(r"\bNone\b", "null", py_norm)
+            expanded.append(py_norm)
+            # Escape raw newlines/tabs inside JSON strings.
+            expanded.append(_escape_newlines_in_strings(cand))
+
+        seen = set()
+        for cand in expanded:
+            norm = _normalize_candidate(cand)
+            if not norm or norm in seen:
+                continue
+            seen.add(norm)
+            yield norm
+
+    last_json_error = None
+    for candidate in _iter_candidates(content):
         try:
-            return json.loads(match.group(0))
-        except json.JSONDecodeError:
-            pass
+            return json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            last_json_error = exc
+            continue
 
     raise ValueError(
-        f"LLM response is not valid JSON. Raw content (first 500 chars): {content[:500]!r}"
+        "LLM response is not valid JSON. "
+        f"Raw content (first 500 chars): {content[:500]!r}"
+        + (f" | last parser error: {last_json_error}" if last_json_error else "")
     )
 
 
@@ -1712,11 +1901,16 @@ def _call_llm(system_prompt: str, messages: list, temperature: float = 0.7,
             else:
                 raise
 
-        content = (
-            resp_data.get("choices", [{}])[0].get("message", {}).get("content")
-            or resp_data.get("content")
-            or ""
-        )
+        content = _extract_llm_content(resp_data)
+        if not content:
+            raw_txt = str(getattr(resp, "text", "") or "").strip()
+            if raw_txt and not raw_txt.startswith("{") and not raw_txt.startswith("["):
+                content = raw_txt
+        if not content:
+            raise Exception(
+                "local_http LLM returned empty content. "
+                f"Payload shape: {_describe_payload_shape(resp_data)}"
+            )
         return _clean_llm_output(_strip_llm_markdown(content))
 
     elif provider == "ollama":
@@ -1735,7 +1929,12 @@ def _call_llm(system_prompt: str, messages: list, temperature: float = 0.7,
         if not resp.ok:
             raise Exception(f"Ollama LLM Error: {resp.status_code} - {resp.text}")
         resp_data = _parse_response_json(resp, "Ollama LLM")
-        content = resp_data.get("response", "")
+        content = _extract_llm_content(resp_data)
+        if not content:
+            raise Exception(
+                "Ollama LLM returned empty content. "
+                f"Payload shape: {_describe_payload_shape(resp_data)}"
+            )
         return _clean_llm_output(_strip_llm_markdown(content))
 
     elif provider == "n8n":
@@ -1795,14 +1994,17 @@ def _call_llm(system_prompt: str, messages: list, temperature: float = 0.7,
             else:
                 raise
 
-        content = (
-            resp_data.get("output")
-            or resp_data.get("text")
-            or resp_data.get("response")
-            or resp_data.get("content")
-            or ""
-        )
-        return _clean_llm_output(content)
+        content = _extract_llm_content(resp_data)
+        if not content:
+            raw_txt = str(getattr(resp, "text", "") or "").strip()
+            if raw_txt and not raw_txt.startswith("{") and not raw_txt.startswith("["):
+                content = raw_txt
+        if not content:
+            raise Exception(
+                "n8n LLM returned empty content. "
+                f"Payload shape: {_describe_payload_shape(resp_data)}"
+            )
+        return _clean_llm_output(_strip_llm_markdown(content))
 
     else:
         raise Exception(f"Invalid LLM provider: {provider!r}")

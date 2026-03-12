@@ -120,6 +120,14 @@ class _FakeHttpResponse:
         return self._payload
 
 
+@pytest.fixture()
+def _preserve_llm_config():
+    original = dict(server.llm_config)
+    yield
+    server.llm_config.clear()
+    server.llm_config.update(original)
+
+
 @pytest.fixture(autouse=True)
 def _reset_model_cache():
     server._model_context_cache.clear()
@@ -716,6 +724,90 @@ def test_clickhouse_writer_done_status_can_drop_specific_preexisting_bot_table(c
     assert "BOT_keep_me" in payload["remaining_bot_tables"]
     assert len(recorder.commands) == 1
     assert "BOT_old_one" in recorder.commands[0]
+
+
+def test_extract_llm_content_supports_common_http_shapes():
+    payload_openai_text = {"choices": [{"text": "hello from choices.text"}]}
+    assert server._extract_llm_content(payload_openai_text) == "hello from choices.text"
+
+    payload_structured = {
+        "choices": [
+            {
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "part 1"},
+                        {"type": "text", "text": "part 2"},
+                    ]
+                }
+            }
+        ]
+    }
+    assert "part 1" in server._extract_llm_content(payload_structured)
+    assert "part 2" in server._extract_llm_content(payload_structured)
+
+    payload_n8n_nested = [{"data": {"output": "hello from n8n list payload"}}]
+    assert server._extract_llm_content(payload_n8n_nested) == "hello from n8n list payload"
+
+
+def test_call_llm_local_http_accepts_choices_text(monkeypatch, _preserve_llm_config):
+    monkeypatch.setitem(server.llm_config, "provider", "local_http")
+    monkeypatch.setitem(server.llm_config, "model", "test-model")
+    monkeypatch.setitem(server.llm_config, "baseUrl", "http://localhost:8000/v1/chat/completions")
+    monkeypatch.setitem(server.llm_config, "apiKey", "")
+    monkeypatch.setitem(server.llm_config, "maxOutputTokens", 256)
+
+    def fake_post(url, **kwargs):
+        _ = url
+        _ = kwargs
+        payload = {"choices": [{"text": "{\"ok\": true}"}]}
+        return _FakeHttpResponse(ok=True, status_code=200, payload=payload, text=json.dumps(payload))
+
+    monkeypatch.setattr(server, "_http_post", fake_post)
+    content = server._call_llm(
+        "System prompt",
+        [{"role": "user", "content": "hello"}],
+        temperature=0.1,
+    )
+    assert content == "{\"ok\": true}"
+
+
+def test_call_llm_n8n_accepts_list_payload(monkeypatch, _preserve_llm_config):
+    monkeypatch.setitem(server.llm_config, "provider", "n8n")
+    monkeypatch.setitem(server.llm_config, "model", "test-model")
+    monkeypatch.setitem(server.llm_config, "baseUrl", "https://example.com/webhook/test")
+    monkeypatch.setitem(server.llm_config, "apiKey", "")
+    monkeypatch.setitem(server.llm_config, "maxOutputTokens", 256)
+
+    def fake_post(url, **kwargs):
+        _ = url
+        _ = kwargs
+        payload = [{"output": "{\"quality\": \"ok\"}"}]
+        return _FakeHttpResponse(ok=True, status_code=200, payload=payload, text=json.dumps(payload))
+
+    monkeypatch.setattr(server, "_http_post", fake_post)
+    content = server._call_llm(
+        "System prompt",
+        [{"role": "user", "content": "hello"}],
+        temperature=0.1,
+    )
+    assert content == "{\"quality\": \"ok\"}"
+
+
+def test_parse_llm_json_repairs_common_malformed_prefix_and_trailing_comma():
+    malformed = '{n "action": "query",\n"reasoning": "ok",\n}'
+    parsed = server._parse_llm_json(malformed)
+    assert isinstance(parsed, dict)
+    assert parsed.get("action") == "query"
+    assert parsed.get("reasoning") == "ok"
+
+
+def test_parse_llm_json_repairs_unescaped_newline_in_string():
+    malformed = '{\n"action": "query",\n"reasoning": "line1\nline2"\n}'
+    parsed = server._parse_llm_json(malformed)
+    assert isinstance(parsed, dict)
+    assert parsed.get("action") == "query"
+    assert "line1" in str(parsed.get("reasoning", ""))
+    assert "line2" in str(parsed.get("reasoning", ""))
 
 
 def test_resolve_sql_memory_placeholders_supports_last_alias_and_unknown_refs():
