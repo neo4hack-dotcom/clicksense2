@@ -457,6 +457,93 @@ def test_agent_final_answer_strips_actionable_recommendations_section(client, mo
     assert "Conclusion finale détaillée" in final_answer
 
 
+def test_agent_executes_query_when_step_response_looks_like_plan_object(client, monkeypatch):
+    monkeypatch.setattr(server, "get_clickhouse_client", lambda: _OkClient())
+    proceed_calls = {"count": 0}
+
+    def fake_call(system_prompt, messages, temperature=0.7, language=None):
+        _ = system_prompt
+        _ = temperature
+        _ = language
+        user_msg = messages[-1]["content"]
+        if user_msg == "Build the plan.":
+            return json.dumps({"plan_steps": ["Baseline query"], "reasoning": "Start simple"})
+        if user_msg == "Proceed with the next step.":
+            proceed_calls["count"] += 1
+            if proceed_calls["count"] == 1:
+                return json.dumps(
+                    {
+                        "reasoning": "Start with a baseline.",
+                        "sql_checks": [
+                            {"name": "Baseline", "sql": "SELECT count() AS metric FROM events"}
+                        ],
+                    }
+                )
+            return json.dumps(
+                {
+                    "action": "finish",
+                    "reasoning": "One baseline is enough for this test",
+                    "final_answer": "Done.",
+                }
+            )
+        if user_msg in {"Synthesise the final answer.", "Final answer now."}:
+            return "Done."
+        raise AssertionError(f"Unexpected call: {user_msg!r}")
+
+    monkeypatch.setattr(server, "_call_llm", fake_call)
+    resp = client.post("/api/agent", json=_base_agent_payload(maxSteps=3))
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["query_attempts_used"] == 1
+    assert payload["steps"][0]["type"] == "query"
+    assert payload["steps"][0]["ok"] is True
+    assert "SELECT count() AS metric FROM events" in payload["steps"][0]["sql"]
+
+
+def test_agent_streams_normalized_decision_and_execution_logs_to_session(client, monkeypatch):
+    monkeypatch.setattr(server, "get_clickhouse_client", lambda: _OkClient())
+    session_id = "runtime-log-session"
+    with server._data_analyst_sessions_lock:
+        server._data_analyst_sessions[session_id] = {
+            "id": session_id,
+            "event_log": [],
+            "event_seq": 0,
+            "updated_at": "",
+        }
+
+    def fake_call(system_prompt, messages, temperature=0.7, language=None):
+        _ = system_prompt
+        _ = temperature
+        _ = language
+        user_msg = messages[-1]["content"]
+        if user_msg == "Build the plan.":
+            return json.dumps({"plan_steps": ["Baseline query"], "reasoning": "Start simple"})
+        if user_msg == "Proceed with the next step.":
+            return json.dumps(
+                {
+                    "action": "query",
+                    "reasoning": "Need baseline",
+                    "hypothesis": "Rows exist",
+                    "expected_signal": "A positive count",
+                    "sql": "SELECT count() AS metric FROM events",
+                }
+            )
+        if user_msg in {"Synthesise the final answer.", "Final answer now."}:
+            return "Done."
+        raise AssertionError(f"Unexpected call: {user_msg!r}")
+
+    monkeypatch.setattr(server, "_call_llm", fake_call)
+    resp = client.post(
+        "/api/agent",
+        json=_base_agent_payload(maxSteps=1, control_session_id=session_id),
+    )
+    assert resp.status_code == 200
+    with server._data_analyst_sessions_lock:
+        events = list(server._data_analyst_sessions[session_id]["event_log"])
+    assert any(evt.get("kind") == "decision" and "normalized decision" in evt.get("message", "") for evt in events)
+    assert any(evt.get("kind") == "execution" and "Executed SQL:" in evt.get("message", "") for evt in events)
+
+
 def test_api_query_can_enforce_simple_compat(client, monkeypatch):
     monkeypatch.setattr(server, "get_clickhouse_client", lambda: _OkClient())
     resp = client.post(
@@ -563,6 +650,43 @@ def test_data_analyst_compose_question_trims_memory_and_notes():
     }
     heavy_combined = server._da_compose_question(heavy_session, question)
     assert len(heavy_combined) <= 600
+
+
+def test_data_analyst_refresh_memory_summary_uses_prior_run_context_not_transcript():
+    session = {
+        "params": {"memory_token_budget": 320, "memory_turn_limit": 8},
+        "conversation": [
+            {"role": "user", "content": "old raw transcript question"},
+            {"role": "assistant", "content": "old raw transcript answer"},
+        ],
+        "recent_user_goals": ["old raw transcript question", "compare current period with previous one"],
+        "last_completed_question": "old raw transcript question",
+        "last_result": {
+            "total_steps": 2,
+            "technical_retries_used": 1,
+            "current_plan": ["Build baseline", "Compare segment"],
+            "steps": [
+                {
+                    "step": 1,
+                    "type": "query",
+                    "ok": True,
+                    "result_summary": "Rows increased by 12% compared with the prior period.",
+                }
+            ],
+            "final_answer": "Volume increased and concentration shifted to segment A.",
+        },
+    }
+
+    server._da_refresh_memory_summary(
+        session,
+        current_question="compare current period with previous one",
+    )
+    summary = session["memory_summary"]
+    assert "U:" not in summary
+    assert "A:" not in summary
+    assert "Rows increased by 12%" in summary
+    assert "Prior conclusion" in summary
+    assert "compare current period with previous one" not in summary
 
 
 def test_execute_sql_guarded_condenses_large_result_sets():

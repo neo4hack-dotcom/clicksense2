@@ -1383,6 +1383,51 @@ def _summarize_agent_steps_for_prompt(
     return "\n".join(lines)
 
 
+def _build_agent_transition_summary(steps: list, current_plan_steps: list | None = None) -> str:
+    """Produce a short bridge summary between agent steps."""
+    if not steps:
+        next_focus = " | ".join(str(step)[:110] for step in (current_plan_steps or [])[:2] if str(step).strip())
+        return (
+            "Trajectory: no evidence gathered yet.\n"
+            + (f"Next planned focus: {next_focus}" if next_focus else "Next planned focus: build a baseline query.")
+        )
+
+    def _one_line(value: str, max_chars: int = 180) -> str:
+        return " ".join(str(value or "").split())[:max_chars]
+
+    successful_queries = [s for s in steps if s.get("type") == "query" and s.get("ok")]
+    failed_queries = [s for s in steps if s.get("type") == "query" and not s.get("ok")]
+    knowledge_steps = [s for s in steps if s.get("type") == "search_knowledge" and s.get("ok")]
+    last_success = next((s for s in reversed(steps) if s.get("ok")), None)
+    last_failure = next((s for s in reversed(steps) if not s.get("ok")), None)
+    last_hypothesis = next(
+        (str(s.get("hypothesis", "")).strip() for s in reversed(steps) if str(s.get("hypothesis", "")).strip()),
+        "",
+    )
+
+    lines = [
+        (
+            "Trajectory: "
+            f"{len(successful_queries)} successful SQL, "
+            f"{len(failed_queries)} failed SQL, "
+            f"{len(knowledge_steps)} knowledge lookup(s)."
+        )
+    ]
+    if last_success:
+        lines.append(f"Last useful evidence: {_one_line(last_success.get('result_summary', ''))}")
+    if last_failure:
+        lines.append(f"Last blocker: {_one_line(last_failure.get('result_summary', ''))}")
+    if last_hypothesis:
+        lines.append(f"Working hypothesis: {_one_line(last_hypothesis, 160)}")
+    if current_plan_steps:
+        next_focus = " | ".join(
+            str(step)[:110] for step in current_plan_steps[:2] if str(step).strip()
+        )
+        if next_focus:
+            lines.append(f"Next planned focus: {next_focus}")
+    return "\n".join(lines)
+
+
 _READONLY_ALLOWED_PREFIXES = ("SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH")
 _READONLY_FORBIDDEN_KEYWORDS = (
     "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE", "CREATE",
@@ -3782,6 +3827,24 @@ def agent_analysis():
             return ""
         return ""
 
+    def _emit_agent_runtime_log(message: str, level: str = "info", kind: str = "runtime") -> None:
+        txt = str(message or "").strip()
+        if not txt:
+            return
+        if control_session_id:
+            try:
+                with _data_analyst_sessions_lock:
+                    sess = _data_analyst_sessions.get(control_session_id)
+                    if sess:
+                        _da_log_event(sess, txt, level, kind)
+                        return
+            except Exception:
+                pass
+        try:
+            _log(txt, level=level, source="agent-analysis")
+        except Exception:
+            pass
+
     if not user_question.strip():
         return jsonify({"error": "No question provided"}), 400
 
@@ -4238,6 +4301,62 @@ Requirements:
     # Transient per-run working memory for multi-hop retrieval.
     working_memory = {"artifacts": {}, "order": []}
 
+    def _normalize_agent_decision(decision) -> dict:
+        normalized = dict(decision or {}) if isinstance(decision, dict) else {}
+        action = str(normalized.get("action", "") or "").strip().lower()
+
+        inferred_sql = str(normalized.get("sql", "") or "").strip()
+        if not inferred_sql and isinstance(normalized.get("query"), str):
+            inferred_sql = str(normalized.get("query", "")).strip()
+        if not inferred_sql and isinstance(normalized.get("sql_checks"), list):
+            for item in normalized.get("sql_checks", []):
+                if isinstance(item, dict) and str(item.get("sql", "")).strip():
+                    inferred_sql = str(item.get("sql", "")).strip()
+                    break
+        if inferred_sql:
+            normalized["sql"] = inferred_sql
+
+        if not action:
+            if inferred_sql:
+                action = "query"
+            elif str(normalized.get("search_query", "") or "").strip():
+                action = "search_knowledge"
+            elif str(normalized.get("suggested_path", "") or "").strip():
+                action = "export_csv"
+            elif str(normalized.get("final_answer", "") or "").strip():
+                action = "finish"
+
+        if action not in {"query", "search_knowledge", "export_csv", "finish"}:
+            if inferred_sql:
+                action = "query"
+            elif str(normalized.get("final_answer", "") or "").strip():
+                action = "finish"
+            else:
+                action = ""
+
+        normalized["action"] = action
+        normalized["reasoning"] = str(normalized.get("reasoning", "") or "").strip()
+        normalized["hypothesis"] = str(normalized.get("hypothesis", "") or "").strip()
+        normalized["expected_signal"] = str(normalized.get("expected_signal", "") or "").strip()
+        normalized["search_query"] = str(normalized.get("search_query", "") or "").strip()
+        normalized["suggested_path"] = str(normalized.get("suggested_path", "") or "").strip()
+        normalized["final_answer"] = str(normalized.get("final_answer", "") or "").strip()
+        return normalized
+
+    def _decision_requires_repair(decision: dict, steps_so_far: list) -> bool:
+        action = str(decision.get("action", "") or "").strip().lower()
+        if not action:
+            return True
+        if action == "query":
+            return not str(decision.get("sql", "") or "").strip()
+        if action == "search_knowledge":
+            return not str(decision.get("search_query", "") or "").strip()
+        if action == "export_csv":
+            return not str(decision.get("sql", "") or "").strip()
+        if action == "finish" and not str(decision.get("final_answer", "") or "").strip() and not steps_so_far:
+            return True
+        return False
+
     def _working_memory_snapshot(max_items: int = 4) -> str:
         order = working_memory.get("order") or []
         artifacts = working_memory.get("artifacts") or {}
@@ -4284,6 +4403,55 @@ Requirements:
         while len(order) > 12:
             old = order.pop(0)
             artifacts.pop(old, None)
+
+    def _repair_agent_decision(raw_decision: dict, steps_so_far: list) -> dict:
+        schema_hint = {}
+        for tbl, cols in list(schema.items())[:8]:
+            schema_hint[tbl] = [
+                c["name"] if isinstance(c, dict) else str(c)
+                for c in list(cols)[:8]
+            ]
+        transition_brief = _build_agent_transition_summary(steps_so_far, current_plan_steps)
+        plan_block = "\n".join(f"- {step}" for step in current_plan_steps[:4]) or "- Build a baseline query."
+        actions_hint = (
+            'Allowed actions: "query", "search_knowledge", "export_csv", "finish".'
+            if use_knowledge_base
+            else 'Allowed actions: "query", "export_csv", "finish".'
+        )
+        repair_prompt = f"""You are repairing an invalid next-action payload for a ClickHouse analyst agent.
+Return EXACTLY one executable next action as valid JSON.
+
+USER QUESTION:
+{user_question}
+
+STEP TRANSITION BRIEF:
+{transition_brief}
+
+CURRENT PLAN:
+{plan_block}
+
+TABLE HINTS:
+{json.dumps(schema_hint, ensure_ascii=False, indent=2)}
+
+INVALID/INCOMPLETE DECISION:
+{json.dumps(raw_decision, ensure_ascii=False, indent=2)}
+
+RULES:
+- Do NOT return a planning object.
+- If no SQL has executed yet, prefer a simple baseline SQL query rather than an empty finish.
+- If action = "query", field "sql" is mandatory.
+- Use simple read-only ClickHouse SQL only, LIMIT <= 5000.
+- Date filters must use BETWEEN or = with explicit date literals.
+- If action = "finish", field "final_answer" is mandatory.
+- {actions_hint}
+
+Return JSON only."""
+        return _call_llm_json(
+            repair_prompt,
+            [{"role": "user", "content": "Repair the next action now."}],
+            temperature=0.1,
+            expected_root="object",
+        )
 
     def _search_knowledge_for_agent(query: str) -> str:
         """Search the knowledge base (ES RAG) for context relevant to the query.
@@ -4359,10 +4527,11 @@ Requirements:
     def _run_agent_step(steps_so_far: list, used_steps: int = None) -> dict:
         """Ask the LLM for its next action given accumulated context."""
         nonlocal context_injected_once
+        transition_brief = _build_agent_transition_summary(steps_so_far, current_plan_steps)
         steps_context = _summarize_agent_steps_for_prompt(
             steps_so_far,
-            max_steps=8,
-            max_result_chars=220,
+            max_steps=6,
+            max_result_chars=160,
         )
 
         effective_used = used_steps if used_steps is not None else len(steps_so_far)
@@ -4431,6 +4600,8 @@ REACT DISCIPLINE:
 - Think before acting: each step MUST contain a clear reasoning thought before the action.
 - For action "query", explicitly include a hypothesis and expected signal before SQL execution.
 - If the previous query failed or was weak, first explain how the next action corrects trajectory.
+- Return ONE immediate executable action only. Never return a plan object here.
+- For action "query", field "sql" is mandatory.
 
 FINAL ANSWER QUALITY:
 - The final answer must remain professional and detailed with a strong functional/business focus.
@@ -4447,6 +4618,9 @@ WORKING MEMORY (TRANSIENT, FOR MULTI-HOP RETRIEVAL):
 - If no suitable memory set exists, run a query first to create it.
 
 CURRENT ANALYSIS PROGRESS ({effective_used}/{MAX_AGENT_STEPS} steps used):
+{transition_brief}
+
+RECENT EXECUTED STEPS:
 {steps_context if steps_context else "None yet — this is the first step."}
 
 CURRENT EXECUTION PLAN:
@@ -4538,15 +4712,11 @@ No markdown fences. Only raw JSON."""
                 f"[Token safety] Prompt too large even after truncation: "
                 f"~{total_tokens} tokens > {context_limit} limit. Falling back to compact step prompt."
             )
-            compact_steps_context = _summarize_agent_steps_for_prompt(
-                steps_so_far,
-                max_steps=4,
-                max_result_chars=120,
-            )
+            compact_steps_context = _build_agent_transition_summary(steps_so_far, current_plan_steps)
             system_prompt = f"""You are an autonomous ClickHouse data analyst agent.
 Your goal is to decide the next best action with minimal context.
 
-CURRENT ANALYSIS PROGRESS:
+STEP TRANSITION BRIEF:
 {compact_steps_context if compact_steps_context else "None yet — first step."}
 
 USER QUESTION:
@@ -4554,12 +4724,14 @@ USER QUESTION:
 
 INSTRUCTIONS:
 {actions_block}
-Return raw JSON only.
+Return one immediate executable action as raw JSON only.
 
 For SQL:
 {{
   "action": "query",
   "reasoning": "Short reason",
+  "hypothesis": "What you are testing",
+  "expected_signal": "What result would confirm it",
   "sql": "SELECT ..."
 }}
 {kb_json_schema}
@@ -4589,20 +4761,16 @@ For final answer:
             )
         except Exception as exc:
             if _is_context_overflow_error(str(exc)):
-                compact_steps_context = _summarize_agent_steps_for_prompt(
-                    steps_so_far,
-                    max_steps=3,
-                    max_result_chars=90,
-                )
+                compact_steps_context = _build_agent_transition_summary(steps_so_far, current_plan_steps)
                 emergency_prompt = f"""You are an autonomous ClickHouse data analyst agent.
 Pick ONLY the next action in raw JSON.
 {actions_block}
-Current progress:
+Step transition brief:
 {compact_steps_context}
 User question:
 {user_question}
 Allowed JSON:
-{{"action":"query","reasoning":"...","sql":"SELECT ..."}}
+{{"action":"query","reasoning":"...","hypothesis":"...","expected_signal":"...","sql":"SELECT ..."}}
 {{"action":"finish","reasoning":"...","final_answer":"..."}}"""
                 try:
                     return _call_llm_json(
@@ -4632,11 +4800,7 @@ Allowed JSON:
         error_msg = retry_info.get("error", "")
         error_class = retry_info.get("error_class", "")
 
-        steps_context = _summarize_agent_steps_for_prompt(
-            steps_so_far,
-            max_steps=8,
-            max_result_chars=220,
-        )
+        steps_context = _build_agent_transition_summary(steps_so_far, current_plan_steps)
         working_memory_block = _working_memory_snapshot(max_items=4)
         if no_prompt_context_injection:
             retry_context_note = (
@@ -4822,6 +4986,14 @@ Respond ONLY with valid JSON (no markdown):
                     technical_retries_used += 1
 
                     if alt_sql and steps:
+                        _emit_agent_runtime_log(
+                            (
+                                f"Retry #{technical_retries_used} prepared ({retry_mode}).\n"
+                                f"Retry SQL: {alt_sql[:420]}"
+                            ),
+                            "warn" if retry_mode == "technical" else "info",
+                            "decision",
+                        )
                         resolved_alt_sql = alt_sql
                         alt_resolution_error = ""
                         try:
@@ -4839,6 +5011,11 @@ Respond ONLY with valid JSON (no markdown):
                             }
                         else:
                             query_attempts_used += 1
+                            _emit_agent_runtime_log(
+                                f"Executing retry SQL #{technical_retries_used}:\n{resolved_alt_sql[:700]}",
+                                "info",
+                                "execution",
+                            )
                             alt_result = _execute_and_summarise(resolved_alt_sql)
                         alt_norm = (alt_result.get("normalized_sql") or alt_sql).strip()
                         alt_fp = _normalize_sql_fingerprint(alt_norm)
@@ -4851,6 +5028,21 @@ Respond ONLY with valid JSON (no markdown):
                                 "summary": "Query failed: duplicate query pattern detected.",
                                 "error_class": "duplicate_query",
                             }
+                        retry_summary = " ".join(str(alt_result.get("summary", "")).split())
+                        retry_log_lines = [
+                            f"Retry SQL #{technical_retries_used} result: {'OK' if alt_result.get('ok') else 'FAILED'}",
+                            f"Executed SQL: {alt_norm[:420]}",
+                            f"Rows: {int(alt_result.get('total_rows', 0) or 0)}",
+                        ]
+                        if retry_summary:
+                            retry_log_lines.append(f"Summary: {retry_summary[:320]}")
+                        if alt_result.get("error_class"):
+                            retry_log_lines.append(f"Error class: {alt_result.get('error_class')}")
+                        _emit_agent_runtime_log(
+                            "\n".join(retry_log_lines),
+                            "info" if alt_result.get("ok") else "warn",
+                            "execution",
+                        )
                         if alt_result["ok"]:
                             if alt_fp:
                                 seen_query_fingerprints.add(alt_fp)
@@ -4899,10 +5091,75 @@ Respond ONLY with valid JSON (no markdown):
                 break
 
             # ── Normal agent step ────────────────────────────────────────────
-            decision = _run_agent_step(steps, used_steps)
+            decision = _normalize_agent_decision(_run_agent_step(steps, used_steps))
+            if _decision_requires_repair(decision, steps):
+                _emit_agent_runtime_log(
+                    "Normalized decision incomplete; launching repair pass.\n"
+                    + json.dumps(decision, ensure_ascii=False, indent=2)[:900],
+                    "warn",
+                    "decision",
+                )
+                try:
+                    repaired_decision = _repair_agent_decision(decision, steps)
+                    decision = _normalize_agent_decision(repaired_decision)
+                    _emit_agent_runtime_log(
+                        "Decision repaired successfully.\n"
+                        + json.dumps(decision, ensure_ascii=False, indent=2)[:900],
+                        "info",
+                        "decision",
+                    )
+                except Exception as repair_exc:
+                    print(f"[Agent Decision] Repair failed: {repair_exc}")
+                    _emit_agent_runtime_log(
+                        f"Decision repair failed: {repair_exc}",
+                        "error",
+                        "decision",
+                    )
+
+            if _decision_requires_repair(decision, steps):
+                if steps:
+                    decision = {
+                        "action": "finish",
+                        "reasoning": "No executable next action could be produced after repair.",
+                        "final_answer": "",
+                    }
+                else:
+                    raise ValueError(
+                        "Agent could not produce an executable first action "
+                        f"(decision={json.dumps(decision, ensure_ascii=False)[:400]})"
+                    )
 
             action = decision.get("action", "finish")
             reasoning = decision.get("reasoning", "")
+            decision_log_lines = [
+                f"Step {used_steps + 1} normalized decision: action={action or 'n/a'}",
+            ]
+            if reasoning:
+                decision_log_lines.append(f"Reasoning: {' '.join(reasoning.split())[:260]}")
+            if action == "query":
+                if decision.get("hypothesis"):
+                    decision_log_lines.append(
+                        f"Hypothesis: {' '.join(str(decision.get('hypothesis', '')).split())[:220]}"
+                    )
+                if decision.get("expected_signal"):
+                    decision_log_lines.append(
+                        f"Expected signal: {' '.join(str(decision.get('expected_signal', '')).split())[:220]}"
+                    )
+                if decision.get("sql"):
+                    decision_log_lines.append(
+                        f"Planned SQL: {str(decision.get('sql', '')).strip()[:360]}"
+                    )
+            elif action == "search_knowledge" and decision.get("search_query"):
+                decision_log_lines.append(
+                    f"Knowledge query: {str(decision.get('search_query', '')).strip()[:260]}"
+                )
+            elif action == "export_csv" and decision.get("sql"):
+                decision_log_lines.append(
+                    f"Export SQL: {str(decision.get('sql', '')).strip()[:320]}"
+                )
+            elif action == "finish":
+                decision_log_lines.append("Agent concluded that enough evidence is available.")
+            _emit_agent_runtime_log("\n".join(decision_log_lines), "info", "decision")
 
             if force_finish_now and action != "finish":
                 # Mid-course review requested early stop to avoid inefficient chains.
@@ -4930,6 +5187,11 @@ Respond ONLY with valid JSON (no markdown):
                     }
                 else:
                     query_attempts_used += 1
+                    _emit_agent_runtime_log(
+                        f"Executing SQL step {used_steps}:\n{resolved_sql[:700]}",
+                        "info",
+                        "execution",
+                    )
                     exec_result = _execute_and_summarise(resolved_sql)
 
                 normalized_sql = (exec_result.get("normalized_sql") or resolved_sql or sql_template).strip()
@@ -4946,6 +5208,23 @@ Respond ONLY with valid JSON (no markdown):
                     }
                 elif exec_result["ok"] and normalized_fp:
                     seen_query_fingerprints.add(normalized_fp)
+
+                exec_status = "OK" if exec_result.get("ok") else "FAILED"
+                exec_summary = " ".join(str(exec_result.get("summary", "")).split())
+                exec_log_lines = [
+                    f"SQL step {used_steps} executed: {exec_status}",
+                    f"Executed SQL: {normalized_sql[:420]}",
+                    f"Rows: {int(exec_result.get('total_rows', 0) or 0)}",
+                ]
+                if exec_summary:
+                    exec_log_lines.append(f"Summary: {exec_summary[:320]}")
+                if exec_result.get("error_class"):
+                    exec_log_lines.append(f"Error class: {exec_result.get('error_class')}")
+                _emit_agent_runtime_log(
+                    "\n".join(exec_log_lines),
+                    "info" if exec_result.get("ok") else "warn",
+                    "execution",
+                )
 
                 step_entry = {
                     "step": used_steps,
@@ -6446,27 +6725,75 @@ def _da_log_event(session: dict, message: str, level: str = "info", kind: str = 
         pass
 
 
-def _da_refresh_memory_summary(session: dict) -> None:
+def _da_update_recent_goals(session: dict, user_text: str) -> None:
+    text = " ".join(str(user_text or "").split())
+    if not text:
+        return
+    recent = session.setdefault("recent_user_goals", [])
+    if not recent or recent[-1] != text:
+        recent.append(text[:320])
+    session["recent_user_goals"] = recent[-12:]
+
+
+def _da_refresh_memory_summary(session: dict, current_question: str = "") -> None:
     params = session.get("params", {})
     turn_limit = _da_coerce_int(params.get("memory_turn_limit", 8), 8, 2, 24)
     token_budget = _da_coerce_int(params.get("memory_token_budget", 700), 700, 120, 2400)
-    convo = session.get("conversation", [])
     lines = []
-    for msg in convo[-(turn_limit * 2):]:
-        role = "U" if msg.get("role") == "user" else "A"
-        text = " ".join(str(msg.get("content", "")).split())
-        if not text:
-            continue
-        lines.append(f"{role}: {text[:220]}")
+
+    recent_goals = [
+        " ".join(str(item or "").split())
+        for item in session.get("recent_user_goals", [])[-max(2, turn_limit // 2):]
+        if str(item or "").strip()
+    ]
+    if current_question:
+        current_norm = " ".join(str(current_question).split())
+        recent_goals = [g for g in recent_goals if g != current_norm]
+    if recent_goals:
+        lines.append(
+            "Recent user intents: "
+            + " | ".join(goal[:180] for goal in recent_goals[-3:])
+        )
+
+    previous_goal = " ".join(str(session.get("last_completed_question", "") or "").split())
+    if previous_goal and previous_goal != " ".join(str(current_question or "").split()):
+        lines.append(f"Previous completed goal: {previous_goal[:220]}")
 
     last_result = session.get("last_result") or {}
     if last_result:
+        steps = last_result.get("steps", []) if isinstance(last_result.get("steps", []), list) else []
+        successful_queries = [
+            step for step in steps
+            if step.get("type") == "query" and step.get("ok")
+        ]
+        failed_queries = [
+            step for step in steps
+            if step.get("type") == "query" and not step.get("ok")
+        ]
         lines.append(
-            "Last run: "
+            "Last run summary: "
             f"steps={last_result.get('total_steps', 0)}, "
-            f"retries={last_result.get('technical_retries_used', 0)}, "
-            f"queries={last_result.get('query_attempts_used', 0)}."
+            f"successful_queries={len(successful_queries)}, "
+            f"failed_queries={len(failed_queries)}, "
+            f"retries={last_result.get('technical_retries_used', 0)}."
         )
+        prior_plan = last_result.get("current_plan") or last_result.get("initial_plan") or []
+        if isinstance(prior_plan, list) and prior_plan:
+            lines.append(
+                "Previous plan focus: "
+                + " | ".join(str(item)[:120] for item in prior_plan[:3] if str(item).strip())
+            )
+        if successful_queries:
+            evidence_lines = []
+            for step in successful_queries[-2:]:
+                summary = " ".join(str(step.get("result_summary", "")).split())
+                if summary:
+                    evidence_lines.append(f"S{step.get('step', '?')}: {summary[:180]}")
+            if evidence_lines:
+                lines.append("Key prior evidence: " + " | ".join(evidence_lines))
+        prior_conclusion = " ".join(str(last_result.get("final_answer", "")).split())
+        if prior_conclusion:
+            lines.append("Prior conclusion: " + prior_conclusion[:260])
 
     raw_summary = "\n".join(lines)
     session["memory_summary"] = _truncate_text_to_budget(raw_summary, token_budget)
@@ -6485,9 +6812,9 @@ def _da_compose_question(session: dict, question: str) -> str:
     blocks = [user_question]
     if memory_summary:
         blocks.append(
-            "CONVERSATION MEMORY (compact, may be partial):\n"
+            "SESSION CONTEXT BRIEF (previous useful context only):\n"
             + memory_summary
-            + "\nUse this memory only when relevant to the new question."
+            + "\nUse this only when it helps the current question."
         )
     if notes:
         note_text = "\n".join(f"- {str(n)[:220]}" for n in notes)
@@ -6638,7 +6965,7 @@ def _da_worker_loop(session_id: str, run_seq: int) -> None:
                 return
             user_question = str(session["pending_user_inputs"].pop(0)).strip()
             params = dict(session.get("params", {}))
-            _da_refresh_memory_summary(session)
+            _da_refresh_memory_summary(session, current_question=user_question)
             composed_question = _da_compose_question(session, user_question)
             _da_log_event(
                 session,
@@ -6704,6 +7031,7 @@ def _da_worker_loop(session_id: str, run_seq: int) -> None:
             else:
                 interrupted = bool(result.get("interrupted", False))
                 interrupt_reason = str(result.get("interrupt_reason", "")).strip().lower()
+                session["last_completed_question"] = user_question
                 analyst_result = {
                     "final_answer": result.get("final_answer", ""),
                     "steps": result.get("steps", []),
@@ -6814,6 +7142,7 @@ def _run_ai_data_analyst_session_agent():
                 "stop_requested": False,
                 "params": _da_normalize_params(params_raw),
                 "conversation": [],
+                "recent_user_goals": [],
                 "pending_user_inputs": [],
                 "paused_notes": [],
                 "memory_summary": "",
@@ -6822,6 +7151,7 @@ def _run_ai_data_analyst_session_agent():
                 "response_seq": 0,
                 "latest_assistant": None,
                 "last_result": None,
+                "last_completed_question": "",
                 "cached_schema": None,
                 "cached_schema_ts": 0,
                 "run_seq": 0,
@@ -6880,6 +7210,7 @@ def _run_ai_data_analyst_session_agent():
                     "content": last_user_text,
                     "ts": _da_now_iso(),
                 })
+                _da_update_recent_goals(session, last_user_text)
                 session["pending_user_inputs"].append(last_user_text)
                 _da_log_event(session, "User added a new message while resuming.", "info", "input")
             started = _da_start_worker_if_needed(session)
@@ -6903,6 +7234,7 @@ def _run_ai_data_analyst_session_agent():
                     "content": last_user_text,
                     "ts": _da_now_iso(),
                 })
+                _da_update_recent_goals(session, last_user_text)
                 session["pending_user_inputs"].append(last_user_text)
                 _da_log_event(session, "Queued new user message for manual run.", "info", "input")
             started = _da_start_worker_if_needed(session)
@@ -6936,6 +7268,7 @@ def _run_ai_data_analyst_session_agent():
             "content": last_user_text,
             "ts": _da_now_iso(),
         })
+        _da_update_recent_goals(session, last_user_text)
         if session.get("status") == "paused" or session.get("pause_requested"):
             session.setdefault("paused_notes", []).append(last_user_text)
             session["paused_notes"] = session["paused_notes"][-20:]
