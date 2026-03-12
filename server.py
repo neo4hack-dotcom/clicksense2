@@ -1465,6 +1465,84 @@ _DATE_LITERAL_PATTERN = (
     r"|toDate\s*\(\s*'\d{4}-\d{2}-\d{2}'\s*\)"
     r"|toDateTime\s*\(\s*'\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}'\s*\))"
 )
+_SIMPLE_COMPAT_DATE_MIN = "1970-01-01"
+_SIMPLE_COMPAT_DATE_MAX = "2149-06-06"
+_SIMPLE_COMPAT_DATE_PROMPT_GUIDANCE = f"""- When filtering by date, ALWAYS emit either:
+  1) `date_col BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'`
+  2) `date_col = 'YYYY-MM-DD'`
+- NEVER emit `date_col > 'YYYY-MM-DD'`, `date_col >= 'YYYY-MM-DD'`, `date_col < 'YYYY-MM-DD'`, or `date_col <= 'YYYY-MM-DD'`.
+- If only one date bound is known, you MUST still use BETWEEN with an explicit safe bound:
+  - `date_col >= '2024-01-01'` -> `date_col BETWEEN '2024-01-01' AND '{_SIMPLE_COMPAT_DATE_MAX}'`
+  - `date_col > '2024-01-01'` -> `date_col BETWEEN '2024-01-02' AND '{_SIMPLE_COMPAT_DATE_MAX}'`
+  - `date_col <= '2024-01-31'` -> `date_col BETWEEN '{_SIMPLE_COMPAT_DATE_MIN}' AND '2024-01-31'`
+  - `date_col < '2024-01-31'` -> `date_col BETWEEN '{_SIMPLE_COMPAT_DATE_MIN}' AND '2024-01-30'`
+- If the user asks a relative period, resolve it to explicit literal dates before writing SQL.
+- Before returning SQL, self-check every date predicate and rewrite any remaining comparator into BETWEEN/equality.
+- NEVER use date extraction/transformation functions for filtering: no year(), month(), toYear(), toMonth(), date_trunc(), toStartOf*()."""
+_SIMPLE_COMPAT_DATE_LEFT_COMPARATOR_RE = re.compile(
+    rf"(?P<column>\b[\w`.]+\b)\s*(?P<op>>=|<=|>|<)\s*(?P<literal>{_DATE_LITERAL_PATTERN})",
+    flags=re.IGNORECASE,
+)
+_SIMPLE_COMPAT_DATE_RIGHT_COMPARATOR_RE = re.compile(
+    rf"(?P<literal>{_DATE_LITERAL_PATTERN})\s*(?P<op>>=|<=|>|<)\s*(?P<column>\b[\w`.]+\b)",
+    flags=re.IGNORECASE,
+)
+
+
+def _extract_iso_date_from_literal(literal: str) -> str:
+    """Extract the YYYY-MM-DD fragment from a simple SQL date literal."""
+    match = re.search(r"(\d{4}-\d{2}-\d{2})", str(literal or ""))
+    return match.group(1) if match else ""
+
+
+def _shift_iso_date(date_text: str, delta_days: int) -> str:
+    """Shift an ISO date literal by whole days."""
+    try:
+        shifted = datetime.strptime(str(date_text or "")[:10], "%Y-%m-%d") + timedelta(days=delta_days)
+        return shifted.strftime("%Y-%m-%d")
+    except Exception:
+        return str(date_text or "")[:10]
+
+
+def _rewrite_simple_compat_date_filters(sql: str) -> str:
+    """Rewrite date literal comparators into BETWEEN ranges accepted by simple compatibility mode."""
+    statement = (sql or "").strip()
+    if not statement or not re.search(_DATE_LITERAL_PATTERN, statement, flags=re.IGNORECASE):
+        return statement
+
+    def _replace(column: str, op: str, literal: str) -> str:
+        iso_date = _extract_iso_date_from_literal(literal)
+        if not iso_date:
+            return f"{column} {op} {literal}"
+        if op == ">=":
+            start, end = iso_date, _SIMPLE_COMPAT_DATE_MAX
+        elif op == ">":
+            start, end = _shift_iso_date(iso_date, 1), _SIMPLE_COMPAT_DATE_MAX
+        elif op == "<=":
+            start, end = _SIMPLE_COMPAT_DATE_MIN, iso_date
+        else:
+            start, end = _SIMPLE_COMPAT_DATE_MIN, _shift_iso_date(iso_date, -1)
+        return f"{column} BETWEEN '{start}' AND '{end}'"
+
+    rewritten = _SIMPLE_COMPAT_DATE_LEFT_COMPARATOR_RE.sub(
+        lambda match: _replace(
+            str(match.group("column") or "").strip(),
+            str(match.group("op") or "").strip(),
+            str(match.group("literal") or "").strip(),
+        ),
+        statement,
+    )
+
+    reverse_map = {">=": "<=", ">": "<", "<=": ">=", "<": ">"}
+    rewritten = _SIMPLE_COMPAT_DATE_RIGHT_COMPARATOR_RE.sub(
+        lambda match: _replace(
+            str(match.group("column") or "").strip(),
+            reverse_map.get(str(match.group("op") or "").strip(), str(match.group("op") or "").strip()),
+            str(match.group("literal") or "").strip(),
+        ),
+        rewritten,
+    )
+    return rewritten
 
 
 def _classify_clickhouse_error(error_text: str) -> str:
@@ -1813,13 +1891,7 @@ def _apply_sql_retry_playbook(
             simplified,
             flags=re.IGNORECASE,
         )
-        # If date comparators are used with literals, degrade to BETWEEN same date.
-        simplified = re.sub(
-            rf"(\b[\w`.]+\b)\s*(?:>=|<=|>|<)\s*({_DATE_LITERAL_PATTERN})",
-            r"\1 BETWEEN \2 AND \2",
-            simplified,
-            flags=re.IGNORECASE,
-        )
+        simplified = _rewrite_simple_compat_date_filters(simplified)
         candidate = _force_limit_for_retry(simplified, preferred_limit=500, hard_cap=5000)
     elif err == "syntax_error":
         # Minimal cleanup only.
@@ -1842,6 +1914,7 @@ def _apply_sql_retry_playbook(
             hard_limit_cap=5000,
         )
         if err == "simple_compat":
+            checked = _rewrite_simple_compat_date_filters(checked)
             _validate_simple_clickhouse_sql(checked)
         return checked
     except Exception:
@@ -1913,6 +1986,7 @@ def _execute_sql_guarded(
             hard_limit_cap=hard_limit_cap,
         )
         if enforce_simple_compat:
+            normalized_sql = _rewrite_simple_compat_date_filters(normalized_sql)
             _validate_simple_clickhouse_sql(normalized_sql)
     except Exception as exc:
         err = str(exc)
@@ -3143,7 +3217,8 @@ def chat():
     # ------------------------------------------------------------------
     # Token budget: base prompt without dynamic content
     # ------------------------------------------------------------------
-    base_prompt_template = """You are an expert ClickHouse data analyst and a proactive guide.
+    base_prompt_template = (
+        """You are an expert ClickHouse data analyst and a proactive guide.
 Your goal is to help the user query their database by asking smart clarifying questions BEFORE generating SQL.
 
 KNOWLEDGE BASE — CRITICAL:
@@ -3194,12 +3269,9 @@ CLICKHOUSE INSTRUCTIONS:
 - Keep SQL straightforward and robust.
 
 DATE HANDLING — CRITICAL:
-- When filtering by date, ALWAYS use either:
-  1) `date_col BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'`
-  2) `date_col = 'YYYY-MM-DD'`
-- NEVER use date extraction/transformation functions for filtering: no year(), month(), toYear(), toMonth(), date_trunc(), toStartOf*().
-- NEVER use >, <, >=, <= with date literals.
-- If the user asks a relative period, translate it to explicit literal dates and use BETWEEN.
+"""
+        + _SIMPLE_COMPAT_DATE_PROMPT_GUIDANCE
+        + """
 
 When NOT ambiguous, return ONLY this JSON:
 {
@@ -3210,6 +3282,7 @@ When NOT ambiguous, return ONLY this JSON:
 
 Do not include markdown formatting. Just the raw JSON.
 """
+    )
     messages_tokens = sum(_estimate_tokens(m.get("content", "")) for m in formatted_messages)
     base_tokens = _estimate_tokens(base_prompt_template) + _estimate_tokens(mapping_note) + _estimate_tokens(fk_context) + messages_tokens
 
@@ -3288,12 +3361,7 @@ CLICKHOUSE INSTRUCTIONS:
 - Keep SQL straightforward and robust.
 
 DATE HANDLING — CRITICAL:
-- When filtering by date, ALWAYS use either:
-  1) `date_col BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'`
-  2) `date_col = 'YYYY-MM-DD'`
-- NEVER use date extraction/transformation functions for filtering: no year(), month(), toYear(), toMonth(), date_trunc(), toStartOf*().
-- NEVER use >, <, >=, <= with date literals.
-- If the user asks a relative period, translate it to explicit literal dates and use BETWEEN.
+{_SIMPLE_COMPAT_DATE_PROMPT_GUIDANCE}
 
 SQL QUERY — PRIORITY RULE:
 The SQL query is ALWAYS the primary deliverable. Even for descriptive or analytical questions,
@@ -3390,6 +3458,7 @@ Database schema hint (truncated):
                 default_limit=1000,
                 hard_limit_cap=5000,
             )
+            normalized_sql = _rewrite_simple_compat_date_filters(normalized_sql)
             _validate_simple_clickhouse_sql(normalized_sql)
             parsed["sql"] = normalized_sql
         except Exception as compat_exc:
@@ -3408,9 +3477,8 @@ RULES:
 - Read-only SQL only (SELECT/SHOW/DESCRIBE/EXPLAIN/WITH).
 - Use only simple functions: COUNT, SUM, AVG, MIN, MAX, COUNT DISTINCT, ROUND, COALESCE, IF.
 - No advanced functions (windowFunnel, retention, sequenceMatch, argMax, topK, uniqHLL12, quantiles*, JSONExtract*, sumIf, countIf).
-- Date filters must use BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD' or = 'YYYY-MM-DD'.
-- No year()/month()/toYear()/toMonth()/date_trunc()/toStartOf*().
-- No >, <, >=, <= with date literals.
+- Keep every date predicate compatible:
+{_SIMPLE_COMPAT_DATE_PROMPT_GUIDANCE}
 - Keep LIMIT <= 5000.
 
 Return JSON only:
@@ -3435,6 +3503,7 @@ Return JSON only:
                     default_limit=1000,
                     hard_limit_cap=5000,
                 )
+                normalized_fixed = _rewrite_simple_compat_date_filters(normalized_fixed)
                 _validate_simple_clickhouse_sql(normalized_fixed)
                 parsed["sql"] = normalized_fixed
                 parsed["explanation"] = (
@@ -3970,7 +4039,8 @@ CONSTRAINTS:
 - Max action credits: {MAX_AGENT_STEPS}
 - Prefer 3 to 5 focused SQL actions.
 - Use only simple SQL functions (COUNT, SUM, AVG, MIN, MAX, COUNT DISTINCT, ROUND, COALESCE).
-- Date filters must use BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD' or = 'YYYY-MM-DD'.
+- Keep every planned date predicate compatible:
+{_SIMPLE_COMPAT_DATE_PROMPT_GUIDANCE}
 - Avoid advanced ClickHouse functions.
 
 Return ONLY JSON:
@@ -4589,12 +4659,7 @@ CLICKHOUSE INSTRUCTIONS:
 - Emit exactly one SQL statement (no semicolon-separated batch).
 
 DATE HANDLING — CRITICAL:
-- When filtering by date, ALWAYS use either:
-  1) `date_col BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'`
-  2) `date_col = 'YYYY-MM-DD'`
-- NEVER use date extraction/transformation functions for filtering: no year(), month(), toYear(), toMonth(), date_trunc(), toStartOf*().
-- NEVER use >, <, >=, <= with date literals.
-- If the user asks a relative period, translate it to explicit literal dates and use BETWEEN.
+{_SIMPLE_COMPAT_DATE_PROMPT_GUIDANCE}
 
 REACT DISCIPLINE:
 - Think before acting: each step MUST contain a clear reasoning thought before the action.
@@ -4726,6 +4791,9 @@ INSTRUCTIONS:
 {actions_block}
 Return one immediate executable action as raw JSON only.
 
+DATE RULES:
+{_SIMPLE_COMPAT_DATE_PROMPT_GUIDANCE}
+
 For SQL:
 {{
   "action": "query",
@@ -4765,6 +4833,8 @@ For final answer:
                 emergency_prompt = f"""You are an autonomous ClickHouse data analyst agent.
 Pick ONLY the next action in raw JSON.
 {actions_block}
+Date rules:
+{_SIMPLE_COMPAT_DATE_PROMPT_GUIDANCE}
 Step transition brief:
 {compact_steps_context}
 User question:
@@ -4846,9 +4916,8 @@ RULES:
 - Use only simple compatible functions: COUNT, SUM, AVG, MIN, MAX, COUNT DISTINCT, ROUND, COALESCE, IF.
 - Do NOT use: windowFunnel, retention, sequenceMatch, argMax, topK, uniqHLL12, quantiles*, JSONExtract*, sumIf, countIf.
 - Avoid nested complexity unless strictly required.
-- For date filters use only: BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD' or = 'YYYY-MM-DD'.
-- No year()/month()/toYear()/toMonth()/date_trunc()/toStartOf*() in filters.
-- No >, <, >=, <= with date literals.
+- Keep every date predicate compatible:
+{_SIMPLE_COMPAT_DATE_PROMPT_GUIDANCE}
 - Add LIMIT 200 if not present; never exceed LIMIT 5000.
 - Return exactly one SQL statement.
 
@@ -7627,7 +7696,8 @@ RULES:
 - Keep SQL simple and compatible.
 - Read-only SQL only.
 - Add LIMIT <= 5000 where relevant.
-- Date predicates must use BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD' or = 'YYYY-MM-DD'.
+- Keep every date predicate compatible:
+{_SIMPLE_COMPAT_DATE_PROMPT_GUIDANCE}
 - No advanced ClickHouse functions.
 
 Return ONLY JSON:
@@ -8134,7 +8204,8 @@ Rules:
 - Keep read-only SQL.
 - Keep it simple and compatible.
 - LIMIT <= 5000.
-- If date filter is needed use BETWEEN or equality date literals.
+- Keep every date predicate compatible:
+{_SIMPLE_COMPAT_DATE_PROMPT_GUIDANCE}
 
 Return JSON only:
 {{

@@ -318,6 +318,8 @@ def test_agent_context_injection_once_and_disabled_mode(client, monkeypatch):
     assert "DATABASE SCHEMA:" in prompts_standard[0]
     assert "Static schema/metadata/knowledge were already injected earlier in this run." in prompts_standard[1]
     assert "DATABASE SCHEMA:" not in prompts_standard[1]
+    assert "date_col BETWEEN '2024-01-01' AND '2149-06-06'" in prompts_standard[0]
+    assert "NEVER emit `date_col > 'YYYY-MM-DD'`" in prompts_standard[0]
 
     prompts_knowledge_agent = []
 
@@ -368,6 +370,7 @@ def test_agent_context_injection_once_and_disabled_mode(client, monkeypatch):
     assert len(prompts_knowledge_agent) >= 1
     assert "Static schema/metadata/knowledge injection is disabled for this run." in prompts_knowledge_agent[0]
     assert "DATABASE SCHEMA:" not in prompts_knowledge_agent[0]
+    assert "date_col BETWEEN '2024-01-01' AND '2149-06-06'" in prompts_knowledge_agent[0]
 
 
 def test_agent_synthesis_has_context_overflow_fallback(client, monkeypatch):
@@ -699,6 +702,40 @@ def test_execute_sql_guarded_condenses_large_result_sets():
     assert out["total_rows"] == 600
     assert "Condensed summary applied for token safety." in out["summary"]
     assert "Descriptive stats computed on a" in out["summary"]
+
+
+def test_rewrite_simple_compat_date_filters_converts_open_ranges_to_between():
+    sql = (
+        "SELECT count() FROM events "
+        "WHERE event_date >= '2024-01-01' "
+        "AND snapshot_date < '2024-02-01'"
+    )
+    rewritten = server._rewrite_simple_compat_date_filters(sql)
+    assert "event_date BETWEEN '2024-01-01' AND '2149-06-06'" in rewritten
+    assert "snapshot_date BETWEEN '1970-01-01' AND '2024-01-31'" in rewritten
+    assert ">=" not in rewritten
+    assert "< '2024-02-01'" not in rewritten
+
+
+def test_execute_sql_guarded_rewrites_date_comparators_before_simple_compat_validation():
+    out = server._execute_sql_guarded(
+        "SELECT count() AS metric FROM events WHERE event_date >= '2024-01-01'",
+        read_only=True,
+        enforce_simple_compat=True,
+        client=_OkClient(),
+    )
+    assert out["ok"] is True
+    assert "BETWEEN '2024-01-01' AND '2149-06-06'" in out["normalized_sql"]
+
+
+def test_retry_playbook_rewrites_date_comparators_semantically_for_simple_compat():
+    retried = server._apply_sql_retry_playbook(
+        "SELECT count() FROM events WHERE event_date <= '2024-03-31'",
+        error_class="simple_compat",
+        error_text="date filters must use BETWEEN",
+    )
+    assert "event_date BETWEEN '1970-01-01' AND '2024-03-31'" in retried
+    assert "<=" not in retried
 
 
 def test_summarize_executive_supports_custom_count(client, monkeypatch):
